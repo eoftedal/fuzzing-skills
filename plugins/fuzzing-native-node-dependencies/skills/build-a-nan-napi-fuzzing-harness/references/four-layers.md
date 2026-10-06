@@ -1,0 +1,172 @@
+# The four layers a faithful harness mirrors, with the cases that taught them
+
+Read this when step 4 of SKILL.md tells you to, or when the gate mismatches and you
+suspect the harness rather than the oracle. Each section is one layer; each case names
+the symptom you would have seen without it.
+
+## Layer 1 — the object the runtime owns
+
+The fields you must initialise and later free are usually **private**, and patching the
+header would mean the object you link is no longer the published package. Reach them
+with the explicit-instantiation trick, which is exempt from access checking and needs no
+source edit:
+
+```cpp
+template <typename Tag, typename Tag::type M> struct Rob {
+  friend typename Tag::type rob(Tag) { return M; }
+};
+struct FieldTag { typedef <FieldType>* Obj::*type; friend type rob(FieldTag); };
+template struct Rob<FieldTag, &Obj::_field>;          // now: obj.*rob(FieldTag{})
+```
+
+**When the boundary is a method of an `ObjectWrap` / `Nan::ObjectWrap` subclass** the
+object cannot be constructed without a `CallbackInfo`, and the recipe that worked on two
+targets is: copy the method body into the harness minus its runtime calls, copy any
+`static inline` helper from the same TU verbatim, and for the few fields the body reads
+either zero the storage (POD fields are zero in the real constructor too), placement-new
+the non-trivial members (a `std::string`, an error struct), and never run the
+destructor. Everything the real method calls around the boundary (the post-decode setter, the
+cleanup routine, `AdjustExternalMemory`) must be mirrored or trapped, which is layer 4.
+Comment the source lines you copied; the copy drifts when the package updates.
+
+Look for a library factory first (`xxx_make_context`, `xxx_new_from_buffer`): most
+libraries with a C API have one and the problem vanishes. Only fabricate if the runtime
+allocates it, and then never `memset` a C++ object: zeroed memory is not a valid
+`std::string`, so every *error* path crashes while valid inputs look perfect.
+Placement-new the non-trivial members and mirror every field the real constructor sets;
+one of them usually guards a whole branch.
+
+Case: an image-decoding binding's four fields (surface, data, data length, SVG handle)
+were private. Patching the
+header would have unpublished the object; the trick above cost six lines.
+
+## Layer 2 — the option layer, and the dispatch that often lives in JS
+
+Read `lib/*.js` for the defaults, then check the addon for a default-constructed
+descriptor struct: it often already encodes them exactly, so constructing it and attaching
+the buffer *is* the no-options call.
+
+Then check whether the JS does more than pass options, because the **dispatch** often
+lives there: it decides *which* native call runs and *how big a buffer* it gets.
+
+Case: a decompression binding's `decompress` is not one native call. JS walks every
+frame summing each frame's *declared* output size, takes a fast path that allocates
+exactly that total and asserts the result, or falls back to a streaming loop sized
+`max(<library chunk size>, remaining)`. A harness that called the obvious one-shot
+function fuzzed a path the package never takes. Mirror the dispatch in the same order,
+and mirror its **ceiling**: where the size is attacker-declared, omitting the limit turns
+a correctly-refused input into a harness-only OOM that looks like a finding, and
+*inventing* the limit silently refuses inputs the real package accepts.
+
+Ask the runtime for that limit; do not quote one. It is far larger than it looks and it
+changes between runtimes and architectures:
+
+```sh
+node -e "console.log(require('buffer').kMaxLength)"
+node -e "try{Buffer.allocUnsafe(2**40);console.log('1 TiB ok')}catch(e){console.log(e.code)}"
+```
+
+Mirror the runtime's **two distinct failures** rather than one cap: a range error above
+the maximum length, and an allocation failure when the allocator refuses a length that
+is legal. The second is the branch the package's own error path handles, and it is
+reached by bounding the fuzz run (`afl-fuzz -m`, or `ASAN_OPTIONS=max_allocation_size_mb`
+under a sanitizer), not by a constant in your harness.
+
+So the templates ship **no cap by default**. Both carry an **opt-in** `ALLOC_CEIL=<bytes>`
+for when a declared size would otherwise make the run crawl: set it to the same value on
+both arms, and apply it **only at the attacker-declared site** (`over_ceiling()` in
+`harness_template.cc`, `overCeiling()` before the call in `real_harness_template.mjs`,
+which reads the declared size from the input the same way), reporting
+`err=alloc-ceiling`. Never wrap `Buffer.alloc*` or `malloc` globally: that also refuses
+the package's internal buffers and the harness's own input copy. Say in the write-up
+that a ceiling was on, and turn it off for the gate on the real corpus, because every
+input it refuses is one the comparison no longer covers.
+
+## Layer 3 — process-global state the init block installs
+
+```sh
+grep -rn "NAN_MODULE_INIT\|NAPI_MODULE_INIT\|napi_register_module_v1\|%init" $SRCDIR/
+grep -rniE "MemSetup|SetAllocator|RegisterNode|_default\(|SetErrorFunc" $SRCDIR/
+```
+
+This is the one people skip, and it is invisible from the call you are harnessing.
+
+* **Library configuration.** A **custom allocator** matters most, because it decides heap
+  layout and therefore what a sanitizer can see at all. Case: one binding wraps every
+  allocation with an 8-byte header, and the identical injected under-read is reported by
+  a default-allocator harness and **invisible** with the allocator mirrored. Node/alloc
+  counters and error handlers are cheap to mirror and buy real coverage.
+* **Callbacks that are the binding's whole purpose.** A SAX-style library does the work
+  only when a handler is installed. Case: one XML parser walks attribute lists, decodes
+  text runs and assembles comments *because* the binding registered its handlers at
+  construction (nine setter calls installing ten callbacks). Parse with none and you skip most of what the package exercises. Mirror
+  the full handler set, reading exactly the arguments the real handlers read
+  (`Nan::New(name)` calls `strlen(name)`; a handler striding an attribute array in pairs
+  until NULL; a text handler reading exactly `len` bytes) so any over-read the library
+  commits while building them is still committed. Mirror the **return value** too: the
+  same binding's unknown-encoding handler returns an error status when no JS listener
+  answered, so a default parser *rejects* unknown encodings. Returning OK would open a
+  branch the package never takes.
+
+Make the runtime-only branches inside a mirrored hook **trap** (`binding_path_reached`),
+so "that branch is dead" is checked, not assumed.
+
+## Layer 4 — what the binding does around the boundary, before and after
+
+Read the *whole* exported function, not just down to the boundary call. A
+post-processing step that fills in the fields the JS API exposes is common, and it is
+usually **not** binding-free, so `find_boundary.sh` never offers it as a candidate.
+
+Case: a binding's image setter called a post-decode hook *after* the decode, and that is where
+width and height are set for two of its five formats. The first working harness reported
+`w=0 h=0` for every input in those formats, and the gate caught it. The fix was four
+lines (mirror the function minus its runtime calls) but nothing in a three-layer model
+says to look.
+
+```sh
+grep -n -A40 '<ExportedMethod>' $SRCDIR/<file>.cc     # BOTH sides of the boundary call
+```
+
+## The dispatch in JavaScript can re-chunk the input
+
+Beyond options and sizes, a JS `Transform` can drive the native stream in pieces: one
+binding splits every written chunk after each `YZ` byte pair (a stream footer magic),
+skips leading zero bytes after a finished member, restarts the decoder on
+`STREAM_END`, and sends a final `code(null)` on flush. A corpus file is then one input
+but the library sees several calls, and any seed containing that byte pair exercises the
+multi-call path. Mirror the state machine, not just the options, and note the byte
+pattern for the corpus skill.
+
+## How the bytes are delivered
+
+The native signature can hide the whole input contract.
+
+Case: an incremental parser's `Parse` entry point does not take a string. It takes a
+**function**, and three decisions live outside the call: `index.js` wraps a string as
+`(offset) => str.slice(offset)`; the conversion layer hands that callback a **code-unit**
+index (`byte_count / 2`); the addon sets the input descriptor's encoding to UTF-16 and
+copies each chunk into its own fixed 32 768-unit staging buffer, so the library never
+sees the caller's memory. A harness that called the one-shot `parse_string` with UTF-8
+would run fine, gate green on a careless field set, and fuzz a different code path. Grep
+the addon for `encoding`, callback-struct typedefs with a `read` member, and any `/ 2`
+or `* 2` on offsets.
+
+**Choose the corpus encoding so that file bytes to the API's value is lossless.** It
+can delete an oracle ceiling. In that case `Buffer.toString('utf16le')` is lossless for
+*arbitrary even-length bytes*, because a JS string may hold lone surrogates; a UTF-8
+corpus would have been lossy for invalid sequences and made whole byte ranges
+unreachable. Mirror the lossy edges too: `toString('utf16le')` drops a trailing odd
+byte, so the harness uses `len / 2` units rather than inventing one.
+
+**When the binding itself stages the input into a fixed buffer**, an over-read past the
+input really is invisible in production, and mirroring the staging buffer is the
+faithful choice even though it costs sensitivity. Say so, and offer the sensitive version
+behind an env var clearly labelled as *not* faithful and never used for the gate
+(`EXACT=1`, corresponding to C API callers who pass an exact buffer).
+
+## Reset only what is safe to reset
+
+Read the implementation of any reset you call in a loop. Case: an image-processing
+binding's library-wide cache-drop call reads like a reset and is a *teardown* that frees its hash table
+and leaves it NULL, breaking every later operation. Faithful configuration plus
+`__AFL_LOOP(1000)` is usually the right answer.

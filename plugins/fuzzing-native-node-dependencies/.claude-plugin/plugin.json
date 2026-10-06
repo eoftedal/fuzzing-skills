@@ -1,0 +1,11 @@
+{
+  "name": "fuzzing-native-node-dependencies",
+  "version": "0.1.0",
+  "description": "Fuzz the native libraries behind NAN/N-API Node addons with AFL++: build a faithful harness, derive a seed corpus from source, run campaigns, and triage crashes against the real npm package. Stops at a classified, minimized reproducer for the maintainer; does not develop exploits.",
+  "author": {
+    "name": "Erlend Oftedal",
+    "email": "eoftedal@gmail.com"
+  },
+  "license": "MIT",
+  "keywords": ["fuzzing", "afl++", "node", "napi", "nan", "native-addons", "security", "triage"]
+}

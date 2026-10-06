@@ -1,0 +1,21 @@
+{
+  "name": "node-security-skills",
+  "owner": {
+    "name": "Erlend Oftedal",
+    "email": "eoftedal@gmail.com"
+  },
+  "metadata": {
+    "description": "Skills for finding security vulnerabilities in Node.js dependencies.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "fuzzing-native-node-dependencies",
+      "source": "./plugins/fuzzing-native-node-dependencies",
+      "description": "Fuzz the native libraries behind NAN/N-API Node addons with AFL++: build a faithful harness, derive a seed corpus from source, run campaigns, and triage crashes against the real npm package.",
+      "version": "0.1.0",
+      "category": "security",
+      "keywords": ["fuzzing", "afl++", "node", "napi", "nan", "native-addons", "security", "triage"]
+    }
+  ]
+}
