@@ -5,7 +5,7 @@
     "email": "eoftedal@gmail.com"
   },
   "metadata": {
-    "description": "Skills for finding security vulnerabilities in Node.js dependencies.",
+    "description": "Skills for finding security vulnerabilities in the native dependencies of Node.js and Ruby packages.",
     "version": "0.1.0"
   },
   "plugins": [
@@ -15,7 +15,33 @@
       "description": "Fuzz the native libraries behind NAN/N-API Node addons with AFL++: build a faithful harness, derive a seed corpus from source, run campaigns, and triage crashes against the real npm package.",
       "version": "0.1.0",
       "category": "security",
-      "keywords": ["fuzzing", "afl++", "node", "napi", "nan", "native-addons", "security", "triage"]
+      "keywords": [
+        "fuzzing",
+        "afl++",
+        "node",
+        "napi",
+        "nan",
+        "native-addons",
+        "security",
+        "triage"
+      ]
+    },
+    {
+      "name": "fuzzing-native-ruby-dependencies",
+      "source": "./plugins/fuzzing-native-ruby-dependencies",
+      "description": "Fuzz the C code behind Ruby gems' C extensions with AFL++: build a faithful harness (mkmf/extconf.rb, vendored mini_portile libraries, Ruby-runtime stubs), derive a seed corpus from source, run campaigns, and triage crashes against the real gem.",
+      "version": "0.1.0",
+      "category": "security",
+      "keywords": [
+        "fuzzing",
+        "afl++",
+        "ruby",
+        "gem",
+        "c-extension",
+        "mkmf",
+        "security",
+        "triage"
+      ]
     }
   ]
 }

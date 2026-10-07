@@ -1,0 +1,11 @@
+{
+  "name": "fuzzing-native-ruby-dependencies",
+  "version": "0.1.0",
+  "description": "Fuzz the C libraries behind Ruby gems' C extensions with AFL++: build a faithful harness, derive a seed corpus from source, run campaigns, and triage crashes against the real gem. Stops at a classified, minimized reproducer for the maintainer; does not develop exploits.",
+  "author": {
+    "name": "Erlend Oftedal",
+    "email": "eoftedal@gmail.com"
+  },
+  "license": "MIT",
+  "keywords": ["fuzzing", "afl++", "ruby", "gem", "c-extension", "mkmf", "native-extensions", "security", "triage"]
+}
