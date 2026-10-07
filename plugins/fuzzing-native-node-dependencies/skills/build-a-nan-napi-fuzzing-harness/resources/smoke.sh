@@ -14,7 +14,8 @@
 #                ADDON=/abs/fuzz/out/asan/Release/<name>.node node real_harness.mjs"
 #
 # Phases:
-#   A  every seed through every sanitized fork harness: a seed that crashes it is listed
+#   A  every seed through every variant's fork harness, sanitized or not: a seed that
+#      crashes or hangs it is listed
 #   0  (before any fuzzing) HOSTSAN, when given, runs once on a seed no harness crashed on
 #      and must print a result line (status=...); a broken real-side command would
 #      otherwise turn every crash into DIRECT-ONLY
@@ -95,6 +96,20 @@ if [ -z "${VARIANTS:-}" ]; then
   VARIANTS=$(for d in "$WS"/out/*/; do v=$(basename "$d"); f=$(hfork "$v"); [ -n "$f" ] && instrumented "$f" && echo "$v"; done | xargs)
 fi
 [ -n "$VARIANTS" ] || { echo "FAIL: no instrumented out/<variant>/harness-fork" >&2; exit 2; }
+# afl-fuzz picks the driver from the magic string in the binary.  A "harness" without it
+# is a fork binary run as persistent, so every input reports as a timeout and nothing is
+# smoked; a harness-fork with it would be driven as persistent.
+MAGIC='##SIG_AFL_PERSISTENT##'
+for v in $VARIANTS; do
+  p=$(hbin "$v"); f=$(hfork "$v")
+  if [ -n "$p" ] && ! grep -qa "$MAGIC" "$p"; then
+    echo "FAIL: $p lacks $MAGIC: a harness TU compiled by something other than afl-clang-fast" >&2
+    echo "      needs -include afl_shim.h with all five macros (re-run link_harness.sh)" >&2; exit 2
+  fi
+  if [ -n "$f" ] && grep -qa "$MAGIC" "$f"; then
+    echo "FAIL: $f carries $MAGIC: the fork binary was built without -DNO_PERSISTENT" >&2; exit 2
+  fi
+done
 [ -n "${HOSTSAN:-}" ] || ts "NOTE: no HOSTSAN, so no real-stack differential: crashes can only be classed UNVERIFIED or HARNESS-FRAME."
 # crash = a signal, or ASAN's distinctive exit code
 ASAN_RUN="exitcode=86:detect_leaks=0:allocator_may_return_null=1:max_allocation_size_mb=$ALLOC_CAP_MB:symbolize=1"
@@ -108,7 +123,7 @@ hostsan() {  # <mode env or ""> <input>
   HERR=$(cat "$e"); rm -f "$e"
 }
 
-# ---- A. every seed through every sanitized fork harness ---------------------------------
+# ---- A. every seed through every variant's fork harness ---------------------------------
 ts "== A. $(ls "$CORPUS" | wc -l) seed(s) through each variant's fork harness =="
 GOOD_SEED=""      # a seed no harness crashes on: the HOSTSAN preflight below uses it
 for v in $VARIANTS; do for mode in default $MODES; do

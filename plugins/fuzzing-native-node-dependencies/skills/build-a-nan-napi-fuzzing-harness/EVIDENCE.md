@@ -137,3 +137,27 @@ Hit by three or more: the ASAN fuzz command rejected by AFL++; the pristine vari
 | works on a real harness and the real npm stack | **[measured]** the image-decoding binding's next major version (a zig build) with `real_harness.mjs` under ASAN: 4 crashes, all `REAL`, all in the PNG stream reader; 52 s end to end. Its stability 97.6 %, 357 execs/s under ASAN and 1,810/s plain |
 | bound the smoke run by wall-clock too | **[measured]** AFL's `-V` is fuzz time only: a plain smoke run on the image-decoding binding with `-V 40` ran **268 s** once it had saved a hang, so a "short" check took 5 minutes. `campaign.sh WALL=` stops it and records `walled`; `smoke.sh` passes `3 * SMOKE_S + 30` |
 | `triage.sh` / `classify.sh` removed | the real-stack comparison moved into `smoke.sh` (before the campaign); deduplication is the triage skill's, which fixed bugs they still had (single-pass template collapse, AFL's `README.txt` read as a crash, no timeout) |
+
+## Review of the skill (2026-10-07): checks moved from prose into the scripts
+
+A read-through of SKILL.md, the references and every resource against the chain contract.
+Nothing new was learned on a target; the changes make existing rules falsifiable by a script
+or remove text the scripts already enforce. Tested in the `sectainer-ruby` container on the
+binaries of past runs plus fabricated harnesses, so the tags are [tool] and [measured] on
+synthetic cases, never on a new target.
+
+| change | tag | what was checked |
+|---|---|---|
+| `link_harness.sh` and `smoke.sh` fail when `out/<v>/harness` lacks `##SIG_AFL_PERSISTENT##` or `harness-fork` carries it | **[measured]** | the persistent binaries of past runs carry the string and their fork twins do not; a persistent binary without it (the zig-shim case above) and a persistent binary copied over `harness-fork` are both refused. Until now the only guard was a sentence in step 3b |
+| `gate.sh` judges NO-OUTPUT on "no line with a `status=` key", and `get()` reads keys from that line only | **[measured]** | fake harnesses: stdout that is only logging is NO-OUTPUT with the new message (before: a MISMATCH with every key empty); a seed with stray `err=` and `status_x` logging lines agreed because keys came from the result line. Same test smoke.sh's HOSTSAN preflight already used |
+| `gate.sh` names rc=124 contention when fewer than three seeds have no output | **[measured]** | one asan gate run reported `no-output=1` while other campaigns shared the host; two re-runs were clean. (The comment in `gate.sh` said "measured" before this file did) |
+| `gate.sh` ends with a `PASS:`/`FAIL:` verdict line in default-only mode too | **[tool]** | piped through `tee` the exit status is lost; the multi-mode path already printed one |
+| `detect_selftest.sh` default `ASAN_OPTIONS` carry `allocator_may_return_null=1:max_allocation_size_mb=$ALLOC_CAP_MB` | **[tool]** | the self-test was the one step outside the chain's single allocation ceiling (README conventions) |
+| `detect_selftest.sh` runs the harness under `timeout 60` in `run()` and in the automatic seed pick; rc=124 is named as a hang in both FAIL messages | **[tool]** | a fault that sends the library into a loop hung the script indefinitely before |
+| `real_harness_template.mjs` dies `ADDON-NEVER-LOADED` when the package answered without dlopening any addon | **[tool]** | a package that rejects in JavaScript before loading its addon lazily printed `ADDON-NOT-SWAPPED`, whose hint points at a wrong path. Still no result line, so the swap proof is unchanged |
+| both `harness_template.cc` copies: keep `status` below 64 | **[tool]** | `smoke.sh` reads 86 and anything above 127 as a crash, the gate reads 124 as a timeout |
+| SKILL.md description names node-gyp, `binding.gyp`, prebuilt `.node`, what the skill proves, and the chain | **[tool]** | triggering vocabulary; the campaign skill's description already carried the chain pointer |
+| SKILL.md: prefer the published tarball (`npm pack`) over a clone as the build tree, state both versions in the write-up | **[carried]** | from the Ruby sibling, where a clone lacked sources a release step generates; the Node skill already met the symptom (a `prepare` step running `tsc`). Not yet seen to matter on a Node target |
+| SKILL.md: the self-test runs in the current environment, so export `MODE=` for a fault on a mode-only path | **[tool]** | `detect_selftest.sh` never applied a mode; the text did not say so |
+| SKILL.md trimmed from 40.0 to 39.0 KB: allocation/work-ceiling long form to `four-layers.md` layer 2, REBUILD out-of-tree recipe and zig REBUILD to the new `selftest-rebuild.md`, mode-budget cost anecdotes dropped (this file keeps them) | **[tool]** | every imperative rule stayed in SKILL.md; the three blocks were 4.5 KB, so the file is still above the 30 KB terminal truncation and the read-with-a-file-reader note stays |
+| pristine-variant count: "on the evaluation targets" | **[tool]** | SKILL.md said five, this file said three or more |

@@ -1,6 +1,6 @@
 ---
 name: build-a-nan-napi-fuzzing-harness
-description: Build a direct AFL++ fuzzing harness for the native library behind a Node NAN, node-addon-api or N-API addon, bypassing node while executing the same machine code. Use when asked to fuzz a native Node dependency (an image, XML, compression, regex, stylesheet or parser binding), to harness a native library behind a binding, or when an interpreter-hosted fuzzer is too slow.
+description: Build a direct AFL++ fuzzing harness for the native library behind a Node NAN, node-addon-api or N-API addon, bypassing node while executing the same machine code. Use when asked to fuzz a native Node dependency or an npm package with a native addon (an image, XML, compression, regex, stylesheet or parser binding), to harness the C or C++ library behind a node-gyp build (binding.gyp) or a prebuild or prebuilt .node file, or when an interpreter-hosted fuzzer is too slow. It proves the harness before any campaign with a fidelity gate against an independently installed copy of the package, a detection self-test with an injected fault, and a smoke run for crashes of its own. The first of four skills - then derive-a-fuzzing-corpus-from-source, run-a-fuzzing-campaign, triage-fuzzing-findings.
 ---
 
 # Build a direct fuzzing harness for a NAN/N-API dependency
@@ -12,16 +12,16 @@ harness, so every step below ends in a check that it is still faithful.
 `resources/` holds the scripts; every step names the one it uses. `references/` holds
 the long versions of the rules with the cases that produced them. Read a reference only
 when the step points you at it or a check fails. `EVIDENCE.md` says which target taught
-each rule. This file is about 40 KB: read it with a file reader, not `cat` into a
+each rule. This file is about 39 KB: read it with a file reader, not `cat` into a
 terminal that truncates at 30 KB (two runs lost its last steps that way).
 
 **Layout convention** (the scripts assume it): a fuzz workspace holding an independent
 `oracle/` install for the real stack, `out/<variant>/` for each build (`plain`, `asan`,
 and `pristine` when you need it) with the snapshotted `Release/` tree, vendored archives
 under `lib/`, the makefile, `harness`, `harness-fork` and `map_size`, and the corpus in
-`corpus/`. The package itself is a clone or `node_modules/<pkg>` elsewhere; always pass
-`build_addon.sh` an **absolute** `OUT=` into the workspace, or it writes `out/` into
-the package.
+`corpus/`. The package itself is an unpacked tarball, a clone or `node_modules/<pkg>`
+elsewhere; always pass `build_addon.sh` an **absolute** `OUT=` into the workspace, or it
+writes `out/` into the package.
 
 **The whole path, for the common case** (library compiled into a node-gyp addon):
 
@@ -58,6 +58,13 @@ Every build step overwrites `build/Release`, so first:
 [ -d node_modules/<pkg>/build/Release ] && cp -a node_modules/<pkg>/build/Release out/prebuilt
 mkdir -p oracle && (cd oracle && npm init -y >/dev/null && npm install <pkg>)   # the REAL stack
 ```
+
+**Build from the published tarball.** Prefer `npm pack <pkg>@<ver>` unpacked
+(`tar xzf <pkg>-<ver>.tgz` gives `package/`), at the version `oracle/` installed
+(`npm ls <pkg>` there), because it is exactly what the oracle compiled and a clone can
+lack sources a release step generates. It has no `node_modules`, so it takes the same
+dependency-only install as a clone, below. Use a clone only when HEAD is the target, and
+state both versions in the write-up: the oracle's installed version and the built tree's.
 
 **From a git clone:** the only install you run in the package directory is the
 dependency-only one, with scripts off so a `prebuild-install` or a `prepare` step does
@@ -191,17 +198,13 @@ package's format sniffing and limit checks are *its* code, not your copy. If the
 exposes several entry points over the same engine (buffer vs file, parse vs parse-html),
 harness them behind an **environment variable**, never an input byte: a corpus
 file stays byte-for-byte what the real API consumes, so any seed or crash replays
-unchanged on the real stack. **Budget the modes, and decide them now**, before the first
-gate: a mode added after the gate rebuilds the harness, and gate, smoke and self-test all
-run again (one run spent 5 of its 10 harness minutes on exactly that). Keep a mode only if
-it reaches library code the default does not (a different decoder, the compressor behind
-a decompressor, a different parser state machine), and stop at two or three. Six modes
-gated and smoked on two variants cost one run an hour, and entry points that are thin
-wrappers over the same call (exec vs test vs match) are one mode with different
-post-processing: fuzz the richest one and say so. Each extra mode multiplies every later
-step (gate, smoke, measure, re-gate, crasher pass). A mode that cannot reject its input
-(a compressor) gets `:min_arms=1` in the gate's `MODES=` spec, so check 3 stays strict
-for the default mode.
+unchanged on the real stack. **Decide the modes now**, before the first gate: a mode
+added later rebuilds the harness and reruns gate, smoke and self-test. Keep a mode only
+if it reaches library code the default does not (a different decoder, the compressor
+behind a decompressor, a different parser state machine), and stop at two or three, since
+each multiplies every later step. Thin wrappers over one call (exec vs test vs match) are
+one mode: fuzz the richest and say so. A mode that cannot reject its input (a compressor)
+gets `:min_arms=1` in the gate's `MODES=` spec, so check 3 stays strict for the default.
 
 For a generated binding, skip the ranking: `grep -n '<libraryEntryPoint>(' $SRCDIR/<generated>.cc`.
 
@@ -234,7 +237,7 @@ expect one of them more often than not.
 Two variants now, one at a time, each snapshotted into `out/<variant>/`: `plain`
 (throughput) and `asan` (bug finding). A third, `pristine` (ASAN, no AFL
 instrumentation), is the control for "did my instrumentation invent this bug?": build
-it when you have a crash to cross-check, not before. On five evaluation targets it was
+it when you have a crash to cross-check, not before. On the evaluation targets it was
 built every time and used on none.
 
 Every variant built with afl-clang-fast gets `-include undef_fuzzmode.h`, because the
@@ -291,7 +294,9 @@ set without editing the package, and `references/zig-build.md` is the recipe.
 
 Whenever the harness TU is compiled by something other than afl-clang-fast (zig cc,
 `HARNESS_CXX=g++`), it needs `-include resources/afl_shim.h` for the persistent-mode
-macros, and `strings harness | grep -c SIG_AFL_PERSISTENT` must be non-zero afterwards.
+macros, and `link_harness.sh` fails if the persistent magic string is missing
+afterwards. On the zig route `link_harness.sh` does not run and `smoke.sh` does the check
+(by hand: `strings harness | grep -c SIG_AFL_PERSISTENT` must be non-zero).
 
 ---
 
@@ -352,31 +357,14 @@ when the package exposes one, otherwise its error name or message with spaces re
 by `_`. Never a hash of a message that embeds the input, which makes `err` unique per
 seed and useless for the corpus skill's histograms, which steer by that field.
 
-**Attacker-declared allocations** (a decompressor's declared content size, an image
-header's dimensions) get **no cap by default**. Mirror what node does instead, with
-node's own tokens: `ERR_OUT_OF_RANGE` above `buffer.kMaxLength` (ask the runtime, do not
-quote it: `-DNODE_KMAXLENGTH=$(node -p ...)`), `ERR_MEMORY_ALLOCATION_FAILED` when the
-allocator refuses a legal length (`Buffer.allocUnsafe` under the sanitizer's
-`max_allocation_size_mb`; only the asan gate exercises this path), and the package's own
-error path, and let the fuzzer's memory limit bound the run
-(`afl-fuzz -m`, or `max_allocation_size_mb` under ASAN, both from `ALLOC_CAP_MB` in
-the campaign). An invented cap was measured to reject inputs the real package accepts.
-Both templates carry an **opt-in** `ALLOC_CEIL=<bytes>`, off unless set, applied only
-at the attacker-declared site and reported as `err=alloc-ceiling`; set it identically on
-both arms, never wrap `malloc` or `Buffer.alloc*` globally. `references/four-layers.md`
-(layer 2) has the case.
-
-**Attacker-chosen work** is the same problem in time: an input field that sets an
-iteration count, a cost or rounds exponent, a dimension of a loop (a password hash's
-cost field is `2^n` rounds, so one byte decides milliseconds or hours). The rule is the
-same: mirror the package's own bound if it has one (read the JS validation and the
-native parser), and otherwise add an **opt-in** `WORK_CEIL=<units>` applied identically
-on both arms at that field and reported as `err=work-ceiling`, so the gate can compare
-the parse of a huge cost without paying for it. Set it for the campaign (the smoke's
-hangs are otherwise all that field), and keep high-cost seeds out of `corpus-final/` as
-hangs. It is also a finding to record for triage when the package does **not** bound it:
-an input-controlled work factor is a denial of service by itself, like declared-size
-memory amplification; quote the field and the time at its minimum and maximum.
+**Attacker-declared sizes and work get no cap by default.** Mirror node's own tokens,
+`ERR_OUT_OF_RANGE` above `buffer.kMaxLength` (asked from the runtime at build time) and
+`ERR_MEMORY_ALLOCATION_FAILED` when the allocator refuses, plus the package's own bound,
+and let the fuzzer's memory limit bound the run. The opt-in `ALLOC_CEIL=<bytes>` and
+`WORK_CEIL=<units>` are set identically on both arms, applied only at the
+attacker-declared field, and reported as `err=alloc-ceiling` / `err=work-ceiling`. An
+input-controlled work factor the package does not bound is itself a finding for triage.
+`references/four-layers.md` (layer 2) has the long form.
 
 Then link:
 
@@ -567,7 +555,9 @@ exists in other functions and the script prints where the fault landed for exact
 reason. Reaching the function is not enough either: the seed must take the **dispatch
 branch** the fault sits on (an unsized frame goes down a streaming path whose oversized
 buffer hides a 1-byte over-write; UTF-8 input never touches a transcoding buffer), so
-read the branch around the faulted line before picking `SEED=`.
+read the branch around the faulted line before picking `SEED=`. The self-test runs the
+harness in the current environment, so for a fault on a path only a mode reaches, export
+that `MODE=` first and pick `SEED=` from a seed that takes it.
 
 `REBUILD` is run with `eval`, twice (fault applied, then restore). Expand any list
 **before** building the string and single-quote the result; a `$(find ...)` left inside
@@ -577,21 +567,12 @@ single quotes reaches `eval` as a literal and the relink fails with an empty log
 L=$(find out/asan/Release/obj.target/<target>/vendor -name '*.o' | tr '\n' ' ')
 REBUILD="resources/rebuild_asan.sh PKG=$PWD OUT=$W/out MK=$W/out/asan/<target>.target.mk SRCDIR=$PWD HARNESS=$W/harness.cc LIB='$L' NODE_GYP='$NODE_GYP'"
 ```
-`rebuild_asan.sh` takes the arguments you gave `build_addon.sh` and `link_harness.sh`;
-it cannot be used when a gyp action re-extracts the library source during configure
-(a tarball-vendored compression binding), where REBUILD has to be an out-of-tree build
-of the library plus a relink: configure the library once outside the package with the
-line `build/<dep>/config.log` records (prefix it with `CC=afl-clang-fast
-AFL_USE_ASAN=1`), then `REBUILD="make -C <that tree> && resources/link_harness.sh
-VARIANT=asan ... LIB=<that tree>/.libs/lib<dep>.a"`. Note that this relinks the asan
-harness against a different archive than the one the gate and smoke vouched for, so
-re-run the asan gate on that harness afterwards. The same holds for every REBUILD: the
-restore step relinks the asan harness, which counts as a harness change, so the asan
-gate runs once more after the self-test (ten seconds; the map size may move by a few
-entries, which is expected). For a zig build it is the two asan
-`zig build` invocations plus a copy of the drivers. The script removes its
-`<src>.injected` copy before the restore rebuild, so a REBUILD that greps the tree for
-`INJECTED` sees a clean tree then.
+`rebuild_asan.sh` takes the arguments you gave `build_addon.sh` and `link_harness.sh`.
+Every REBUILD's restore step relinks the asan harness, which counts as a harness change,
+so the asan gate runs once more after the self-test (ten seconds; the map size may move
+by a few entries, which is expected). When a gyp action re-extracts the library source
+during configure, or the package is a zig build, `references/selftest-rebuild.md` has
+the REBUILD to use instead.
 
 **Keep the self-test's output** (`resources/detect_selftest.sh ... | tee selftest.txt`, with
 its `PASS:` line): the campaign skill refuses to run without it, because a campaign that finds

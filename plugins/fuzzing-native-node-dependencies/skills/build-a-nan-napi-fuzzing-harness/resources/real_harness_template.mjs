@@ -34,7 +34,8 @@ const PKG = process.env.PKG || '/path/to/oracle/node_modules/<package>';
 //       ADDON_MAP    `regex=path;regex=path`, first match wins: one replacement per addon
 //                    (a runtime plus a grammar, a host plus a plugin)
 //     The swap is PROVEN, not assumed: with ADDON or ADDON_MAP set, no result line is
-//     printed unless a dlopen was actually redirected (ADDON-NOT-SWAPPED otherwise), and
+//     printed unless a dlopen was actually redirected (ADDON-NOT-SWAPPED otherwise, or
+//     ADDON-NEVER-LOADED when the package answered without dlopening any addon), and
 //     a single ADDON redirected into two distinct addons is AMBIGUOUS-SWAP.
 const ADDON = process.env.ADDON ? path.resolve(process.env.ADDON) : null;
 const MATCH = process.env.ADDON_MATCH ? new RegExp(process.env.ADDON_MATCH) : /\.node$/;
@@ -66,6 +67,9 @@ const swappedFrom = new Set();  // the paths the package asked for that were red
 // the second one can decide for it.
 const checkSwap = (final) => {
   if (!ADDON && !ADDON_MAP.length) return;
+  if (swappedFrom.size === 0 && final && loaded.length === 0)
+    die('ADDON-NEVER-LOADED: the package produced a result without dlopening any addon ' +
+        '(rejected in JavaScript before native code?); nothing was swapped, so no result is printed under ADDON=');
   if (swappedFrom.size === 0 && (final || loaded.length))
     die(`ADDON-NOT-SWAPPED: ADDON is set but no dlopen was redirected (loaded: ${loaded.join(',') || 'none'}). ` +
         'Check ADDON_MATCH against the path the package loads, and that PKG is the package that loads it.');

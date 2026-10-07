@@ -66,11 +66,17 @@ node -e "console.log(require('buffer').kMaxLength)"
 node -e "try{Buffer.allocUnsafe(2**40);console.log('1 TiB ok')}catch(e){console.log(e.code)}"
 ```
 
-Mirror the runtime's **two distinct failures** rather than one cap: a range error above
-the maximum length, and an allocation failure when the allocator refuses a length that
-is legal. The second is the branch the package's own error path handles, and it is
-reached by bounding the fuzz run (`afl-fuzz -m`, or `ASAN_OPTIONS=max_allocation_size_mb`
-under a sanitizer), not by a constant in your harness.
+Pass it in at build time, `-DNODE_KMAXLENGTH=$(node -p 'require("buffer").kMaxLength')`,
+and `#error` when the macro is missing rather than defaulting it.
+
+Mirror the runtime's **two distinct failures** rather than one cap, with node's own
+tokens: `ERR_OUT_OF_RANGE` above the maximum length, and `ERR_MEMORY_ALLOCATION_FAILED`
+when the allocator refuses a length that is legal (`Buffer.allocUnsafe` under the
+sanitizer's `max_allocation_size_mb`; only the asan gate exercises this path). The
+second is the branch the package's own error path handles, and it is reached by bounding
+the fuzz run (`afl-fuzz -m`, or `ASAN_OPTIONS=max_allocation_size_mb` under a sanitizer,
+both from `ALLOC_CAP_MB` in the campaign), not by a constant in your harness. An invented cap was measured to reject
+inputs the real package accepts.
 
 So the templates ship **no cap by default**. Both carry an **opt-in** `ALLOC_CEIL=<bytes>`
 for when a declared size would otherwise make the run crawl: set it to the same value on
@@ -81,6 +87,21 @@ which reads the declared size from the input the same way), reporting
 the package's internal buffers and the harness's own input copy. Say in the write-up
 that a ceiling was on, and turn it off for the gate on the real corpus, because every
 input it refuses is one the comparison no longer covers.
+
+### Attacker-chosen work: `WORK_CEIL`
+
+The same problem in time: an input field that sets an iteration count, a cost or rounds
+exponent, a dimension of a loop (a password hash's cost field is `2^n` rounds, so one
+byte decides milliseconds or hours). Mirror the package's own bound if it has one (read
+the JS validation and the native parser). Otherwise add an **opt-in** `WORK_CEIL=<units>`,
+applied identically on both arms at that field and reported as `err=work-ceiling`, so the
+gate can compare the parse of a huge cost without paying for it.
+
+* Set it for the campaign: the smoke's hangs are otherwise all that field.
+* Keep high-cost seeds out of `corpus-final/`; they belong in `hangs/`.
+* When the package does **not** bound the field, record it as a finding for triage: an
+  input-controlled work factor is a denial of service by itself, like declared-size
+  memory amplification. Quote the field and the time at its minimum and maximum.
 
 ## Layer 3 — process-global state the init block installs
 

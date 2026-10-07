@@ -3,6 +3,8 @@
 #
 #   BOTH the direct harness and the real-stack harness print ONE line of
 #   key=value pairs, space separated, for each input.
+#   That result line is the first one holding a status= key: other stdout (a package's own
+#   logging) is ignored, and a side that prints no such line is judged NO-OUTPUT.
 #
 # Configure with KEY=VALUE arguments or environment variables:
 #   DIRECT      command for the direct harness; the input path is appended
@@ -65,7 +67,8 @@ TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 export DIRECT REAL FIELDS ARM_FIELD SOFT_FIELD SOFT_DROP TMP
 
 first_err() { grep -m1 -E 'ERROR:|Error|error|Cannot|SUMMARY' "$1" | cut -c1-110; }
-get() { sed -n "s/.*\b$2=\([^ ]*\).*/\1/p" <<<"$1" | head -1; }
+# keys come from the result line only, so stray stdout logging cannot supply one
+get() { grep -m1 -E '(^| )status=' <<<"$1" | sed -n "s/.*\b$2=\([^ ]*\).*/\1/p" | head -1; }
 key() { local line=$1 drop=${2:-} out=""; for f in $FIELDS; do
           case " $drop " in *" $f "*) continue ;; esac
           out="$out|$f=$(get "$line" "$f")"; done; echo "$out"; }
@@ -83,8 +86,10 @@ judge() {
   # (rc=124 means the 30 s timeout fired: a hang, named like any other no-output seed.)
   # A seed with no output is the interesting case: a sanitizer abort on one side (a real
   # finding) or a broken real-side command (a wrong ADDON= path).  Say which.
-  if [ -z "$d" ]; then printf 'NO-OUTPUT\t%s\t\tdirect printed nothing, rc=%s: %s\n' "$n" "$drc" "$(first_err "$err")"; return; fi
-  if [ -z "$r" ]; then printf 'NO-OUTPUT\t%s\t\treal printed nothing, rc=%s: %s\n' "$n" "$nrc" "$(first_err "$rerr")"; return; fi
+  # Stdout without a status= line counts as none: judged on keys it would read as a
+  # MISMATCH with every key empty.
+  if ! grep -qE '(^| )status=' <<<"$d"; then printf 'NO-OUTPUT\t%s\t\tdirect printed no result line (status=...), rc=%s: %s\n' "$n" "$drc" "$(first_err "$err")"; return; fi
+  if ! grep -qE '(^| )status=' <<<"$r"; then printf 'NO-OUTPUT\t%s\t\treal printed no result line (status=...), rc=%s: %s\n' "$n" "$nrc" "$(first_err "$rerr")"; return; fi
   local arm; arm=$(get "$d" "$ARM_FIELD")
   if [ "$(key "$d")" = "$(key "$r")" ]; then printf 'AGREED\t%s\t%s\t\n' "$n" "$arm"
   elif [ -n "$SOFT_FIELD" ] && [ "$(get "$r" "$SOFT_FIELD")" = 1 ] \
@@ -112,10 +117,16 @@ one_mode() {   # runs the whole gate in the current environment; prints and retu
   echo "  agreed=$ok  oracle-limited=$limited  mismatched=$mism  no-output=$empty  entered-binding=$stub"
   if [ "$empty" = "$NSEEDS" ] && [ "$empty" -gt 0 ]; then
     echo "  (EVERY seed had no output on one side: the command is broken, not the seeds -- read the message above."
-    if grep -q 'direct printed nothing, rc=86' "$TMP/judged"; then
+    if grep -qF 'direct printed no result line (status=...), rc=86' "$TMP/judged"; then
       echo "   The DIRECT side died with the sanitizer exit code and no report: is a sanitizer runtime"
       echo "   LD_PRELOADed into this whole command?  It belongs inside REAL= only.)"
     else echo "   A wrong ADDON= / PKG= path, or a missing LD_PRELOAD inside REAL=, are the usual causes.)"; fi
+  fi
+  # A lone timeout-shaped NO-OUTPUT on a busy host is usually contention, not the seed
+  # (measured: one asan gate run reported no-output=1 while other campaigns shared the
+  # host; two re-runs were clean).  Say so before anyone debugs it.
+  if [ "$empty" -gt 0 ] && [ "$empty" -lt 3 ] && [ "$empty" -lt "$NSEEDS" ] && grep -q '^NO-OUTPUT.*rc=124' "$TMP/judged"; then
+    echo "  (rc=124 is the 30 s timeout: on a loaded host re-run the gate before debugging; a NO-OUTPUT that repeats is real.)"
   fi
 
   echo "== 3. both arms are populated ($ARM_FIELD) =="
@@ -162,6 +173,9 @@ one_mode() {   # runs the whole gate in the current environment; prints and retu
 status=0
 if [ -z "$MODES" ]; then
   one_mode || status=1
+  # Always end with a verdict line: piped through `| tee` (as the docs do) the exit code
+  # is lost, and the per-check lines alone do not say whether the gate passed.
+  [ "$status" = 0 ] && echo "PASS: the gate passed (default mode only)" || echo "FAIL: the gate failed (see the checks above)"
 else
   for setting in default $MODES; do
     echo "######## mode: $setting"

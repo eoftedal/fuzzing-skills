@@ -24,6 +24,10 @@
 #   SEED        or name one explicitly -- do so whenever the fault is in a path the
 #               first seed does not take (a raw-block fault with a compressed-block
 #               seed fires nothing); the script cannot know which seed reaches it
+#   ALLOC_CAP_MB   memory ceiling (default 1024), as everywhere else
+#
+# The harness runs in the CURRENT environment: for a fault on a path only one mode reaches,
+# export that mode (MODE=...) before running this, and pick SEED= from a seed that takes it.
 #
 # REBUILD for a node-gyp package: resources/rebuild_asan.sh with the same arguments you
 # gave build_addon.sh and link_harness.sh.  For a library a gyp ACTION extracts or
@@ -58,7 +62,9 @@ FAULT_SRC=${FAULT_SRC:?set FAULT_SRC}
 FAULT_SED=${FAULT_SED:?set FAULT_SED}
 REBUILD=${REBUILD:?set REBUILD}
 HARNESS=${HARNESS:?set HARNESS}
-export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:symbolize=1:exitcode=86}"
+ALLOC_CAP_MB=${ALLOC_CAP_MB:-1024}
+# the chain's allocation ceiling, so a seed refused here is refused the same way everywhere
+export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:symbolize=1:exitcode=86:allocator_may_return_null=1:max_allocation_size_mb=$ALLOC_CAP_MB}"
 
 [ -f "$FAULT_SRC" ] || { echo "FAIL: FAULT_SRC not found: $FAULT_SRC" >&2; exit 1; }
 BK=$(mktemp)
@@ -91,7 +97,7 @@ if [ -z "$SEED" ]; then
   best=-1
   for c in "${CORPUS:?set CORPUS or SEED}"/*; do
     [ -f "$c" ] && [ -s "$c" ] || continue          # skip non-files and zero-byte seeds
-    out=$($HARNESS "$c" 2>/dev/null) || continue
+    out=$(timeout 60 $HARNESS "$c" 2>/dev/null) || continue   # a hanging seed is not a candidate
     [[ "$out" == *"status=0"* ]] || continue
     [[ "$out" == *"out_len=0"[!0-9]* || "$out" == *"out_len=0" ]] && continue
     sz=$(wc -c <"$c")
@@ -102,7 +108,8 @@ fi
 echo "seed: $(basename "$SEED")"
 
 # prints "<rc>|<sanitizer error kind or empty>|<1 if stderr mentions AFL-HARNESS-STUB>"
-run() { local o rc stub=0; o=$($HARNESS "$SEED" 2>&1); rc=$?
+# rc 124 is the timeout: a fault that sends the library into a loop must not hang the script
+run() { local o rc stub=0; o=$(timeout 60 $HARNESS "$SEED" 2>&1); rc=$?
         [[ "$o" == *AFL-HARNESS-STUB* ]] && stub=1
         echo "$rc|$(sed -n 's/.*ERROR: [A-Za-z]*Sanitizer: \([a-z-]*\).*/\1/p' <<<"$o" | head -1)|$stub"; }
 show() { printf '%-28s %s %s\n' "$1" "$2" "$3"; }
@@ -112,6 +119,7 @@ IFS='|' read -r crc ckind cstub <<<"$(run)"
 show clean "$crc" "$ckind"
 # The clean run is the baseline: it must be a plain success, else the comparison means nothing.
 [ "$cstub" = 1 ] && fail "a stubbed symbol was hit (AFL-HARNESS-STUB on stderr in the clean run, rc=$crc): the harness reached code it stubs out."
+[ "$crc" = 124 ] && fail "the seed hangs the clean harness (timed out after 60 s); choose a different seed (SEED=...)."
 if [ "$crc" != 0 ] || [ -n "$ckind" ]; then
   fail "the seed already crashes or fails without the fault (rc=$crc, kind=${ckind:-none}); choose a different seed (SEED=...)."
 fi
@@ -144,7 +152,9 @@ if [ -n "$kind" ] && { [ "$rc" != "$crc" ] || [ "$kind" != "$ckind" ]; }; then
   VERDICT="PASS: the harness detects memory errors injected into the library ($kind, rc=$rc)."
 else
   VERDICT_FD=2
-  if [ -n "$kind" ]; then
+  if [ "$rc" = 124 ]; then
+    VERDICT="FAIL: the faulted run timed out; a hang is not a detected memory error (rc=$rc, kind=${kind:-none})."
+  elif [ -n "$kind" ]; then
     VERDICT="FAIL: the faulted run is indistinguishable from the clean run (rc=$rc, kind=$kind)."
   else
     VERDICT="FAIL: injected fault went unnoticed (rc=$rc, no sanitizer report).

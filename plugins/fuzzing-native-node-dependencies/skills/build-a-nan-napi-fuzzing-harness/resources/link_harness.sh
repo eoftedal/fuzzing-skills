@@ -116,6 +116,19 @@ for drv in harness harness-fork; do
     exit 1
   fi
 done
+# afl-fuzz picks the driver from the persistent-mode magic string in the binary.  A shim
+# lacking the testcase macros once turned the persistent binary into a usage-printing fork
+# binary without any error, and a sentence in SKILL.md was the only guard: check it here.
+if [ "$VARIANT" != pristine ]; then
+  MAGIC='##SIG_AFL_PERSISTENT##'
+  if ! grep -qa "$MAGIC" "$D/harness"; then
+    echo "FAIL: $D/harness lacks $MAGIC: a harness TU compiled by something other than" >&2
+    echo "      afl-clang-fast needs -include afl_shim.h with all five macros" >&2; exit 1
+  fi
+  if grep -qa "$MAGIC" "$D/harness-fork"; then
+    echo "FAIL: $D/harness-fork carries $MAGIC: the fork binary was built without -DNO_PERSISTENT" >&2; exit 1
+  fi
+fi
 if [ "$VARIANT" != pristine ]; then
   ms=$(AFL_DUMP_MAP_SIZE=1 "$D/harness" 2>/dev/null | tail -1)
   echo "  map size: ${ms:-?}   (pass MAP_SIZE=$ms to gate.sh / measure.sh; it differs per variant)"

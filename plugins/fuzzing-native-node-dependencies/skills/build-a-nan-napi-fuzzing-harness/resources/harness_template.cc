@@ -211,6 +211,7 @@ int main(int argc, char** argv) {
     // against the library: do not encode "rejected inputs produce no output" (an
     // error-recovering parser does) or "valid inputs produce some" (many do not).
     // The gate judges by comparison against the real stack, not by your guess.
+    // keep status < 64: smoke.sh reads 86 and >127 as a crash, the gate reads 124 as a timeout
     return r.status;
   }
 
