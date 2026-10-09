@@ -14,11 +14,14 @@ What the skills hand each other, so the names stay the same end to end:
 
 | artifact | written by | read by |
 |---|---|---|
+| `fuzz.env` (`SKILLS R RC W PKG_NAME PKG PKG_VERSION EXT_ASAN MODES FIELDS SOFT_FIELD SOFT_DROP ALLOC_CAP_MB REAL REAL_ASAN`, plus `X` and `EXTCONF_ARGS` by hand) | harness (`init_workspace.sh`) | every command block of all four, and their scripts as defaults |
 | `out/<variant>/{harness,harness-fork,map_size}` | harness | corpus, campaign, triage |
+| `out/<variant>/dict.afl` (the build's compared constants) | harness (`build_ext.sh`, `link_harness.sh`) | corpus (`dict.sh`), campaign and smoke (fallback `-x`) |
 | `out/<variant>/{<ext>.so,Makefile,extconf.h,obj/,lib/}` | harness (`build_ext.sh`) | harness (`link_harness.sh`), triage (the sanitized `.so` swapped into the real gem) |
 | `corpus/` (the gate corpus), `real_harness.rb`, `oracle/` | harness | corpus (re-gate), triage (`PKG=oracle/gems/<gem>-<ver>`, `GOOD=` a gate seed) |
 | `selftest.txt` with its `PASS:` line | harness | campaign (refuses without it; flags it stale if a harness is newer) |
 | `corpus-final/`, `crashers/`, `hangs/` | corpus | campaign (`corpus-final/` is the default seed set), triage (`crashers/` and `hangs/` are screened against every variant) |
+| `dict.afl` | corpus (`dict.sh`) | campaign and smoke (the default `-x`) |
 | `campaigns/manifest.tsv` | campaign | triage (variant, harness, mode, entry, ceiling, status per campaign) |
 | `triage/REPORT.md` | triage | you |
 
@@ -28,8 +31,14 @@ real-side scripts activate the gem from `oracle/`, and its runtime dependencies 
 there). `--platform ruby` matters: a precompiled platform gem (`aarch64-linux-gnu`,
 `x86_64-linux`) ships someone else's build of the extension and of any vendored library.
 
-Three conventions run through all four:
+Four conventions run through all four:
 
+* **Every command block starts with `cd $W && . ./fuzz.env`**, `$W` spelled out as the
+  absolute workspace path. Each tool call is a fresh shell, so variables set in one block
+  are gone in the next, and a relative `resources/` path resolves against the workspace;
+  `fuzz.env` holds the paths and settings instead. The scripts read it as defaults, and an
+  explicit argument wins. Re-run `init_workspace.sh` with just the changed keys to update
+  it.
 * **A harness mode is an entry point, named after it.** The harness reads `MODE=<value>` from the
   environment, never from an input byte; `real_harness.rb` keeps its calls into the gem in an
   `ENTRIES` hash keyed by that value; the campaign records each mode's `entry` as that value;

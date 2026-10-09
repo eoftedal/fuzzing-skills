@@ -213,7 +213,12 @@ A CLEAN ASAN cell is not proof of absence. Two mechanisms:
 
 * **The faulting allocation belongs to an uninstrumented dependency.** An image-processing binding
   over system codec libraries uses the distro's JPEG and PNG codecs, with no redzones around their scratch buffers: a hard
-  crash inside a codec still shows, a 1-byte over-read does not.
+  crash inside a codec still shows, a 1-byte over-read does not. The same holds when the
+  harness linked an instrumented **static archive** of a library the package loads as a
+  system `.so`: the asan harness sees inside the library, the sanitized confirm column
+  (sanitized addon, uninstrumented system `.so`) does not. A memory-safety bucket inside
+  that library can read CLEAN there; it is not an artifact. Say so on the report's
+  "Instrumented:" line.
 * **The binding replaced the library's allocator with one that cushions the block.**
   A DOM XML-parser binding puts an 8-byte header in front of every allocation its XML
   library makes, which hides *every* under-read from ASAN — measured on an identical
@@ -261,14 +266,16 @@ bucket alone — which saves filing them and saves counting them.
 
 ## Adapting confirm.mjs for non-one-shot APIs
 
-The `ENTRIES` arms assume `lib.doTheThing(buf)` returns a value or a Promise. Replace or add
+Edit the workspace copy (`$W/confirm.mjs`, copied from this skill's `resources/`), never
+the plugin's file; `triage_all.sh` and `confirm.sh` use it by default, `CONFIRM=` points
+elsewhere. The `ENTRIES` arms assume `lib.doTheThing(buf)` returns a value or a Promise. Replace or add
 arms for other shapes; keep the handler scaffolding, the `evidence=`, and the timeout.
 
 * **AsyncWorker / Promise** — already handled: return the Promise and the `.then(resolve,
   reject)` arms map to CLEAN / CAUGHT. A throw from inside the worker that the binding does
   not forward to the Promise becomes UNCAUGHT, which is correct. Remember this arm runs on a
   threadpool thread (see stack exhaustion above).
-* **A path or file argument** — use the provided `asFile(ext)` helper, which writes the exact
+* **A path or file argument**: use the provided `asFile(b, ext)` helper, which writes the exact
   bytes to a temp file. This is the raw-byte entry point and it is where the inputs your
   string entry point cannot express become real findings.
 * **Streaming (compression, parsers fed in chunks)** — create the stream, write the crash

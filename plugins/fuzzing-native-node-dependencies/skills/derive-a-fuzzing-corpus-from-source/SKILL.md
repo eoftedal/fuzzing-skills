@@ -1,6 +1,6 @@
 ---
 name: derive-a-fuzzing-corpus-from-source
-description: Derive a high-coverage fuzzing seed corpus by reading the target's parser source instead of collecting sample files. Use when a fuzzing harness exists but has few or weak seeds, when coverage has plateaued, when a format or code path has no sample files, or when asked to improve a corpus, write seeds, or raise branch coverage.
+description: Derive a high-coverage fuzzing seed corpus by reading the target's parser source instead of collecting sample files. Needs the gated fork harness from build-a-nan-napi-fuzzing-harness and its gate corpus. Use when a fuzzing harness exists but has few or weak seeds, when coverage has plateaued, when a format or code path has no sample files, or when asked to improve a corpus, write seeds, or raise branch coverage. The second of four skills - after build-a-nan-napi-fuzzing-harness, before run-a-fuzzing-campaign and triage-fuzzing-findings.
 ---
 
 # Derive a fuzzing corpus by reading the source
@@ -9,9 +9,8 @@ You have a working harness. This is about what to feed it.
 
 **Budget: about fifteen minutes, and it does not have to be perfect.** The deliverable is
 a corpus that beats the baseline, passes the gate, and names what it does not cover; the
-campaign's mutations do the rest. The runs that took an hour spent it waiting: measuring
-thousands of unminimised fixtures, re-gating every seed in every mode on every variant,
-and running the crasher pass per mode. The rules below say what to skip; when you pass
+campaign's mutations do the rest. Time goes on waiting (unminimised measuring, gating
+everything everywhere, per-mode crasher passes); the rules below say what to skip. Past
 the budget, go to step 7, ship the union, and list the families you did not write.
 
 **The goal is branches, not valid files.** A seed does not have to be a valid image,
@@ -27,22 +26,29 @@ code that only runs once the input was accepted (step 8).
 **Prerequisites.** A harness that takes one input file as `argv[1]`, exits non-zero on
 rejection, and prints a one-line `key=value` result including the library's **own error
 code or name** in a field (the companion skill `build-a-nan-napi-fuzzing-harness` prints
-it as `err=`); `afl-showmap`. `resources/` holds the scripts, every step names its own,
-and all take `KEY=VALUE` arguments. `references/axes.md` is the long form of step 4;
-`references/measured-examples.md` holds the magnitudes behind every rule.
+it as `err=`); `afl-showmap`. `resources/` holds the scripts (`$RC/` in every command),
+every step names its own, and all take `KEY=VALUE` arguments. `references/` holds the long form of each step,
+pointed at from the step; `references/measured-examples.md` holds the magnitudes behind
+every rule. Read this file with a file reader, not `cat` into a terminal that truncates.
+
+**Every command block starts with `cd $W && . ./fuzz.env`** (`$W` written out as the
+absolute workspace path), because each tool call is a fresh shell; the harness skill wrote `fuzz.env` (`R`, `RC`, `W`, `PKG`, `MODES`, ...), and
+if it is missing, go back and run its `init_workspace.sh`.
 
 **The whole path:**
 
 ```sh
-# 1  resources/measure.sh BASE=baseline ...           what the existing seeds cover
+cd $W && . ./fuzz.env
+# 1  $RC/measure.sh BASE=baseline ...           what the existing seeds cover
 # 2  borrow: a transferred corpus, the gate corpus, fixtures, extract_literals.py
 # 3  read the dispatcher; one seed per sniffer at minimum match
-# 4  list the axes (table below); sweep options with resources/sweep.sh
+# 4  list the axes (table below); sweep options with $RC/sweep.sh
 # 5  author: gen_template.mjs for records, literal files for text
-# 6  resources/validate.sh per family                 seeds reach DEEP code?
-# 7  resources/compare.sh, minimise.sh, cover.sh      gap, union, stop signal
+# 6  $RC/validate.sh per family                 seeds reach DEEP code?
+# 7  $RC/compare.sh, minimise.sh, cover.sh      gap, union, stop signal
+# 7b $RC/dict.sh OUT=./dict.afl TOKENS=...       the campaign's dictionary
 # 8  the success path: the library's writer, transplants, fixture directories
-# 9  resources/cost.sh                                 per-exec cost
+# 9  $RC/cost.sh                                 per-exec cost
 ```
 
 ## Deliverable
@@ -54,35 +60,29 @@ and all take `KEY=VALUE` arguments. `references/axes.md` is the long form of ste
 | `maps_final/` | `measure.sh BASE=final CORPUS=./corpus-final`, so the next person can compare against it |
 | `crashers/`, `hangs/` | per the seed policy below, with `crashers.summary.tsv` beside them |
 | `<set>.manifest.tsv` | beside each generated set, outside the corpus directory |
+| `dict.afl` | the AFL++ dictionary (step 7b), which `campaign.sh` passes as `-x` by default |
 
 Do not overwrite `corpus/`: it is the harness skill's gate corpus.
 
 **Seed policy.** A seed that crashes only the sanitized (ASAN) harness stays in
 `corpus-final/` and is also copied to `crashers/`, with its sanitizer `SUMMARY:` line
-recorded in `crashers.summary.tsv`. A seed that crashes the plain harness, or hangs
-(`rc=hang` from `measure.sh`), goes only to `crashers/` (hangs may go in `hangs/`) and
-never into `corpus-final/`. The campaign skill runs afl-fuzz with
+recorded in `crashers.summary.tsv`. A seed that crashes the plain harness goes only to
+`crashers/`, with a `plain rc=` row in the same file; one that hangs (`rc=hang` from
+`measure.sh`) goes to `hangs/`; neither goes into `corpus-final/`. The campaign skill runs afl-fuzz with
 `AFL_IGNORE_SEED_PROBLEMS=1`, which skips crashing and hanging seeds in the dry run
-instead of aborting, so the ASAN-only crashers left in `corpus-final/` are harmless there;
-`AFL_SKIP_CRASHES=1` covers crashes only and is not the setting to rely on.
+instead of aborting, so the ASAN-only crashers left in `corpus-final/` are harmless there.
 
-Every script that runs the harness bounds each run with `TIMEOUT=` (seconds, default 5)
-and reports seeds over it as `hang`. `measure.sh` and the gate take `JOBS=` (default 8);
+Every script that runs the harness bounds each run with `TIMEOUT=` (seconds, default 5;
+30 for step 7's ASAN crasher pass) and reports seeds over it as `hang`. `measure.sh` and the gate take `JOBS=` (default 8);
 a thousand seeds is a minute, not five.
 
-**A harness with several entry points** (`MODE=` settings, from the harness skill) is
-one corpus measured several times. The scripts handle it like this: `measure.sh` runs
-in one environment, so `sweep.sh SWEEP='MODE=... MODE=...'` is how you measure every
-mode (it also writes the per-seed union, `maps_<base>_union/`, and names the per-mode
-directories `maps_<base>_default` and `maps_<base>_MODE_compress`: `=` becomes `_`; the
-current environment is always included, so do not list it in `SWEEP`); `compare.sh`
-takes the unions; `minimise.sh MODES=` keeps a candidate that adds an edge in **any**
-mode and `HAVE=` takes every per-mode map directory (it refuses one that does not exist); `cover.sh MAPS=` takes several directories
-and unions each seed's maps, so the cover is not biased to the default mode; the seed
-policy and the final gate loop over modes (step 7). Report per-mode edges and the union.
-A setting is not a seed byte, so a mode-dependent corpus is still one directory: the
-campaign skill runs one campaign per mode (`campaign.sh MODES=`) over the same
-`corpus-final/`.
+**A harness with several entry points** (`MODE=` settings) is one corpus measured
+several times, and still one directory: the campaign runs one campaign per mode over
+`corpus-final/`. `sweep.sh SWEEP='MODE=a MODE=b'` measures every mode (the current
+environment is always included: do not list it) and writes `maps_<base>_union/`; give
+`compare.sh` the unions, and `minimise.sh MODES= HAVE=` and `cover.sh MAPS=` every
+per-mode directory. Report per-mode edges and the union. Names and details:
+`references/modes.md`.
 
 ---
 
@@ -92,38 +92,37 @@ Non-negotiable, and the most common way this work gets wasted. You need what the
 existing seeds cover before you can know what a new corpus adds *and misses*.
 
 ```sh
-resources/measure.sh BASE=baseline HARNESS=./out/plain/harness-fork CORPUS=./corpus
+cd $W && . ./fuzz.env
+$RC/measure.sh BASE=baseline HARNESS=./out/plain/harness-fork CORPUS=./corpus
 ```
 
-It writes per-seed maps to `maps_baseline/`, always saves each seed's exit code and
-result line to `maps_baseline/.results` (which `validate.sh` and `error_inventory.sh`
-reuse, so the harness is not run again; `NO_RESULTS=1` skips that pass on a slow
-target), and prints edge total, unique-map count, the exit-code histogram and which seeds
-duplicate another's coverage. Pass `MAP_SIZE=$(cat out/plain/map_size)` when the
-harness is not instrumented the way the script guesses. It costs about two process
-starts per seed: measure an unminimised borrowed set (thousands of extracted literals)
-once, or send it straight to `minimise.sh`, and use `NO_RESULTS=1` for sweeps.
+It writes per-seed maps to `maps_baseline/` and each seed's exit code and result line to
+`maps_baseline/.results` (which `validate.sh` and `error_inventory.sh` reuse, so the
+harness is not run again), and prints edge total, unique-map count, the exit-code
+histogram and which seeds duplicate another's coverage; it reads `out/<v>/map_size`
+itself. `NO_RESULTS=1` skips the result pass, for a
+discovery sweep only, never the final one, whose `.results` step 7 reads.
 
 **Then find out which back ends are in code you instrumented**, because a family aimed
-at an uninstrumented decoder costs the same to write and shows up as nothing:
+at an uninstrumented decoder costs the same to write and shows up as nothing. Look at
+the harness binary and its archives, not the addon, whose `ldd` lists system `.so` files a
+static-archive harness never loads:
 
 ```sh
+cd $W && . ./fuzz.env
 nm ./out/plain/harness-fork | grep -c sancov                        # the harness itself: must be > 0
-for l in $(ldd <addon>.node | awk '{print $3}' | grep -vE 'libc\.|libstdc|libgcc|libm\.|libpthread|ld-linux'); do
-  printf '%-40s sancov=%s\n' "$(basename $l)" "$(nm -D $l 2>/dev/null | grep -c sancov)"
-done
+for a in out/plain/lib/*.a; do [ -f "$a" ] && echo "$(basename $a) sancov=$(nm $a 2>/dev/null | grep -c sancov)"; done
+# only if the harness links a shared library: nm -D on each ldd ./out/plain/harness-fork entry
 ```
 
-An empty list is the good case: everything is statically linked and instrumented.
-Spend the family budget where the instrumentation is. When every decoder is a system
-`.so` with `sancov=0` (an image-decoding binding whose image codecs are system
-libraries), the productive families are the **in-tree parsers**: a hand-rolled BMP
-reader, container and EXIF glue, GIF compositing. A family for an uninstrumented decoder, and the writer-driven seeds of
-step 8 for it, add nothing you can measure.
+Every archive non-zero (or no archives) is the good case. Spend the family budget where
+the instrumentation is: when every decoder is in a system `.so` with `sancov=0` (or the
+harness links no instrumented archive of it), write for the **in-tree parsers** (`references/measured-examples.md`
+step 1); a family, or step 8's writer seeds, for an uninstrumented decoder adds nothing
+you can measure.
 
-Two readings of the measurement that mislead: many seeds sharing one map while all
-*failing* die early; sharing one map while all *succeeding* means the work is in code you
-did not instrument. Check the exit codes before concluding either.
+Many seeds sharing one map die early if all *fail*, and run uninstrumented code if all
+*succeed*: check the exit codes before concluding either.
 
 ---
 
@@ -132,53 +131,40 @@ did not instrument. Check the exit codes before concluding either.
 Cheapest coverage available, in this order. Measure each as an A-side (step 7), then
 `minimise.sh` it into the corpus rather than shipping all of it.
 
-1. **A corpus derived for another target over the same format.** Reading a *format*
-   amortises across every binding over it. The seeds must share the **input convention**
-   too: a UTF-16 corpus needs re-encoding before it means anything to a UTF-8 parser.
-2. **The harness's own gate corpus.** Twenty to forty seeds written to populate both
-   arms. A weak baseline, but a real one, and often the only one. It also catches a
-   failure a sample baseline cannot (step 7, "every A-side").
-3. **Fixtures one level down.** The binding may ship none while the vendored dependency
-   ships many. Filter the `find` to the target's own tree, or it returns devDependency
-   noise, and **look inside vendored tarballs and submodules**: a vendored source tarball
-   under `deps/` can hold the library's whole `tests/files/` with a README naming every
-   case, and `find` cannot see it.
+1. **A corpus derived for another target over the same format**, in the same **input
+   convention** (re-encode a UTF-16 corpus for a UTF-8 parser).
+2. **The harness's own gate corpus**: weak but real, often the only baseline (step 7,
+   "every A-side").
+3. **Fixtures one level down**, in the vendored dependency's tree. Filter the `find` to
+   the target's own tree, and **look inside vendored tarballs and submodules**, which
+   `find` cannot see (`references/fixtures.md`).
    ```sh
+   cd $W && . ./fuzz.env && cd <package dir>
    find . -path ./node_modules -prune -o -type d \( -name test -o -name tests -o -name testing \
         -o -name fixtures -o -name testdata -o -name corpus -o -name golden* \) -print
    for t in deps/*.tar.* vendor/*.tar.*; do case $t in *.sig|*.asc|*.sha*) continue;; esac
      [ -f "$t" ] && tar tf "$t" | grep -iE 'test|fixture' | head; done
    ```
-   (A vendored library's test directory may be named `testing`, and a tarball usually
-   ships beside its `.sig`.)
-   **The fixtures may not be files.** A library whose tests are compiled often carries
-   hundreds of documents as string literals in its test source:
+   **The fixtures may not be files**: compiled tests carry documents as string literals.
    ```sh
-   resources/extract_literals.py OUT=./corpus-fixtures STARTS='<' SRC=<lib>/tests/*.c
-   resources/extract_literals.py OUT=./corpus-fixtures RE='^(\x89PNG|GIF8)' SRC=test/*.js
-   resources/extract_literals.py OUT=./corpus-fixtures DECODE=hex SRC=tests/*.ts
-   resources/extract_literals.py OUT=./corpus-fixtures ALL=1 SRC=tests/*.c   # no signature byte
+   cd $W && . ./fuzz.env; P=<package dir>
+   $RC/extract_literals.py OUT=./corpus-fixtures STARTS='<' SRC=$P/<lib>/tests/*.c
+   $RC/extract_literals.py OUT=./corpus-fixtures RE='^(\x89PNG|GIF8)' SRC=$P/test/*.js
+   $RC/extract_literals.py OUT=./corpus-fixtures DECODE=hex SRC=$P/tests/*.ts
+   $RC/extract_literals.py OUT=./corpus-fixtures ALL=1 SRC=$P/tests/*.c   # no signature byte
    ```
-   `SRC=` repeats, takes a glob, or one quoted list; a path that does not exist is an
-   error, not an empty result. `DECODE=hex|base64` when a binary record is spelled out
-   as a string. `ALL=1` for a format with no signature byte (patterns, queries, source
-   text); the default filter throws nearly everything away there. For a **structured**
-   input convention (a container of `flags NUL pattern NUL subject`), a raw literal is
-   not a seed: wrap each one into the container with a few lines of script before
-   measuring. `JSREGEX=1` also extracts JS **regex literals**
-   (`/.../flags`), the dominant fixture form in a regex binding's own tests, which string
-   extraction misses entirely. Images embedded as `data:` URIs are not reachable this
-   way; use the fixture files.
+   `JSREGEX=1` for JS regex literals; wrap
+   each literal into a **structured** input convention before measuring; `data:` URIs
+   are not reachable this way. Options and cases: `references/fixtures.md`.
 4. **The library's own writer.** Where the dependency can write the format (step 8), its
    default output is a sample corpus you generated yourself.
 
-**Ignore the one giant sample.** A single multi-megabyte document is a cost problem, not
-a corpus. Use it to find constructs, then write small seeds carrying them.
+**Ignore the one giant sample** (a cost problem, not a corpus): mine it for constructs,
+then write small seeds carrying them.
 
 **Never `measure.sh` an unminimised borrowed set of more than a few hundred files.** Send
 it straight to `minimise.sh` against the baseline maps (one `afl-showmap` per candidate,
-no result pass) and measure the keepers; thousands of extracted literals are minutes of
-waiting for a number you will not use.
+no result pass) and measure the keepers.
 
 ### When there is genuinely no baseline
 
@@ -187,38 +173,20 @@ with the to-do list the library wrote for you: **every error code it can raise t
 your corpus never provokes.**
 
 ```sh
-resources/error_inventory.sh SRC=<vendor dir> PREFIX=<LIB> RESULTS=maps_baseline/.results
+cd $W && . ./fuzz.env
+$RC/error_inventory.sh SRC=<vendor dir> PREFIX=<LIB> RESULTS=maps_baseline/.results
 ```
 
-Three routes, best first. If the library exposes `*_ErrorString()` / `*_strerror()`
-(or a C++ `Status::CodeText()`), **do not grep**: `resources/errenum_template.c` is the
-ten-line program; fill in the two names, compile it together with the library's
-error-string source file (the AFL-instrumented objects do not link into a plain program;
-the pristine ones do), and diff its output against the `err` column of `.results`. It
-skips the filler string such functions return for non-members. The mapping is exact,
-and on every target that had such a function it was the right route; an enum member
-the parser never sets is dead code, which is a finding, not a gap. If the harness
-prints the numeric code, parse the enum from the header and index it:
-`sed -n '/^typedef enum/,/^}/p' <lib>/api.h | grep -oE '[A-Z][A-Z0-9_]*ERR[A-Z0-9_]*'`.
-Only otherwise grep literals, and if the library *composes* its messages at runtime,
-grep the composer, not the literals: a literal grep both misses most of the real
-inventory and returns unrelated constants. `HASHCMD=` only works when the harness hashes
-exactly the literal; a low hit rate from it means the comparison is broken, not the
-corpus.
+Three routes to the list, best first (`references/error-inventory.md` has each):
 
-Classify what remains: **input-reachable** (write the seed), **API-state only**
-(suspend/abort/alloc-failure paths: ignore), **unreachable in this configuration** (a
-feature the binding never enables, a legacy format compiled out: ignore, and record why),
-and **converted internally** (an inner layer's code that an outer layer maps to a generic
-one before it reaches the API: an entropy decoder's table-size errors reported as
-"corruption detected" by the block layer; the generic code is the reachable one, so count
-the inner ones as covered by it, not as gaps). The third class is where effort goes to
-die: check which constructor and which subsystems the binding actually calls before
-writing seeds for a feature it never turns on. One more thing the histogram shows: a JS
-wrapper may **shadow** the library's header errors (a size pre-check that throws its own
-error before the native call), so a code is reachable only through an input that gets
-past the pre-check first (an unsized first frame); the per-family `err` histogram is
-where that shows.
+* an `*_ErrorString()` / `*_strerror()` function: compile `$RC/errenum_template.c`
+  against it and diff with the `err` column; **do not grep**;
+* a numeric code from the harness: parse the enum from the header;
+* only otherwise grep literals, and the composer when messages are built at runtime
+  (`HASHCMD=` only when the harness hashes exactly the literal).
+
+Classify what remains (input-reachable: write the seed; the other classes, and a JS
+wrapper shadowing a library error, are in `references/error-inventory.md`).
 
 **Measure after each family.** A family that adds nothing means you misread the code
 (when to stop: the last section).
@@ -227,25 +195,23 @@ where that shows.
 
 ## Step 3 — Read the entry point first
 
-Find the function that decides *what kind of input this is*.
+Find the function that decides *what kind of input this is* (`references/axes.md`, "Read
+the entry point first", has the reasoning).
 
-* **Sniffers are looser than the formats they claim to detect.** Look for magic checks
-  testing fewer bytes than the signature has, or skipping one. Write one seed per
-  sniffer at its **minimum match**, often 2-12 bytes: the cheapest coverage in the method.
+* **One seed per sniffer at its minimum match**, often 2-12 bytes: sniffers test fewer
+  bytes than their signature.
   ```sh
+  cd $W && . ./fuzz.env && cd <package dir>
   grep -rnE "memcmp\(.*(magic|sig|header)|== *0x[0-9a-fA-F]{2}.*&&.*== *0x" src/
   ```
-* **Dispatch order is reachability.** If the dispatcher tests A before B, anything
-  matching both never reaches B.
-* **Short inputs.** A zero-padded fixed-size sniff buffer means sub-minimum inputs still
-  reach every sniffer with defined values. Emit lengths 0, 1, 2, 3 and the sniff width.
-* **Anything that runs before the real codec**: metadata, container framing, checksum
-  skipping. In-tree, hand-written, rarely reviewed, reachable behind two bytes of magic.
-  Prioritise it.
-* **Supported formats with zero fixtures** are the biggest gap a sample corpus has, and
-  mutation never closes it. **Verify the back end is registered** before writing a family
-  for it: a class name in `strings` can sit behind an `#ifdef` the build never defined.
-  One minimum-match probe settles it. Have the harness print **which back end was
+* **Dispatch order is reachability**: anything matching an earlier test never reaches a
+  later one.
+* **Emit lengths 0, 1, 2, 3 and the sniff width.** afl-fuzz drops a zero-byte seed
+  (named in `campaigns/<name>.dropped`), so the step 7 union leaves it in the gate corpus.
+* **Prioritise anything that runs before the real codec**: metadata, container framing,
+  checksum skipping.
+* **Write for supported formats with zero fixtures**, after one minimum-match probe
+  proves the back end is registered. Have the harness print **which back end was
   selected**.
 
 ---
@@ -257,11 +223,11 @@ One line per axis; `references/axes.md` has the reasoning and the greps.
 | axis | how to find it | what to emit |
 |---|---|---|
 | generated parser | the grammar/schema/IDL file **is** the axis list; its `extras` and token regexes are looser than the standard | productions, separators, tokens straight from the grammar |
-| constants | `enumerate_constants.sh` for hand-rolled parsers; `case` arms and enums for mature ones. **Only when the value selects a branch**: names looked up in one table by one loop (Unicode property names, script names) are data, and 516 seeds for them bought 11 edges | every accepted value, every rejected one, one unlisted, both sides of each range check |
+| constants | `enumerate_constants.sh` for hand-rolled parsers; `case` arms and enums for mature ones. **Only when the value selects a branch**: names looked up in one table by one loop (Unicode property names) are data, and 516 seeds bought 11 edges; a table of function pointers (one converter per name) is the next row's axis | every accepted value, every rejected one, one unlisted, both sides of each range check |
 | declared sizes and counts | any field the code allocates or loops from (content size, dimensions, entry counts); the field's **encoding** (one frame format stores size-256 under one flag) | both sides of the allocation ceiling, sums across records (2^53 in a JS double, 2^64), the wrap-to-zero product, and each encoding boundary checked against the real writer |
 | the fixture the harness supplies | for a program-shaped input (regex, query, template) the subject's length and anchoring select the engine | several subjects via `SUBJECT=`, and seeds that genuinely match each one; dump the match result to confirm they do |
 | options and modes | `grep -rnE '_PARSE_\|_OPT_\|getenv\(' src/ harness.cc`; also compile-time macros and constructors the binding never calls | per-setting corpus directories via `sweep.sh` (step 7: sweep both sides) |
-| parallel implementations | per encoding, width, endianness, syntax (`_utf8_`, `_le_`, `SIMD`) | the construct list re-emitted over every implementation |
+| parallel implementations | per encoding, width, endianness, syntax (`_utf8_`, `_le_`, `SIMD`), or one per name in a function-pointer table | the construct list re-emitted over every implementation |
 | internal buffer sizes | `#define *_(BUF\|CHUNK\|BLOCK)_SIZE` | a multi-byte char straddling each boundary; tables grown past their initial size |
 | position | prolog, declaration, content, attribute value, epilog, inside a literal | each construct in each legal position |
 | sub-grammar | does the construct take an argument something else parses? | the grammar *inside* the construct |
@@ -275,25 +241,12 @@ Cross only the fields the code couples (`if (... && ...)` naming two fields). Cr
 everything with everything produces 10 000 files testing one error path.
 
 **Options are often worth more than any seed work** and easy to miss because they are not
-input bytes; a setting that changes nothing is itself a finding (the binding never makes
-the call). Expect a near-null result sometimes.
+input bytes; a setting that changes nothing is itself a finding, and a near-null result
+is normal (`references/axes.md`, "The option axis").
 
-### Bug patterns to hold in mind while reading
-
-| Shape | Why it breaks | Seeds to write |
-|---|---|---|
-| Range check **before** a sign flip (`if (h > MAX) err; if (h < 0) h = -h;`) | the negation reintroduces the excluded value | large negatives for every signed field, especially `INT_MIN` |
-| Allocation size computed in `int` from input fields | overflows long before any field looks unreasonable | factor backwards so the product **wraps to 0 or small positive** |
-| `new T[n]` without `nothrow` plus a null check | plain `new[]` throws, so the guard is dead code | an unreasonable size aborts the process |
-| `new (nothrow) T[n]` where arithmetic **wraps to 0** | allocation succeeds, every guard passes | a *negative* size is caught, zero is not |
-| Two reader primitives, one checked and one not | some call site relies on one up-front check | pass the up-front check, then read more than was validated |
-| A reader with no bounds checks plus a separate `hasBytes()` | a caller that does not use it; `_idx + n` wraps | an index so large the wrap reports "true" |
-| Unsigned underflow in relative offsets (`skip(read32() - 8)`) | `value < constant` gives ~4 G | that field at `0`, `1`, `constant-1`, `UINT_MAX` |
-| Table indexed by a raw byte, sized by a count field | index 0..255 into a 2-entry table | minimum legal table size, maximum index values |
-| Loop bound from one structure, memory sized by another | declared vs actual, container vs element | mismatch the pair |
-| Error paths that release without clearing the pointer | shared cleanup frees again | reach each early return |
-| Anything parsed **before** validation | hand-written, rarely reviewed, cheap to reach | two bytes of magic plus crafted metadata |
-
+**Hold the bug patterns in mind while reading** (`references/bug-patterns.md`: sign flips
+after range checks, `int` allocation sizes that wrap, unchecked readers, offset
+underflow, mismatched loop bounds, double frees) and write the seeds each row names.
 Verify allocator behaviour on *your* toolchain with a ten-line program rather than
 reasoning about it.
 
@@ -303,7 +256,7 @@ reasoning about it.
 
 | Input shape | Author as | Why |
 |---|---|---|
-| Binary record with sizes/offsets that must agree | **generator** from `resources/gen_template.mjs` | derived fields cannot be hand-maintained; you will regenerate a dozen times |
+| Binary record with sizes/offsets that must agree | **generator** from `$RC/gen_template.mjs` | derived fields cannot be hand-maintained; you will regenerate a dozen times |
 | Text in a grammar | **literal seeds, one file per construct** | a flat list of `emit(name, bytes, why)` *is* the readable form |
 | Families that multiply (construct x encoding x position) | **small loops over a table of literals** | mild parameterisation, not a field-deriving generator |
 | Payload that must genuinely decode | **the library's own writer** (step 8) | hand-assembly means implementing the codec |
@@ -311,32 +264,27 @@ reasoning about it.
 The deciding property is whether seeds contain fields that must agree with each other.
 If nothing has to be derived, do not build a generator.
 
-**If you write a generator**, start from `gen_template.mjs`. It already names files
-`<family>-<nnn>-<name>` so `validate.sh PREFIX=` can slice a family, writes the manifest
-*outside* the corpus directory, clamps every written integer to its field width, and
-separates the declared value from the actual layout. What you add:
+**If you write a generator**, start from `gen_template.mjs` (it already names files
+`<family>-<nnn>-<name>` for `validate.sh PREFIX=`, writes the manifest outside the corpus,
+clamps writes to field width, and separates declared value from layout). Add:
 
 * **Defaults that parse to completion, proved by byte-diffing against the real writer
-  before any family exists.** Thirty seconds, and it catches the class of framing error
-  that no re-reading of the format does:
+  before any family exists**: a differing required field is the bug, an optional one is
+  fine if both decode alike (`references/measured-examples.md` step 5):
   ```sh
+  cd $W && . ./fuzz.env
   <writer> < sample > ref.bin && od -An -tx1 ref.bin | head -3
   node gen.mjs ONLY=default && od -An -tx1 corpus-derived/default-001-default | head -3
   ```
-  A difference in an **optional** field (a writer that adds sizes or padding to a header
-  by default, a multithreaded encoder's flags) is fine when both records decode to the
-  same bytes; a difference in a required field is the bug you are looking for.
-* **Dependent fields derived from the code's own rule.** A plausible constant silently
-  kills a whole family.
+* **Dependent fields derived from the code's own rule**, never a plausible constant.
 
 **If you write literal seeds**, start from one that parses to completion and vary one
 construct per file. A family that all dies on an early syntax error tests one path many
 times.
 
-**Seeds that crash the sanitized harness are the point, not a problem.** The bug-pattern
-table asks for them (INT_MIN dimensions, indices past a palette), and they belong in the
-deliverable under the seed policy at the top: ASAN-only crashers stay in `corpus-final/`
-and are copied to `crashers/`; plain-harness crashers and hangs leave it.
+**Seeds that crash the sanitized harness are the point, not a problem.** The bug patterns
+ask for them (INT_MIN dimensions, indices past a palette); file them under the seed
+policy at the top.
 
 **Either way:** keep two or three realistic composites (per-construct seeds cannot cover
 combinations) and mark them in the manifest. A generator that imports the package needs
@@ -347,15 +295,15 @@ whatever variant was built last.
 
 ## Step 6 — Validate that seeds reach deep code, not that they run
 
-The highest-value check here. A corpus can have hundreds of files, all executing without
-error, and score no better than the baseline, because they all died on the first
-validated field.
+The highest-value check here: hundreds of seeds can all run cleanly and score no better
+than the baseline, because they all died on the first validated field.
 
 ```sh
-resources/measure.sh BASE=derived HARNESS=./out/plain/harness-fork CORPUS=./corpus-derived   # writes maps_derived/
-resources/validate.sh RESULTS=maps_derived/.results FIELD=err                  # from measure.sh
-resources/validate.sh RESULTS=maps_derived/.results FIELD=err PREFIX=len-      # one family, no harness runs
-resources/validate.sh RESULTS=maps_derived/.results FIELD=err IGNORE="out_hash out_len"   # group by error only
+cd $W && . ./fuzz.env
+$RC/measure.sh BASE=derived HARNESS=./out/plain/harness-fork CORPUS=./corpus-derived   # writes maps_derived/
+$RC/validate.sh RESULTS=maps_derived/.results FIELD=err                  # from measure.sh
+$RC/validate.sh RESULTS=maps_derived/.results FIELD=err PREFIX=len-      # one family, no harness runs
+$RC/validate.sh RESULTS=maps_derived/.results FIELD=err IGNORE="out_hash out_len"   # group by error only
 ```
 
 **Run it per family.** One broken family of 15 disappears into 200 healthy seeds. Three
@@ -366,11 +314,16 @@ checks, in increasing value:
 2. **Unique maps vs file count.** Want them close, with the step-1 caveat about
    uninstrumented code.
 3. **The target's own error code, per seed.** The same early error on every seed means
-   you never got past field one. This is the one that finds the bug.
+   you never got past field one. This is the one that finds the bug. With only an error
+   class, or a message embedding a position, `err` is the message up to the position
+   marker (`references/error-inventory.md`).
+
+After `sweep.sh` the results are per mode: `maps_<base>_default/.results`, and one per
+setting beside it (`references/modes.md`).
 
 **When the "valid" seeds do not parse, diff against the real encoder** instead of
 reasoning about which field is wrong: `od -An -tx1` on one record from each, side by
-side. It is faster and it is conclusive.
+side: faster, and conclusive.
 
 ---
 
@@ -380,7 +333,8 @@ The absolute edge count depends on how much of the dependency is instrumented; t
 *differences* say where to go next.
 
 ```sh
-resources/compare.sh A=maps_baseline B=maps_derived
+cd $W && . ./fuzz.env
+$RC/compare.sh A=maps_baseline B=maps_derived
 ```
 
 * **Expect reading alone to score level with or below the baseline.** A derived corpus
@@ -398,65 +352,107 @@ resources/compare.sh A=maps_baseline B=maps_derived
 apply the seed policy, measure:
 
 ```sh
-H=./out/plain/harness-fork
+cd $W && . ./fuzz.env; H=./out/plain/harness-fork
 # every BORROWED set is minimised against what you have, and only its keepers are shipped
-resources/minimise.sh HAVE="maps_derived maps_baseline" CAND=./corpus-fixtures HARNESS=$H KEEP=./corpus-extra
-resources/minimise.sh HAVE="maps_derived maps_baseline" CAND=./corpus-samples  HARNESS=$H KEEP=./corpus-extra
+$RC/minimise.sh HAVE="maps_derived maps_baseline" CAND=./corpus-fixtures HARNESS=$H KEEP=./corpus-extra
+$RC/minimise.sh HAVE="maps_derived maps_baseline" CAND=./corpus-samples  HARNESS=$H KEEP=./corpus-extra
 # union of every set (name yours), deduplicated by content hash; corpus/ is read, never written
 mkdir -p corpus-final crashers hangs; : > corpus-final.hashes
 for f in corpus/* corpus-derived/* corpus-extra/*; do
-  [ -f "$f" ] || continue
+  [ -f "$f" ] && [ -s "$f" ] || continue    # zero bytes: no afl-fuzz seed
   h=$(sha1sum < "$f" | cut -d' ' -f1); grep -qx "$h" corpus-final.hashes && continue
   echo "$h" >> corpus-final.hashes
   n=$(basename "$f"); [ -e "corpus-final/$n" ] && n="$(basename "$(dirname "$f")")-$n"
   cp "$f" "corpus-final/$n"
 done
-resources/measure.sh BASE=final HARNESS=$H CORPUS=./corpus-final
-# seed policy: hangs and plain-harness crashes (rc >= 128 is a signal) leave corpus-final/
+$RC/measure.sh BASE=final HARNESS=$H CORPUS=./corpus-final
+# seed policy: hangs and plain crashes (rc >= 128) leave corpus-final/.
+# rebuild this pass's rows only: smoke-* rows are smoke.sh's finds, not re-derivable here
+grep '^smoke-' crashers.summary.tsv > .tmp 2>/dev/null; mv .tmp crashers.summary.tsv
 awk -F'\t' '$1=="hang"{print $3}' maps_final/.results | while read -r n; do mv "corpus-final/$n" hangs/; done
-awk -F'\t' '$1~/^[0-9]+$/ && $1>=128 {print $3}' maps_final/.results | while read -r n; do mv "corpus-final/$n" crashers/; done
+awk -F'\t' '$1~/^[0-9]+$/ && $1>=128 {print $1"\t"$3}' maps_final/.results | while IFS=$'\t' read -r rc n; do
+  mv "corpus-final/$n" crashers/ && printf '%s\tplain rc=%s\n' "$n" "$rc" >> crashers.summary.tsv; done
 # ASAN-only crashers stay, and are copied out with their summary line.  Same ASAN_OPTIONS as
 # the campaign and the gate: without the allocation ceiling a seed that merely DECLARES a huge
 # size aborts with allocation-size-too-big and is filed as a crasher it is not.
-# Default mode only, in parallel: a seed that crashes only in another mode is the campaign's
-# to find (it runs one campaign per mode), not worth a serial pass per mode here.
-export ASAN_OPTIONS="detect_leaks=0:allocator_may_return_null=1:max_allocation_size_mb=${ALLOC_CAP_MB:-1024}"
+# Default mode only, in parallel: a crash only in another mode is that mode's campaign's to find.
+# 30 s, not 5: under load ASAN symbolization outlasts 5 s, the report loses its SUMMARY: line,
+# and the pass would record nothing; the WARN names every such seed.
+export ASAN_OPTIONS="detect_leaks=0:exitcode=86:allocator_may_return_null=1:max_allocation_size_mb=$ALLOC_CAP_MB"
 find corpus-final -maxdepth 1 -type f -print0 | xargs -0 -P 8 -I{} bash -c '
-  s=$(timeout -k1 5 ./out/asan/harness-fork "$1" 2>&1 >/dev/null | grep -m1 "^SUMMARY:")
-  [ -n "$s" ] && cp "$1" crashers/ && printf "%s\t%s\n" "$(basename "$1")" "$s"' _ {} >> crashers.summary.tsv
-resources/measure.sh BASE=final HARNESS=$H CORPUS=./corpus-final     # maps_final/ after the moves
-resources/sweep.sh BASE=final HARNESS=$H CORPUS=./corpus-final SWEEP="$MODES"   # per-mode + maps_final_union/
-resources/cover.sh MAPS="maps_final_union" KEEP=./corpus-min CORPUS=./corpus-final
+  o=$(timeout -k1 "$2" ./out/asan/harness-fork "$1" 2>&1 >/dev/null); rc=$?
+  s=$(printf "%s\n" "$o" | grep -m1 "^SUMMARY:")
+  if [ -n "$s" ]; then cp "$1" crashers/ && printf "%s\t%s\n" "$(basename "$1")" "$s"
+  elif [ $rc = 86 ] || [ $rc -gt 128 ] || printf "%s" "$o" | grep -q "ERROR: AddressSanitizer"; then
+    echo "WARN: $(basename "$1") rc=$rc but no SUMMARY: line: raise TIMEOUT" >&2; fi' _ {} "${TIMEOUT:-30}" >> crashers.summary.tsv
+$RC/measure.sh BASE=final HARNESS=$H CORPUS=./corpus-final     # maps_final/ after the moves
+# no modes: sweep.sh refuses an empty SWEEP and writes no union, so cover the one map set
+if [ -n "$MODES" ]; then
+  $RC/sweep.sh BASE=final HARNESS=$H CORPUS=./corpus-final SWEEP="$MODES"   # fuzz.env's MODES, as the gate's
+  $RC/cover.sh MAPS="maps_final_union" KEEP=./corpus-min CORPUS=./corpus-final
+else
+  $RC/cover.sh MAPS="maps_final" KEEP=./corpus-min CORPUS=./corpus-final
+fi
 ```
 
 The greedy cover in `corpus-min/` is a stop signal, not a reason to ship only the cover
 (a fuzzer mutates what you give it, and duplicates cost little); criteria in the last section.
 
-**Re-run the harness skill's gate on `corpus-final/`**: the **plain** variant in the
-default mode over the whole corpus (`JOBS=8`; a thousand seeds is about a minute), then
-the other modes and the asan variant over `corpus-min/` only. The oracle's ceiling and a
-mirroring gap show on plain in the default mode; the cover reaches every edge, so it is
-enough to prove the other arms. Gating every seed in every mode on every variant is what
-turned one run into an hour. It is the only check that finds fidelity gaps the gate corpus was
-too small to reach, and on one target it was what exposed a library accepting inputs
-the real stack rejects. Expect it to find the oracle's ceiling too: a lossy conversion
-that changes the length as well as the hash needs `SOFT_DROP="out_len out_hash"`, and a
-lossy test that looks only at the final string misses a U+FFFD inside an event's name.
-Any mismatch goes back to the harness skill's step 5; do not ship a corpus the gate has
-not seen. One mismatch
-shape is a finding rather than a gap: a decoder that allocates its output and never
-fully writes it, or a parser that leaves part of a stack buffer unset on a bad input,
-puts uninitialised bytes in the API's result -- different between the arms, and for a
-heap buffer often different between two runs of one arm (run each arm twice; a stack
-buffer is usually stable per arm). ASAN does not see it; a one-off MSan build of the
-library and harness names it. Have the real side mark exactly **those inputs** lossy
-(the condition that takes the path), never the whole mode, and record it as
-uninitialised memory reaching the API.
+**Check that every seed agrees with itself** (exit 0 when all do):
+
+```sh
+cd $W && . ./fuzz.env
+$RC/nondet.sh HARNESS=./out/plain/harness-fork CORPUS=./corpus-final MOVE=./corpus-nondet MODES="$MODES"
+```
+
+A seed that does not agree with itself cannot pass the gate reliably, and its mutants
+drag the campaign's stability down: quarantine it, or canonicalise the order on both
+sides of the gate; never loosen `FIELDS`. A seed also in `crashers/` is not quarantined:
+its varying result is the bug (an over-read returning garbage), not noise. When it moves
+anything, re-run the last `measure.sh` and the cover so `maps_final/` and `corpus-min/` drop those seeds too.
+
+**Re-run the harness skill's gate** (`$R/gate.sh`): the **plain** variant in the default
+mode only (`MODES=""`) over the whole corpus, then the asan variant in every mode over
+the cover (`gate.sh` picks `REAL_ASAN` itself for it; the rest comes from `fuzz.env`):
+
+```sh
+cd $W && . ./fuzz.env
+$R/gate.sh DIRECT=./out/plain/harness-fork CORPUS=./corpus-final JOBS=8 MODES="" MAP_SIZE=$(cat out/plain/map_size)
+$R/gate.sh DIRECT=./out/asan/harness-fork CORPUS=./corpus-min JOBS=8
+```
+
+Re-gate because only a real corpus reaches the oracle's ceiling; the cover is enough for
+the asan arms
+(`references/measured-examples.md` step 7). `gate.sh` skips seeds also in `crashers/` as
+`known-crasher`, so the ASAN-only crashers the cover kept need no exclusion. The lossy
+test must look at every string the API returns (a U+FFFD inside an event's name). Any
+mismatch goes back to the harness skill's step 5 and its `references/oracle-ceiling.md`;
+do not ship a corpus the gate has not seen.
 
 **When you cannot predict the offset, sweep and minimise.** Generate every single-byte
 flip of two or three small composites (not of every seed, and never through
 `measure.sh`), then `minimise.sh` keeps the few that pay. This is the fuzzer's own job;
 a few hundred keepers for a few hundred edges is plenty.
+
+---
+
+## Step 7b — Write the dictionary
+
+afl-fuzz splices dictionary tokens in whole; mutation alone almost never assembles a
+multi-byte keyword. The harness builds wrote `out/<variant>/dict.afl` (the constants
+instrumented code compares against); add what that pass cannot see:
+
+```sh
+cd $W && . ./fuzz.env
+$RC/dict.sh OUT=./dict.afl TOKENS="<separator> <mode> <option> ..." [SRC="<uncompiled sources>"]
+```
+
+`TOKENS` (or `TOKENS_FILE=`): the framing separators documented at the top of
+`harness.cc`, every `MODE` and option value, the names in a lookup table that selects
+code (encoding or format names), a grammar's keywords and operators. `SRC=` harvests
+literals from sources afl-clang-fast never compiled (a system library, JavaScript that
+selects native paths). The campaign picks `$W/dict.afl` by itself. Syntax and a worked
+example: `references/dictionary.md`.
 
 ---
 
@@ -470,40 +466,32 @@ The gap that survives source reading is code that only runs once the input was a
 | A **program** run against data (regex, query, template, bytecode) | seeds that genuinely **match or execute against the fixture the harness supplies**; dump each seed's result once to confirm, because a "matching" seed that matches nothing tests the reject path again |
 | A document it transforms | a valid document per output mode |
 
-**Decide whether you need the writer at all.** It is necessary only when the format has a
-layer you cannot hand-assemble: entropy coding, a range coder, codec-internal tables, a
-checksum over compressed bytes. On a shallow tag-based format it adds nothing. One
-writer option is usually worth two axes: the flag that omits a declared output size is
-often also the binding's dispatch switch.
-
-**The most productive seeds of all are valid records corrupted after the header.** A
-correct early section with a broken later one gets deep and *then* fails.
-
-**Transplant blobs you cannot synthesise** (a colour profile, a metadata IFD, an embedded
-font): cut the segment out of a sample and graft it onto a tiny host. Truncated and
-length-inflated variants come free. Where the writer refuses a variant, keep the sample
-that holds it and say so.
-
-**If the target resolves external references, the corpus is a directory.** A seed whose
-include never resolves reaches only the failure path. Create the referenced files, point
-the target's search path at them, and treat the fixture directory as part of the corpus:
-entities and DTDs, stylesheet imports, template includes, archive members.
+**Decide whether you need the writer at all** (only for a layer you cannot
+hand-assemble), then drive it across its option surface. **The most productive seeds of
+all are valid records corrupted after the header.** **Transplant blobs you cannot
+synthesise** onto a tiny host; **if the target resolves external references, the corpus
+is a directory**. Each in `references/success-path.md`.
 
 ---
 
 ## Step 9 — Keep per-execution cost low
 
-Bytes are a proxy. Cost tracks **output size** (a 71-byte input rendering 512x512 is
-expensive) and **how early the parser rejects**. Cap declared dimensions and counts, not
+Bytes are a proxy. Cost tracks **output size** and **how early the parser rejects**
+(`references/measured-examples.md` step 9). Cap declared dimensions and counts, not
 just file length, but keep a few mid-sized seeds to cross each internal chunking
 threshold (size is also an axis).
 
 ```sh
-resources/cost.sh HARNESS=./out/plain/harness-fork CORPUS=./corpus | head -20
+cd $W && . ./fuzz.env
+$RC/cost.sh HARNESS=./out/plain/harness-fork CORPUS=./corpus | head -20
 ```
 
-Skip it when per-exec work is far below fork+exec (a 10 µs parser against a 900 µs
-startup): the ranking is then noise. Time the call in-process instead if cost matters.
+It also lists the seeds whose per-exec work exceeds `SLOW_MS` (default 1000). The
+campaign's dry run drops them silently (afl-fuzz calibrates a far lower timeout, and
+`AFL_IGNORE_SEED_PROBLEMS=1` skips what exceeds it), so cap their declared work or move
+them to `hangs/`.
+
+Skip it when per-exec work is far below fork+exec: the ranking is then noise. Time the call in-process instead if cost matters.
 
 ---
 

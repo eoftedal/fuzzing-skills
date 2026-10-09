@@ -7,8 +7,9 @@
 #   resources/triage_all.sh [OUT=./triage] [PKG=...] [GOOD=...] [ENTRIES="..."] [MODES="..."]
 #
 # What it does NOT decide for you, and cannot:
-#   * the consumer calls.  Fill in the ENTRIES arms in confirm.rb first.  Without PKG it
-#     stops after bucketing and says so.
+#   * the consumer calls.  Copy confirm.rb into the workspace ($WORKSPACE/confirm.rb, found
+#     there by default) and fill in its ENTRIES arms first.  Without PKG it stops after
+#     bucketing and says so.
 #   * the harness's modes.  If the harness reads a mode variable (MODE=, HARNESS_MODE=),
 #     list the non-default settings in MODES -- the driver cannot discover them.
 #   * severity and the write-up.  OUT/REPORT.md has the facts; you judge.
@@ -29,6 +30,11 @@
 #             levels above it.
 #   GOOD      a reference input: guards minimize.sh's allocation-ceiling ladder AND is
 #             confirm.sh's liveness check.
+#   GOOD_<entry>  a known-good input for one entry point's liveness check (an entry that
+#             takes another encoding or input shape), passed to confirm.sh; see its header.
+#   CONFIRM   the confirm.rb with your ENTRIES arms (default: $WORKSPACE/confirm.rb when it
+#             exists, else the plugin's copy next to this script).  Passed to confirm.sh, and
+#             the arms it defines are the entries confirmed.
 #   ENTRIES ASAN_RT EXT_MATCH EXT_MAP PRISTINE_MAP   passed to confirm.sh.
 #   EXT PRISTINE   override the auto-discovered extension .so paths.
 #   TIMEOUT RETRY HANG_S ALLOC_CAP_MB CAP_LADDER CAP_UP CELL_TIMEOUT PROGRESS_EVERY
@@ -37,23 +43,46 @@
 #             exec_timeout_ms plus HANG_PAD_S (default 1) s of process start-up (AFL's fork
 #             server excluded start-up; a fresh process does not), not the 5000 ms + 5 s
 #             default; and a campaign with stability < 90 % is screened with RETRY=5.
+#   HARNESS_RE  regex for the harness's own source files (default: smoke.sh's); a bucket
+#             keyed in one is copied code, and the report says to map its line by hand.
 #   ONLY      space-separated variant names to restrict to (default: all discovered).
 #   SKIP_HANGS=1   crashes only.
 #   MINIMIZE_ALL=1 also minimize representatives that are CLEAN on every column and entry.
+#
+# $WORKSPACE/fuzz.env (the harness skill writes it) supplies defaults below the arguments:
+# PKG, EXT (from EXT_ASAN), ASAN_RT (from $R/find_asan_rt.sh), and MODES and ALLOC_CAP_MB,
+# which rank below the manifest too (it records what the campaigns actually ran with).
 #
 # Order: screen -> bucket the RAW reproducers -> confirm one representative per bucket on
 # its original bytes -> minimize the representatives -> confirm the minimized ones.  The
 # expensive step (minimization) runs once per bug, not once per crash.
 set -uo pipefail
+for kv in "$@"; do case $kv in WORKSPACE=*) export "$kv";; esac; done   # find fuzz.env first
+WS=${WORKSPACE:-.}; F_MODES=""; F_CAP=""
+if [ -f "$WS/fuzz.env" ]; then
+  _m=${MODES:-}; _c=${ALLOC_CAP_MB:-}          # from the caller's environment: kept
+  set -a; . "$WS/fuzz.env"; set +a
+  F_MODES=${MODES:-}; F_CAP=${ALLOC_CAP_MB:-}; MODES=$_m; ALLOC_CAP_MB=$_c
+fi
 for kv in "$@"; do case $kv in *=*) export "$kv";; esac; done
+# the sanitized columns need the runtime preloaded; find it the way the harness skill does
+if [ -z "${ASAN_RT:-}" ] && [ -n "${R:-}" ] && [ -f "$R/find_asan_rt.sh" ]; then
+  rt=$(bash "$R/find_asan_rt.sh" 2>/dev/null) && [ -n "$rt" ] && ASAN_RT=$rt
+fi
 ENTRIES_PINNED=${ENTRIES:+1}     # the caller chose the arms; never widen them
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${OUT:-./triage}; WS=${WORKSPACE:-.}
+# the confirm script holding the ENTRIES arms: CONFIRM=, else the workspace's copy, else ours
+CONFIRM=${CONFIRM:-}; [ -n "$CONFIRM" ] || { CONFIRM="$WS/confirm.rb"; [ -f "$CONFIRM" ] || CONFIRM="$HERE/confirm.rb"; }
+[ -f "$CONFIRM" ] || { echo "FAIL: CONFIRM=$CONFIRM does not exist" >&2; exit 2; }
+CONFIRM="$(cd "$(dirname "$CONFIRM")" && pwd)/$(basename "$CONFIRM")"
+for v in $(compgen -v GOOD_); do [ -f "${!v}" ] || { echo "FAIL: $v=${!v} does not exist (relative to $(pwd))" >&2; exit 2; }; done
 [ -z "${GOOD:-}" ] || [ -f "$GOOD" ] || { echo "FAIL: GOOD=$GOOD does not exist (relative to $(pwd)). A missing reference input" >&2
                                             echo "      looks 'consistent' at every ceiling and silently disables the guard." >&2; exit 2; }
 # What the USER set wins over anything read from the manifest (per-campaign hang timeout,
 # RETRY on a low-stability campaign), so remember it before defaulting.
 USER_TIMEOUT=${TIMEOUT:-}; USER_RETRY=${RETRY:-}
+HARNESS_RE=${HARNESS_RE:-'(^|/)(harness|stubs|afl_shim|covstub)[A-Za-z0-9_.-]*\.(c|cc|cpp|h|hpp)$'}   # smoke.sh's default
 TIMEOUT=${TIMEOUT:-5000}; CELL_TIMEOUT=${CELL_TIMEOUT:-30}
 mkdir -p "$OUT"
 SUM="$OUT/summary.tsv"; : > "$SUM"
@@ -70,6 +99,8 @@ rule() { say ""; say "==========================================================
 # Each campaign starts on the harness of the build that produced it, and whatever does not
 # reproduce there is offered to the other builds (see process() for the measured reason).
 rule "1. discovering campaigns in $WS"
+ts "  confirm script: $CONFIRM"
+[ "$CONFIRM" = "$HERE/confirm.rb" ] && say "    (the plugin's own copy: copy it to $WS/confirm.rb and fill in ENTRIES there, or pass CONFIRM=)"
 harness_for() {  # <variant> -> path to that variant's fork harness, or empty
   local v=$1 c
   for c in "$WS/out/$v/harness-fork" "$WS/out/$v/bin/harness-fork"; do
@@ -162,42 +193,64 @@ if [ -f "$MANIFEST" ] && [ -z "${NO_MANIFEST:-}" ]; then
     echo "$UNLISTED" | sed 's/^/    /'
     say "  Re-run campaign.sh for them, or NO_MANIFEST=1 to triage by discovery instead."
   fi
-  if [ ${#MROWS[@]} -eq 0 ]; then
-    # "Nothing found" is a result and needs its own facts: what ran, how long, how stable,
-    # and that the harness was shown to detect an injected fault.  Without them a clean
-    # campaign cannot be told from a harness that detects nothing (measured: a 10-minute
-    # 10-minute campaign found nothing and the old driver wrote no REPORT.md at all).
-    say "  manifest lists no campaign with crash or hang files; writing a no-findings $REPORT."
-    stl=$(grep -h -m1 '^PASS:\|^FAIL:' "$WS"/selftest*.txt 2>/dev/null | head -1)
-    {
-      echo "# Triage findings: none"
-      echo
-      echo "No campaign in \`$MANIFEST\` saved a crash or a hang. That is a result only as strong"
-      echo "as the facts below: a harness proven to detect an injected fault (self-test), run for"
-      echo "this long, at this stability, from this corpus. State them with the claim."
-      echo
-      echo "| campaign | variant | mode | driver | seconds | execs | stability | crashes | hangs | status | self-test | seeds loaded |"
-      echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
-      paste <(col name) <(col variant) <(col mode_env) <(col driver) \
-            <(paste <(col start) <(col stop) | awk -F'\t' '{print ($2 ~ /^[0-9]+$/ && $1 ~ /^[0-9]+$/) ? $2 - $1 : "?"}') \
-            <(col execs) <(col stability) \
-            <(col crash_files) <(col hang_files) <(col status) <(col selftest) \
-            <(paste -d/ <(col seeds_loaded) <(col seeds_total)) \
-        | awk -F'\t' '{printf "| %s |", $1; for (i = 2; i <= NF; i++) printf " %s |", $i; print ""}'
-      echo
-      echo "Self-test: ${stl:-NOT FOUND -- without a passing self-test this is not a negative result}"
-      [ -n "$badst" ] && echo "Campaigns that did not run to completion: $badst"
-      [ -n "$UNLISTED" ] && echo "Crash/hang directories NOT in the manifest (not triaged): $(echo "$UNLISTED" | xargs)"
-      echo
-      echo "Scope: only the entry points and modes above were fuzzed, from the corpus the campaign"
-      echo "loaded; say which public API calls they correspond to and which were not covered."
-    } > "$REPORT"
-    exit 0
-  fi
+  # No campaign row with files: crashers/ and hangs/ are still triaged below, and the
+  # no-findings report is written only if they leave no bucket either.
+  [ ${#MROWS[@]} -gt 0 ] || say "  manifest lists no campaign with crash or hang files; crashers/ and hangs/ are still screened."
   VARIANTS=$(col variant | sort -u | xargs)    # chain only through the builds the manifest lists
   MANIFEST_DRIVEN=1
 fi
 
+# "Nothing found" is a result and needs its own facts: what ran, how long, how stable, from
+# which seeds, and that the harness was shown to detect an injected fault.  Without them a
+# clean campaign cannot be told from a harness that detects nothing (measured: a 10-minute
+# campaign found nothing and the old driver wrote no REPORT.md at all).  Scope says what was
+# instrumented: a sanitized real-side column over an uninstrumented system library cannot
+# see an overflow inside that library, and a report that does not say so is not a result.
+no_findings_report() {
+  local stl md=$(dirname "$MANIFEST") n df
+  stl=$(grep -h -m1 '^PASS:\|^FAIL:' "$WS"/selftest*.txt 2>/dev/null | head -1)
+  {
+    echo "# Triage findings: none"
+    echo
+    echo "No campaign in \`$MANIFEST\` saved a crash or a hang. That is a result only as strong"
+    echo "as the facts below: a harness proven to detect an injected fault (self-test), run for"
+    echo "this long, at this stability, from this corpus. State them with the claim."
+    echo
+    echo "| campaign | variant | mode | driver | seconds | execs | stability | crashes | hangs | status | self-test | seeds loaded |"
+    echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
+    paste <(col name) <(col variant) <(col mode_env) <(col driver) \
+          <(paste <(col start) <(col stop) | awk -F'\t' '{print ($2 ~ /^[0-9]+$/ && $1 ~ /^[0-9]+$/) ? $2 - $1 : "?"}') \
+          <(col execs) <(col stability) \
+          <(col crash_files) <(col hang_files) <(col status) <(col selftest) \
+          <(paste -d/ <(col seeds_loaded) <(col seeds_total)) \
+      | awk -F'\t' '{printf "| %s |", $1; for (i = 2; i <= NF; i++) printf " %s |", $i; print ""}'
+    echo
+    echo "Self-test: ${stl:-NOT FOUND -- without a passing self-test this is not a negative result}"
+    [ -n "$badst" ] && echo "Campaigns that did not run to completion: $badst"
+    [ -n "$UNLISTED" ] && echo "Crash/hang directories NOT in the manifest (not triaged): $(echo "$UNLISTED" | xargs)"
+    [ -n "$CRASHERS$HANGSEEDS" ] && echo "Hand-saved inputs ($(echo ${CRASHERS:+crashers/} ${HANGSEEDS:+hangs/})) screened on every variant and mode: none reproduced$([ -s "$UNRES" ] && echo "; see \`$UNRES\`")."
+    echo
+    echo "## Scope"
+    echo
+    echo "* Variants: $(col variant | sort -u | xargs)"
+    echo "* Modes, and the entry each confirms through: $(paste <(col mode_env) <(col entry) | sort -u \
+          | awk -F'\t' '{printf "%s%s -> %s", s, $1, ($2 == "" ? "default" : $2); s = ", "}')"
+    echo "* Campaign durations: $(paste <(col name) <(col start) <(col stop) \
+          | awk -F'\t' '{printf "%s%s %ss", s, $1, ($2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/) ? $3 - $2 : "?"; s = ", "}')"
+    echo "* Seeds loaded: $(paste <(col name) <(col seeds_loaded) <(col seeds_total) \
+          | awk -F'\t' '{printf "%s%s %s/%s", s, $1, ($2 == "" ? "?" : $2), $3; s = ", "}')"
+    for n in $(col name); do
+      df="$md/$n.dropped"; [ -s "$df" ] || continue
+      awk -F'\t' -v n="$n" '{printf "  * %s did not fuzz `%s`: %s\n", n, $1, $2}' "$df"
+    done
+    echo "* Instrumented: <state here what was instrumented and what the real side's sanitized column can and cannot see>"
+    echo "* Not covered: <the public API calls these modes correspond to, and the ones not fuzzed>"
+  } > "$REPORT"
+}
+
+# fuzz.env's modes (gate.sh spelling: drop the :options) and ceiling, below the manifest's
+[ -n "${MODES:-}" ] || MODES=$(for m in $F_MODES; do printf '%s\n' "${m%%:*}"; done | xargs)
+[ -n "${ALLOC_CAP_MB:-}" ] || ALLOC_CAP_MB=$F_CAP
 declare -A CAMPAIGNS                                   # "variant kind" -> space-separated dirs
 while [ -z "${MANIFEST_DRIVEN:-}" ] && read -r d; do
   [ -n "$d" ] || continue
@@ -226,6 +279,15 @@ done; fi
 [ -n "$CRASHERS" ] && say "  crashers/  screened against every variant: $(echo $VARIANTS)"
 [ -n "$HANGSEEDS" ] && say "  hangs/     screened (as hangs) against every variant: $(echo $VARIANTS)"
 [ -n "${MODES:-}" ] && say "  non-reproducers are re-screened under: $MODES"
+# No pristine build: the confirm column that rules out an instrumentation artifact stays
+# empty, and in every evaluation run nothing earlier said to build it.
+HAVE_CRASH=""
+[ -n "$CRASHERS" ] && HAVE_CRASH=1
+for r in "${MROWS[@]:-}"; do case $r in *"|crashes|"*) HAVE_CRASH=1;; esac; done
+for k in "${!CAMPAIGNS[@]}"; do case $k in *" crashes") HAVE_CRASH=1;; esac; done
+PRISTINE_TODO="build the pristine variant (the harness skill's build_ext.sh VARIANT=pristine plus link_harness.sh VARIANT=pristine) and re-run confirm to earn the 'reproduces without instrumentation' sentence"
+NEED_PRISTINE=""; [ -n "$HAVE_CRASH" ] && [ ! -d "$WS/out/pristine" ] && [ -z "${PRISTINE:-}" ] && NEED_PRISTINE=1
+[ -n "$NEED_PRISTINE" ] && say "  NOTE: no out/pristine/: $PRISTINE_TODO."
 
 # ---- 2. minimize + bucket ----------------------------------------------------------------
 LAST_NONREPRO=""
@@ -273,6 +335,7 @@ run_one() {  # <build variant> <kind> <harness env or ""> <source tag or ""> <di
   [ -n "$lab" ] && grep -qa '__asan_report_load' "$lab" || lab=$(find "$WS/out" -maxdepth 3 -name harness-fork -type f -perm -u+x 2>/dev/null \
                                                               | while read -r h; do grep -qa '__asan_report_load' "$h" && { echo "$h"; break; }; done)
   [ -n "$lab" ] || lab=$fork
+  echo "LABEL_FORK=$lab" >> "$o/config"            # minimize.sh's drift check keys with it too
   # tee BEFORE the indenting sed, so bucketing progress is live (it used to be replayed
   # after the fact) and bucket.out stays unindented for the key extraction below.
   bash "$HERE/bucket.sh" FORK="$fork" LABEL_FORK="$lab" OUT="$o" CELL_TIMEOUT="$CELL_TIMEOUT" \
@@ -386,6 +449,13 @@ if [ -n "$HANGSEEDS" ] && [ -z "${ONLY:-}" ]; then
   fi
 fi
 
+if [ -n "${MANIFEST_DRIVEN:-}" ] && [ ${#MROWS[@]} -eq 0 ] && [ ! -s "$SUM" ]; then
+  rule "no findings: writing $REPORT"
+  no_findings_report
+  ts "  wrote $REPORT (no bucket; fill in its Scope lines)"
+  exit 0
+fi
+
 # ---- 3. confirm the representatives, on their ORIGINAL bytes --------------------------
 # Before minimization, for two reasons: it is cheap (one ruby process per cell; on the Node
 # sibling about 0.1 s per run, the same as the bare harness), and original bytes are the safer
@@ -396,26 +466,26 @@ fi
 # build_ext.sh leaves the extension at the TOP of out/<variant>/ (<name>.so beside the mkmf
 # Makefile); obj/ and lib/ hold its objects and static archives, never the loadable one.
 disc() { find "$WS/out/$1" -maxdepth 1 -name '*.so' -type f 2>/dev/null | sort | head -1; }
-A=${EXT:-$(disc asan)}; P=${PRISTINE:-$(disc pristine)}
+A=${EXT:-${EXT_ASAN:-${ADDON_ASAN:-$(disc asan)}}}; P=${PRISTINE:-$(disc pristine)}
 # Confirm through EVERY arm confirm.rb defines, not only the entries the campaigns ran
 # under: an extra arm (a load method beside a parse method) is a second way a user reaches
 # the bug, and was measured to be silently never run when the manifest named only `default`.
 if [ -z "${ENTRIES_PINNED:-}" ]; then
-  arms=$(grep -oE '^[[:space:]]*"[A-Za-z0-9_-]+"[[:space:]]*=>' "$HERE/confirm.rb" | sed -E 's/^[^"]*"([^"]*)".*/\1/' | xargs)
+  arms=$(grep -oE '^[[:space:]]*"[A-Za-z0-9_-]+"[[:space:]]*=>' "$CONFIRM" | sed -E 's/^[^"]*"([^"]*)".*/\1/' | xargs)
   extra=$(comm -13 <(printf '%s\n' ${ENTRIES:-default} | sort -u) <(printf '%s\n' $arms | sort -u) | xargs)
   if [ -n "$extra" ]; then
     ENTRIES=$(printf '%s\n' ${ENTRIES:-default} $extra | sort -u | xargs)
-    say "  confirm entries: $ENTRIES (added from confirm.rb's ENTRIES: $extra; pin ENTRIES= to restrict)"
+    say "  confirm entries: $ENTRIES (added from $(basename "$CONFIRM")'s ENTRIES: $extra; pin ENTRIES= to restrict)"
   fi
 fi
-[ -n "${PKG:-}" ] && [ -z "$P" ] && {
+[ -n "${PKG:-}" ] && [ -z "$P" ] && [ -z "$NEED_PRISTINE" ] && {
   say "  note: no out/pristine/*.so -- the column that rules out an instrumentation artifact will be empty."
   say "        Build it when there are crashes:  (cd <ext dir> && build_ext.sh VARIANT=pristine OUT=$WS/out ...)  and re-run."; }
 # PKG=oracle/gems/<gem>-<ver>: the gem must load from that install, not from whatever the
 # ambient GEM_HOME holds, so GEM_HOME/GEM_PATH default to its oracle/ root.
 [ -z "${PKG:-}" ] || case $PKG in */gems/*) : "${GEM_HOME:=${PKG%/gems/*}}"; : "${GEM_PATH:=$GEM_HOME}";; esac
 confirm_dir() {  # <dir> <buckets dir> <verdicts file> <output file>
-  bash "$HERE/confirm.sh" OUT="$1" BUCKETS="$2" VERDICTS="$3" PKG="$PKG" CELL_TIMEOUT="$CELL_TIMEOUT" \
+  bash "$HERE/confirm.sh" OUT="$1" BUCKETS="$2" VERDICTS="$3" PKG="$PKG" CELL_TIMEOUT="$CELL_TIMEOUT" CONFIRM="$CONFIRM" \
       ${GEM_HOME:+GEM_HOME="$GEM_HOME"} ${GEM_PATH:+GEM_PATH="$GEM_PATH"} \
       ${A:+EXT="$A"} ${P:+PRISTINE="$P"} ${ASAN_RT:+ASAN_RT="$ASAN_RT"} \
       ${GOOD:+GOOD="$GOOD"} ${ENTRIES:+ENTRIES="$ENTRIES"} ${ALLOC_CAP_MB:+ALLOC_CAP_MB="$ALLOC_CAP_MB"} \
@@ -433,7 +503,7 @@ else
   rule "3. confirm: SKIPPED"
   say "  No PKG given, so nothing was confirmed against the real gem -- and the"
   say "  confirm step is the only one that answers whether a crash reaches a user."
-  say "  Fill in the ENTRIES arms in $HERE/confirm.rb, install the pinned version on its own"
+  say "  Fill in the ENTRIES arms in $CONFIRM, install the pinned version on its own"
   say "  (gem install --install-dir oracle --platform ruby <gem> -v <ver>),"
   say "  and re-run with PKG=oracle/gems/<gem>-<ver> GOOD=<a reference input>."
 fi
@@ -470,16 +540,38 @@ for d in "$OUT"/*/; do
 done
 
 # ---- 4. report skeleton ----------------------------------------------------------------
+# minimize.sh's key for <min>/<name>.key is bucket.sh's key without the line and the access;
+# compare in that form.  DRIFT: the minimized bytes reach another bug than the bucket's.
+norm_key() { sed -E -e 's/ \[(READ|WRITE)(-[0-9]+)?\]$//' -e 's/^([A-Za-z-]+ @ [^ ]*):[0-9?]+ in /\1 in /' <<<"$1"; }
+min_key_cell() {  # <bucket key> <key file> -> table cell
+  [ -f "$2" ] || { echo "-"; return; }
+  local mk; mk=$(head -1 "$2")
+  case $mk in "("*) echo "$mk"; return;; esac
+  if [ "$mk" = "$(norm_key "$1")" ]; then echo "$mk"; else echo "**DRIFT** $mk"; fi
+}
+copied_code() {  # <bucket key> -> 0 when its file is one of the harness's own sources
+  local f; f=$(sed -n 's/^[^ ]* @ \([^ :]*\):.*/\1/p' <<<"$1")
+  [ -n "$f" ] && grep -qE "$HARNESS_RE" <<<"$f"
+}
+NDRIFT=0; NCOPIED=0
+if [ -s "$SUM" ]; then
+  while IFS=$'\t' read -r from on henv sz b key o; do
+    n=$(basename "$b")
+    case $(min_key_cell "$key" "$o/min/$n.key") in "**DRIFT**"*) NDRIFT=$((NDRIFT+1)); say "  WARN: ${b#$OUT/}: the minimized reproducer's key differs from the bucket's (DRIFT); report the original bytes";; esac
+    copied_code "$key" && NCOPIED=$((NCOPIED+1))
+  done < "$SUM"
+fi
 rule "4. $REPORT"
 {
   say "# Triage findings"
   say ""
   say "Workspace \`$WS\`. One row per BUCKET (exact sanitizer key); merge rows that differ"
   say "only in line number inside one function before reporting -- bucket.out prints that"
-  say "merged grouping. Severity is yours to judge (skill step 4); this file has the facts."
+  say "merged grouping, and a grouping on the caller below the crashing function."
+  say "Severity is yours to judge (skill step 4); this file has the facts."
   say ""
-  say "| from campaign | reproduced on | harness mode | bucket key | original | minimized | worst verdict (original / minimized) | memory amplification |"
-  say "|---|---|---|---|---|---|---|---|"
+  say "| from campaign | reproduced on | harness mode | bucket key | original | minimized | minimized key | worst verdict (original / minimized) | memory amplification | note |"
+  say "|---|---|---|---|---|---|---|---|---|---|"
   worst() {  # <verdicts file> <name> -> most severe cell over all entries and columns
     awk -F'\t' -v n="$2" 'function r(v){ if(v~/NATIVE/)return 6; if(v~/UNCAUGHT/)return 5; if(v~/HANG/)return 4;
         if(v~/CAUGHT/)return 3; if(v~/ERROR|EXT-|SKIPPED/)return 2; if(v~/CLEAN/)return 1; return 0 }
@@ -492,10 +584,12 @@ rule "4. $REPORT"
       vo=$(worst "$o/verdicts.tsv" "$n"); vm=$(worst "$o/verdicts.min.tsv" "$n")
       amp=$(cat "$o/amplification.min.tsv" "$o/amplification.tsv" 2>/dev/null \
             | awk -F'\t' -v n="$pn" '$1==n{printf "%s B in, %s B demanded, %sx at %s MB", $2, $3, $4, $5; exit}')
-      say "| $from | $on | $henv | $key | \`${b#$OUT/}\` $sz B | $msz | $vo / $vm | ${amp:--} |"
+      mk=$(min_key_cell "$key" "$o/min/$n.key")
+      note="-"; copied_code "$key" && note="copied code: see the copy's source comment for the package line"
+      say "| $from | $on | $henv | $key | \`${b#$OUT/}\` $sz B | $msz | $mk | $vo / $vm | ${amp:--} | $note |"
     done
   else
-    say "| — | — | — | nothing survived screening | — | — | — | — |"
+    say "| — | — | — | nothing survived screening | — | — | — | — | — | — |"
   fi
   say ""
   say "## Did not reproduce in any configuration tried"
@@ -520,7 +614,11 @@ rule "4. $REPORT"
   [ -n "${PKG:-}" ] || { say "_Not confirmed: no PKG given. Nothing here says whether a user is affected._"; say ""; }
   say "## Still to do by hand"
   say ""
-  say "* Merge buckets that differ only in line number inside one function."
+  say "* Merge buckets that differ only in line number inside one function. When bucket.out's"
+  say "  'merged on caller' grouping collapses several functions into one, judge whether that is the bug."
+  [ "$NDRIFT" -gt 0 ] && say "* $NDRIFT row(s) marked DRIFT: the minimized bytes reach a different bug; report the original bytes for them."
+  [ "$NCOPIED" -gt 0 ] && say "* $NCOPIED row(s) keyed in the harness's copied code: map each harness line to the package line through the copy's source comment."
+  [ -n "$NEED_PRISTINE" ] && say "* No pristine build: $PRISTINE_TODO."
   say "* Severity per row, and the gem API entry point a reader should use (a harness mode"
   say "  usually corresponds to one)."
   say "* \`od -An -tx1\` the reproducer bytes inline for each native crash."

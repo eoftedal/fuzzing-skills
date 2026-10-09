@@ -23,7 +23,16 @@
 #      smoke test is about the harness itself and runs BEFORE the detection self-test):
 #      execs/s over the measured fuzz time, and stability.  At least one campaign must be
 #      `completed` or `walled`, and none `aborted` or `failed`, or nothing was smoked
-#   C  every crash that run saved, classified (below)
+#   C  every crash that run saved, classified (below).  Each is replayed on the direct
+#      harness and grouped by (variant, mode, site); only ONE representative per group (the
+#      smallest) is replayed on the real stack, and the rest take its class marked
+#      "(same site)" (per-file rows in smoke/classified.tsv).  The group count and replay
+#      count are printed first.  Representatives classed REAL or PERSISTENT-ONLY are handed
+#      to triage: copied into $WS/crashers/ (the corpus skill's seed-policy directory, which
+#      triage_all.sh screens; smoke/ itself it skips) as
+#      smoke-<variant>[@<mode>]-<original name>, with a row "<name>\tsmoke <class> <site>"
+#      (plus how many crashes shared the site) appended to $WS/crashers.summary.tsv.  A file
+#      whose content is already there is skipped
 #   D  one verdict and an exit status
 #
 # Classes, per crash (grouped by site in the report):
@@ -58,7 +67,8 @@
 # broken HOSTSAN, no completed/walled campaign, an aborted/failed campaign).
 #
 # Configure with KEY=VALUE arguments or environment:
-#   WORKSPACE  the fuzz workspace (default .)
+#   WORKSPACE  the fuzz workspace (default .): its fuzz.env, when present, is sourced first
+#              (init_workspace.sh writes it), so arguments still override it
 #   VARIANTS   builds to smoke (default: every out/<v>/ with an AFL-instrumented fork harness)
 #   MODES      harness settings to smoke BESIDES the default, campaign.sh's spelling
 #              ("MODE=file MODE=string"): one short campaign per variant per mode, each
@@ -66,6 +76,7 @@
 #   CORPUS     seeds (default ./corpus)
 #   SMOKE_S    seconds of fuzzing per variant (default 30)
 #   HOSTSAN    command for the real stack under the sanitizer; the input path is appended.
+#              Defaults to fuzz.env's REAL_ASAN.
 #              The differential needs it: without it a crash can only be called UNVERIFIED
 #              (or HARNESS-FRAME, which then cannot be told from a bug in copied code).
 #   STRING_API=1   the API takes a JS string: classify non-UTF-8 / NUL inputs OUT-OF-SCOPE
@@ -77,7 +88,10 @@
 #   CAMPAIGNER path to run-a-fuzzing-campaign's campaign.sh
 #   ALLOC_CAP_MB   memory ceiling (default 1024), as everywhere else
 set -uo pipefail
+for kv in "$@"; do case $kv in WORKSPACE=*) WORKSPACE=${kv#*=};; esac; done
+WS=${WORKSPACE:-.}; [ -f "$WS/fuzz.env" ] && { set -a; . "$WS/fuzz.env"; set +a; }
 for kv in "$@"; do case $kv in *=*) export "$kv";; esac; done
+HOSTSAN=${HOSTSAN:-${REAL_ASAN:-}}
 HERE=$(cd "$(dirname "$0")" && pwd)
 WS=${WORKSPACE:-.}; WS=$(cd "$WS" && pwd); cd "$WS" || exit 2
 SMOKE_S=${SMOKE_S:-30}; MIN_EPS=${MIN_EPS:-100}; MIN_STAB=${MIN_STAB:-90}; MODES=${MODES:-}
@@ -85,6 +99,11 @@ CORPUS=${CORPUS:-$WS/corpus}; ALLOC_CAP_MB=${ALLOC_CAP_MB:-1024}
 HARNESS_RE=${HARNESS_RE:-'(^|/)(harness|stubs|afl_shim|covstub)[A-Za-z0-9_.-]*\.(c|cc|cpp|h|hpp)$'}
 CAMPAIGNER=${CAMPAIGNER:-$HERE/../../run-a-fuzzing-campaign/resources/campaign.sh}
 T0=$(date +%s)
+# A mode variable left in the environment (MODE=file exported in an earlier block) would
+# turn the "default" runs into that mode, silently smoking it twice.
+for setting in $MODES; do s=${setting%%:*}; for kv in ${s//,/ }; do v=${kv%%=*}
+  if [ -n "${!v+x}" ]; then echo "WARN: $v=${!v} is set in the environment: unset for the default mode, which otherwise runs under it"; unset "$v"; fi
+done; done
 ts() { printf '[%s +%ds] %s\n' "$(date +%H:%M:%S)" "$(( $(date +%s) - T0 ))" "$*"; }
 hfork() { for p in "$WS/out/$1/harness-fork" "$WS/out/$1/bin/harness-fork"; do [ -x "$p" ] && { echo "$p"; return; }; done; }
 hbin()  { for p in "$WS/out/$1/harness" "$WS/out/$1/bin/harness"; do [ -x "$p" ] && { echo "$p"; return; }; done; }
@@ -200,22 +219,37 @@ if [ "$ran" = 0 ]; then
 fi
 
 # ---- C. classify every crash the smoke run saved ----------------------------------------
+# Two passes.  C1 replays each crash on the direct harness only (cheap) and keys it by
+# (variant, mode, site).  C2 replays ONE representative per key on the real stack (seconds
+# each: 112 crashes in 3 sites took 25 min one by one); the others take its class, marked
+# "(same site)".  A crash with no site (no sanitized variant to label it) is its own key.
 ts "== C. classify the saved crashes =="
-declare -A CNT SITE
-total=0; copied=0
+declare -A CNT SITE SHR GMEM GN
+total=0; copied=0; handed=0; dupes=0; shared=0
 LABEL=""; for v in $VARIANTS; do f=$(hfork "$v"); grep -qa '__asan_report_load' "$f" 2>/dev/null && { LABEL=$f; break; }; done
 site_of() {  # stack text on stdin -> "func<TAB>file<TAB>line" of the innermost project-source frame
   sed -n 's#^ *\#[0-9]* 0x[0-9a-f]* in \(.*\) \(/[^ :]*\):\([0-9]*\).*#\1\t\2\t\3#p' \
     | grep -vE $'^(__asan_|__interceptor_|__sanitizer_|operator new|operator delete|malloc|free|memcpy|memmove|memset)|\t/usr/|compiler-rt|sanitizer_common' | head -1
 }
+handoff() {  # <crash file> <variant> <mode env or ""> <class> <site> <crashes sharing the site>
+  local d="$WS/crashers" x n note=""
+  mkdir -p "$d"
+  for x in "$d"/*; do [ -f "$x" ] && cmp -s "$1" "$x" && { dupes=$((dupes+1)); return; }; done
+  n="smoke-$2${3:+@${3//[\/ ]/_}}-$(basename "$1")"
+  [ "${6:-1}" -gt 1 ] && note=" (representative of $6 smoke crashes at this site)"
+  cp "$1" "$d/$n" && printf '%s\tsmoke %s %s%s\n' "$n" "$4" "$5" "$note" >> "$WS/crashers.summary.tsv" && handed=$((handed+1))
+}
 expressible() { [ -z "${STRING_API:-}" ] && return 0
   iconv -f UTF-8 -t UTF-8 "$1" >/dev/null 2>&1 && ! grep -qaP '\x00' "$1"; }
+# C1: per crash F V M (file, variant, mode env), PRE (CRASH, STATE, PERSISTENT-ONLY), ST site, IH in-harness
+F=(); V=(); M=(); PRE=(); ST=(); IH=(); KEYS=()
 while IFS=$US read -r name variant driver harness mode_env entry out_dir rest; do
   [ "$name" = name ] && continue
   fork=$(hfork "$variant"); menv=""; [ "$mode_env" != default ] && menv=$mode_env
   for c in "$WS/$out_dir"/default/crashes/id:*; do
-    [ -f "$c" ] || continue; total=$((total+1))
+    [ -f "$c" ] || continue; i=$total; total=$((total+1))
     out=$( { env ${menv//,/ } ASAN_OPTIONS="$ASAN_RUN" timeout 30 "$fork" "$c" >/dev/null; } 2>&1 ); rc=$?
+    inharness=0
     if ! is_crash "$rc"; then
       # Not through the fork binary.  Before calling it iteration state, try the PERSISTENT
       # binary single-shot (argv path): a crash that reproduces there every time is a
@@ -230,7 +264,7 @@ while IFS=$US read -r name variant driver harness mode_env entry out_dir rest; d
         fi
       fi
     else
-      st=$(site_of <<<"$out")
+      cls=CRASH; st=$(site_of <<<"$out")
       # a build without the sanitizer has no stack: get one from the sanitized fork harness
       if [ -z "$st" ] && [ -n "$LABEL" ] && [ "$LABEL" != "$fork" ]; then
         lout=$( { env ${menv//,/ } ASAN_OPTIONS="$ASAN_RUN" timeout 30 "$LABEL" "$c" >/dev/null; } 2>&1 ); lrc=$?
@@ -238,24 +272,56 @@ while IFS=$US read -r name variant driver harness mode_env entry out_dir rest; d
       fi
       IFS=$'\t' read -r sfn spath sline <<<"$st"
       site="${sfn:-?} @ $(basename "${spath:-?}"):${sline:-?}"
-      inharness=0; [ -n "$spath" ] && grep -qE "$HARNESS_RE" <<<"$spath" && inharness=1
-      if [ -n "${HOSTSAN:-}" ]; then
-        # The real stack FIRST: the harness holds copies of package method bodies and static
-        # helpers (step 2), so a frame in a harness file can be a real bug in copied code.
-        hostsan "${menv//,/ }" "$c"
-        if is_crash "$HRC" || grep -q 'Sanitizer:' <<<"$HERR"; then
-          cls=REAL; [ "$inharness" = 1 ] && { site="$site (frame in copied code)"; copied=$((copied+1)); }
-        elif [ "$inharness" = 1 ]; then cls=HARNESS-FRAME
-        elif ! expressible "$c"; then cls=OUT-OF-SCOPE
-        else cls=DIRECT-ONLY; fi
-      elif [ "$inharness" = 1 ]; then cls=HARNESS-FRAME
-      else cls=UNVERIFIED; fi
+      [ -n "$spath" ] && grep -qE "$HARNESS_RE" <<<"$spath" && inharness=1
     fi
-    CNT[$cls]=$(( ${CNT[$cls]:-0} + 1 )); SITE["$cls|$site"]=$(( ${SITE["$cls|$site"]:-0} + 1 ))
+    F[i]=$c; V[i]=$variant; M[i]=$menv; PRE[i]=$cls; ST[i]=$site; IH[i]=$inharness
+    [ "$cls" = STATE ] && continue
+    k="$cls|$variant|$menv|$site"; case $site in "? @ ?:?"*) k="$k|#$i";; esac
+    [ -z "${GN[$k]:-}" ] && KEYS+=("$k")
+    GN[$k]=$(( ${GN[$k]:-0} + 1 )); GMEM[$k]="${GMEM[$k]:-} $i"
   done
 done < <(rows)
+for ((i = 0; i < total; i++)); do [ "${PRE[i]}" = STATE ] && { CNT[STATE]=$(( ${CNT[STATE]:-0} + 1 )); SITE["STATE|-"]=$(( ${SITE["STATE|-"]:-0} + 1 )); }; done
+nrep=0; for k in "${KEYS[@]}"; do [ "${k%%|*}" = CRASH ] && nrep=$((nrep+1)); done
+if [ "$total" -gt 0 ]; then
+  if [ -n "${HOSTSAN:-}" ]; then ts "  $total crash(es) at ${#KEYS[@]} (variant, mode, site) group(s): replaying $nrep representative(s) on the real stack, one per site (10-30 s each)"
+  else ts "  $total crash(es) at ${#KEYS[@]} (variant, mode, site) group(s); no HOSTSAN, so no real-stack replay"; fi
+fi
+# C2: one representative per key: the smallest file (an expressible one first under STRING_API)
+for k in "${KEYS[@]}"; do
+  rep=""; for i in ${GMEM[$k]}; do
+    if [ -z "$rep" ]; then rep=$i; continue; fi
+    ei=0; expressible "${F[i]}" && ei=1; er=0; expressible "${F[rep]}" && er=1
+    if [ "$ei" -gt "$er" ] || { [ "$ei" = "$er" ] && [ "$(wc -c < "${F[i]}")" -lt "$(wc -c < "${F[rep]}")" ]; }; then rep=$i; fi
+  done
+  site=${ST[rep]}; n=${GN[$k]}
+  if [ "${PRE[rep]}" = PERSISTENT-ONLY ]; then cls=PERSISTENT-ONLY
+  elif [ -n "${HOSTSAN:-}" ]; then
+    # The real stack FIRST: the harness holds copies of package method bodies and static
+    # helpers (step 2), so a frame in a harness file can be a real bug in copied code.
+    hostsan "${M[rep]//,/ }" "${F[rep]}"
+    if is_crash "$HRC" || grep -q 'Sanitizer:' <<<"$HERR"; then
+      cls=REAL; [ "${IH[rep]}" = 1 ] && { site="$site (frame in copied code)"; copied=$((copied+n)); }
+    elif [ "${IH[rep]}" = 1 ]; then cls=HARNESS-FRAME
+    elif ! expressible "${F[rep]}"; then cls=OUT-OF-SCOPE
+    else cls=DIRECT-ONLY; fi
+  elif [ "${IH[rep]}" = 1 ]; then cls=HARNESS-FRAME
+  else cls=UNVERIFIED; fi
+  for i in ${GMEM[$k]}; do
+    c=$cls; mark=""; [ "$i" != "$rep" ] && { mark=" (same site)"; shared=$((shared+1)); }
+    # expressibility is per file: a member of a DIRECT-ONLY / OUT-OF-SCOPE site is re-judged
+    case $c in DIRECT-ONLY|OUT-OF-SCOPE) if expressible "${F[i]}"; then c=DIRECT-ONLY; else c=OUT-OF-SCOPE; fi;; esac
+    tk="$c|${V[i]}${M[i]:+ [${M[i]}]}: $site"
+    CNT[$c]=$(( ${CNT[$c]:-0} + 1 )); SITE[$tk]=$(( ${SITE[$tk]:-0} + 1 ))
+    [ -n "$mark" ] && SHR[$tk]=$(( ${SHR[$tk]:-0} + 1 ))
+    printf '%s\t%s\t%s\t%s\t%s%s\n' "$(basename "${F[i]}")" "${V[i]}" "${M[i]:-default}" "$c" "$site" "$mark" >> "$WS/smoke/classified.tsv"
+  done
+  case $cls in REAL|PERSISTENT-ONLY) handoff "${F[rep]}" "${V[rep]}" "${M[rep]}" "$cls" "$site" "$n";; esac
+done
 # keys hold spaces (`func @ file:line`), so iterate them quoted, not through word-splitting
-for k in "${!SITE[@]}"; do printf '  %-14s %3d  %s\n' "${k%%|*}" "${SITE[$k]}" "${k#*|}"; done | sort
+for k in "${!SITE[@]}"; do sh=${SHR[$k]:-0}
+  printf '  %-14s %3d  %s%s\n' "${k%%|*}" "${SITE[$k]}" "${k#*|}" "$([ "$sh" -gt 0 ] && echo "  [$sh same site]")"; done | sort
+[ "$shared" -gt 0 ] && echo "  ($shared crash(es) took their site representative's class \"(same site)\"; per-file rows in smoke/classified.tsv)"
 [ "$total" = 0 ] && echo "  (the smoke run saved no crashes)"
 
 # ---- D. verdict --------------------------------------------------------------------------
@@ -281,6 +347,12 @@ fi
 [ "${CNT[REAL]:-0}" -gt 0 ] && echo "  ok:   ${CNT[REAL]} crash(es) reproduce on the real stack: library bugs, not harness bugs."
 [ "$copied" -gt 0 ] && echo "        $copied of them have their innermost frame in code copied into the harness: report against the package source the copy came from."
 [ "${CNT[OUT-OF-SCOPE]:-0}" -gt 0 ] && echo "  ok:   ${CNT[OUT-OF-SCOPE]} crash(es) need input a JS string cannot carry: out of scope, not a harness bug."
+if [ $((handed + dupes)) -gt 0 ]; then
+  dn=""; [ "$dupes" -gt 0 ] && dn="; $dupes already there by content, skipped"
+  echo "  hand-off: $handed REAL/PERSISTENT-ONLY site representative(s) copied to $WS/crashers/ (smoke-*, rows in crashers.summary.tsv"
+  echo "        name how many crashes shared each site)$dn.  The others stay in smoke/ (listed in smoke/classified.tsv)."
+  echo "        triage_all.sh screens crashers/, so they reach triage with the corpus skill's crashers."
+fi
 [ "$warns" -gt 0 ] && echo "  WARN: $warns speed/stability/completion warning(s) above."
 if [ "$broken" -gt 0 ] || [ -n "$unsmoked" ]; then
   echo "  FAIL: ${broken} smoke campaign(s) aborted or failed${unsmoked:+; variant(s) with no completed/walled run:$unsmoked}."

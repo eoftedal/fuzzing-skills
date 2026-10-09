@@ -19,7 +19,9 @@ know how big an effect to expect. `EVIDENCE.md` maps each target to its totals.
   four decoders were uninstrumented system libraries, the greedy cover's top ten seeds
   were six of one in-tree format, three of an in-tree metadata reader and one palette
   walk, and **nothing from the two formats whose decoders lived outside the build**,
-  despite 21 seeds having been written for them.
+  despite 21 seeds having been written for them. On an image-decoding binding whose
+  codecs are system libraries, the productive families are the in-tree parsers: a
+  hand-rolled BMP reader, container and EXIF glue, GIF compositing.
 
 ## Step 2 — Borrow before deriving
 
@@ -71,6 +73,11 @@ know how big an effect to expect. `EVIDENCE.md` maps each target to its totals.
 * **Crossing axes that select an implementation.** One regex engine was selected only by
   **anchored AND capturing**; a corpus with anchored seeds and a corpus with capturing
   seeds both missed it. One such seed was worth 24 edges that 160 others missed.
+* **A name lookup that selects code is an axis, not data.** On a transcoding binding the
+  encoding name is looked up in a table of about a hundred and fifty converters, each a
+  function pointer of its own, so one family per converter (decode, truncated decode,
+  encode, encode with transliteration) is the parallel-implementations axis. Names
+  looked up in one table by one loop, by contrast, select nothing.
 * **Buffer boundaries.** One library ships a regression fixture whose entire purpose is a
   two-byte character split across its big buffer.
 * **A generated parser's dialect is looser than its standard.** One JSON grammar listed
@@ -89,6 +96,15 @@ know how big an effect to expect. `EVIDENCE.md` maps each target to its totals.
   one target were a length field with an off-by-one encoding convention (the byte stored
   `(n+1)*4`, not `n*4`) and a size field that had to count a trailing checksum described
   in a different section of the documentation.
+* **Reading the byte diff.** It is thirty seconds, and it catches the class of framing
+  error that no re-reading of the format does. A difference in an **optional** field (a
+  writer that adds sizes or padding to a header by default, a multithreaded encoder's
+  flags) is fine when both records decode to the same bytes; a difference in a required
+  field is the bug you are looking for.
+* **Dependent fields from a plausible constant.** A field that must agree with another
+  (a length, a count, a checksum) and is filled with a plausible constant instead of the
+  code's own rule silently kills the whole family, because every seed in it fails the
+  same check.
 * **A generator that imports the package needs the harness's loader interception.** After
   a sanitizer self-test the in-tree artefact is the sanitizer build, and the generator
   dies on a missing sanitizer symbol.
@@ -120,6 +136,24 @@ know how big an effect to expect. `EVIDENCE.md` maps each target to its totals.
 * **Noise floor.** One target was stable at the union level and jittered 21 edges per
   seed; another was byte-identical per seed while the *union* moved by 6. Take the larger
   of the two as the floor.
+* **Re-gate on the real corpus, cheaply.** A thousand seeds on the plain variant in the
+  default mode is about a minute; gating every seed in every mode on every variant is
+  what turned one run into an hour. The oracle's ceiling and a mirroring gap show on
+  plain in the default mode, and the cover reaches every edge, so the asan run over the
+  cover is enough to prove the other arms. The re-gate is the only check that finds
+  fidelity gaps the gate corpus was too small to reach: on one target it exposed a
+  library accepting inputs the real stack rejects.
+* **The ASAN crasher pass needs a long timeout.** With a 5-second limit on a loaded
+  machine the sanitizer's symbolization outran the timeout, no report reached its
+  `SUMMARY:` line, and the pass recorded nothing and said nothing; at 90 seconds the same
+  pass found 32 ASAN-only crashers. Hence the 30-second default and the `WARN` line for a
+  run that exits 86 or on a signal with no `SUMMARY:`.
+* **`AFL_IGNORE_SEED_PROBLEMS=1`, not `AFL_SKIP_CRASHES=1`.** The latter covers crashing
+  seeds only and says nothing of hanging ones.
+* **A nondeterministic seed can be a crasher.** `nondet.sh` once moved 20 seeds to
+  quarantine whose varying results came from the plain harness reading past the end of
+  its input: the over-read bug, already in `crashers/`. Hence `nondet.sh` leaves a seed
+  that is also in `crashers/` in place and reports it as the bug.
 * **Sweep and minimise.** One sweep of 258 single-byte-flip candidates yielded **10
   keepers for +20 edges**.
 
@@ -141,6 +175,8 @@ know how big an effect to expect. `EVIDENCE.md` maps each target to its totals.
 * A 71-byte input that renders a 512x512 surface is expensive; a 30-byte sample can be
   as cheap as anything you generate. Early-reject seeds cost several times less than
   decoding ones at the same byte size.
+* **When to skip `cost.sh`.** A 10 µs parser against a 900 µs fork+exec startup: the
+  per-exec ranking is noise, so time the call in-process instead.
 * Reference end-to-end result on a target with hand-written in-tree parsing: seed
   coverage 429 to 677 edges, converged 659 to 732, distinct crash sites 7 to 10, three
   crashes that reproduced the moment the files were written. On a thin shim over a

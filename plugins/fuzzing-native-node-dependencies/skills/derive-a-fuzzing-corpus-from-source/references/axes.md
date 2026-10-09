@@ -2,7 +2,30 @@
 
 SKILL.md step 4 lists each axis in a line. This is the reasoning and the grep for each,
 to read when a family you expected to add coverage added nothing, or when you are not
-sure what the next family should be. Magnitudes are in `measured-examples.md`.
+sure what the next family should be. The first section is the long form of step 3, which
+decides the first axis: what kind of input this is. Magnitudes are in
+`measured-examples.md`.
+
+## Read the entry point first (step 3)
+
+Find the function that decides *what kind of input this is*.
+
+* **Sniffers are looser than the formats they claim to detect.** Look for magic checks
+  testing fewer bytes than the signature has, or skipping one. A seed per sniffer at its
+  **minimum match**, often 2-12 bytes, is the cheapest coverage in the method.
+* **Dispatch order is reachability.** If the dispatcher tests A before B, anything
+  matching both never reaches B.
+* **Short inputs reach every sniffer.** A zero-padded fixed-size sniff buffer means
+  sub-minimum inputs still reach every sniffer with defined values, hence lengths 0, 1,
+  2, 3 and the sniff width.
+* **Anything that runs before the real codec** (metadata, container framing, checksum
+  skipping) is in-tree, hand-written, rarely reviewed, and reachable behind two bytes of
+  magic. That is why it comes first.
+* **Supported formats with zero fixtures** are the biggest gap a sample corpus has, and
+  mutation never closes it. A class name in `strings` can sit behind an `#ifdef` the
+  build never defined, so verify the back end is registered before writing a family for
+  it: one minimum-match probe settles it. A harness that prints **which back end was
+  selected** makes that probe, and every later family, readable.
 
 ## If the parser is generated, read the specification, not the generated code
 

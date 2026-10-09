@@ -57,3 +57,32 @@ The fork-driver switch on low stability, the interrupt trap, the status decision
 aborted start, and one-output-directory-per-campaign are **[carried]** with their Node
 review corrections. The Ruby record is the three campaigns above (target C 5 and 10 min,
 target B 10 min), all at stability above 90 %.
+
+## Chain review mirrored from the Node plugin (2026-10-08)
+
+| change | tag | evidence |
+|---|---|---|
+| `campaign.sh DETACH=1` (setsid nohup, `campaigns/campaign.log`), core_pattern NOTE, MODE-leak WARN, `fuzz.env` defaults below the manifest | [measured, synthetic] | identical copy of the Node script, exercised on a tiny harness in the `sectainer` image; SKILL.md gained the "Running it from a tool call" paragraph |
+
+## Second evaluation round (2026-10-08)
+
+Four fresh agents (Opus and Sonnet, a gem whose parser is the extension's own C and a gem
+over a system library) ran the chain end to end; the per-run friction and the fixes are
+tabulated in the harness skill's EVIDENCE.md under the same heading, including the rows
+that belong to this skill. Corpus phases took 3 to 6 minutes, campaigns were
+`DURATION=300 JOBS=2` and all completed, triage ran in 1 to 13 minutes.
+
+## Mirrored from the Node plugin's evaluation round (2026-10-08)
+
+The shared scripts changed identically in both plugins (`check_shared.sh`: 0 drift) after
+four Node runs; the rows are in the Node plugin's EVIDENCE.md files under the same heading.
+On this plugin they are **[carried]** except where the Ruby-side templates and text were
+adjusted to match (the empty-output hash rule, the framing-not-a-mode rule, `mkgate.sh`,
+`CRASHES-BOTH` and `known-crasher`, the `DONE:` marker, pristine before triage, the caller
+grouping and `DRIFT`).
+
+## AFL dictionaries (2026-10-08)
+
+| change | tag | evidence |
+|---|---|---|
+| `DICT=` passes `afl-fuzz -x`; default `$W/dict.afl`, else the variant's `out/<variant>/dict.afl`, `DICT=none` disables; new last manifest column `dict`, with an older manifest upgraded in place; smoke runs pick the same default | **[measured]** on a fabricated extension in the `sectainer-ruby` container, not on a published gem | a 5 s run picked `$W/dict.afl`, the log shows the dictionary loaded, the manifest row carries it on completed and interrupted paths; `triage_all.sh` and `smoke.sh` read the 26-column manifest unchanged |

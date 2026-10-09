@@ -50,6 +50,15 @@ expected, not a harness error -- confirm it from the direct side's stack (the re
 the input buffer) and report it as such. Over-reads of the library's OWN heap buffers are
 unaffected: those are malloc blocks on both sides.
 
+A seed whose ASAN report is an over-read just past the harness's input copy, clean on the
+sanitized real side, is that ceiling, not a fidelity failure. Name it in the write-up and
+in triage; do not "fix" the harness to match.
+
+**In the smoke test** it shows up as `DIRECT-ONLY`, and `smoke.sh` has no class for it.
+Before fixing the harness, read the report: an over-read of the input block `run_one`
+allocated, on an input under ~616 bytes, is that case; hand it to triage as a candidate
+finding with that reasoning, and fix the harness only for anything else.
+
 The gem reports through its own transformations. On the Node sibling the causes of
 fake mismatches were a JS-string round trip replacing invalid UTF-8 with U+FFFD on input
 *or* output, and a colour transform in a pipeline. A Ruby String keeps invalid bytes, so
@@ -122,6 +131,69 @@ String argument) and state that the transcoding mode is not gateable for invalid
   per seed; on a host shared with other campaigns one asan gate run reported
   `no-output=1` and two re-runs were clean (measured). Re-run before debugging a
   lone NO-OUTPUT; a reproducible one is real.
+
+## Over a system library the sanitized real side is blind inside it
+
+When the harness links the library as an instrumented static archive (SKILL.md step 3b),
+the real stack still loads the **system** shared library. `REAL_ASAN` (the asan gate's and
+smoke's host side) and triage's `gem+asan-ext` column swap in only the sanitized
+**extension**; the process still maps the uninstrumented, unsanitized system `.so`
+(`/proc/self/maps` shows it). So:
+
+* an overflow **inside the library** fires in the direct harness and in nothing on the
+  real side but a hard crash: a smoke crash there can read `DIRECT-ONLY`, and a triage
+  bucket there can read CLEAN or CAUGHT on the asan column. Read the frame before calling
+  it a harness bug: a frame in the library's source is the library's, and the plain
+  column (a real segfault) is the only real-stack evidence it can get;
+* the gate still proves fidelity: the comparison is of results, which the uninstrumented
+  library computes identically;
+* the write-up and triage's report must say it: "the sanitized real-stack column runs
+  against the uninstrumented system `<lib>`; memory errors inside it are visible only in
+  the direct harness". Both evaluation runs on this shape had to work this out.
+
+To give triage a sanitized real-side column for such a bucket, build the same source as an
+ASAN shared library (`AFL_USE_ASAN=1`, or plain clang `-fsanitize=address`,
+`--enable-shared`) and put its directory first in `LD_LIBRARY_PATH` for that column only;
+check `/proc/self/maps` that it is the one mapped. Do this per finding, not up front.
+
+## The five checks
+
+1. **Every seed reaches the library.** Exit 0 licenses nothing.
+2. **Byte-exact agreement on the deepest artifact the API gives you**: the serialized
+   document, every pixel, or for a callback-driven library the hashed event stream. This
+   is what proves the *option* mirroring, not just the parse.
+3. **Both arms populated.** The corpus must contain inputs the library rejects; truncate
+   and bit-flip a few seeds. `MIN_ARMS=1` only for a target that cannot reject (per mode:
+   `:min_arms=1` in `MODES=`). The gate corpus also needs **one seed per branch of the
+   mirrored dispatch** (a declared size over a ceiling, each entry point behind `MODE=`),
+   or the gate proves nothing about the branches the corpus skill will later exercise.
+   Write one valid sample per entry point and branch, then `$R/mkgate.sh OUT=./corpus
+   SAMPLES="..." [TRUNC=3] [FLIPS=3] [EMPTY=1]` writes truncations and flips of each (and
+   an empty file), which populates the rejecting arm; 15 to 40 seeds in all.
+4. **Coverage discriminates.** If a trivial input scores nearly as many tuples as a real
+   one you are measuring init. **Unless** the decoders are in an uninstrumented system
+   `.so` (`nm -D <lib.so> | grep -c sancov` is 0): then rejects out-score successes and the
+   rule inverts. Check that before interpreting the numbers.
+5. **The stubs stayed unreachable.** The gate reads `AFL-HARNESS-STUB` and
+   `AFL-HARNESS-RUBYPATH` from stderr per seed.
+
+A seed that crashes **both** sides is classed `CRASHES-BOTH`: not a fidelity failure but a
+finding, so move it to `crashers/` with a row in `crashers.summary.tsv`, where triage picks
+it up. The gate skips seeds already in `crashers/` as `known-crasher`, which is what lets
+the asan re-gate over the corpus skill's `corpus-min` run without removing them first.
+
+`JOBS` runs seeds in parallel because ruby startup dominates the gate's time.
+
+## The real side's extension swap
+
+With `EXT=<abs .so>`, `real_harness.rb` swaps in a sanitized extension. It intercepts
+**both** `require` and `require_relative` (a gem with precompiled builds first tries
+`require_relative "3.3/<name>"`, then `require "<gem>/<name>"`), then **proves** the swap
+from `/proc/self/maps`, and refuses to print a result (`EXT-NOT-SWAPPED`) if the gem's own
+`.so` is mapped or no load was redirected. A non-matching `EXT_MATCH` was refused that
+way, and plain and ASAN-swapped runs printed identical result lines (both measured). Set
+`EXT_MATCH=` (a regex on the resolved path) when the gem loads several extensions and one
+is yours, `EXT_MAP='<re>=<path>;...'` for several.
 
 ## The harness reports facts; the gate judges
 

@@ -2,7 +2,28 @@
 
 Read this when `gate.sh` reports MISMATCH on some seeds and not others. Work through the
 causes in this order; the first two are cheap to check and the third is the one you
-actually want to find.
+actually want to find. When every seed fails or produces no output, start at section 0.
+
+## 0. Every seed fails: the command, not the seeds
+
+The real side (`real_harness_template.mjs`) swaps in a sanitized addon with `ADDON=`
+through a `process.dlopen` hook, so the swap works however the package computes its
+binary's path, and it refuses to print a result (`ADDON-NOT-SWAPPED`) if no load was
+redirected. It also re-homes the input into an unpooled buffer before the call.
+
+For the asan gate the sanitizer runtime is preloaded **inside `REAL=`**, never in front of
+`gate.sh`. In front, it is preloaded into afl-showmap and the direct harness as well:
+every seed is `NO-OUTPUT ... rc=86` with an empty message and check 4 says `afl-showmap
+produced nothing`; the gate now names that cause.
+
+The gate's default `ASAN_OPTIONS` carry the campaign's allocation ceiling
+(`allocator_may_return_null=1`, `max_allocation_size_mb=$ALLOC_CAP_MB`), so a seed
+declaring a huge allocation is refused the same way on both sides instead of aborting
+with `allocation-size-too-big` and no result line on one.
+
+The gate prints the first error line of whichever side produced no output, so a wrong
+`ADDON=` path or a sanitizer abort on one side is named rather than counted. If **every**
+seed has no output, the command is broken, not the seeds.
 
 ## 1. The target reads out-of-bounds or uninitialised memory, so neither arm is wrong
 
@@ -45,6 +66,27 @@ SOFT_DROP="out_len out_hash"`: name every field the loss changes, and a U+FFFD
 substitution changes the length too) and count them separately. Never silently pass or
 fail.
 
+Two more causes, both seen in a mode that hands the library a JS string rather than a
+Buffer, and both found only by the corpus skill's bigger corpus (the gate corpus was
+clean):
+
+* **Lone surrogates dropped on the way in.** The binding converts the JS string to bytes
+  (`Buffer::New(isolate, string)`, `napi_get_value_string_utf8`), and V8's conversion
+  drops or replaces an unpaired surrogate: `"x\ud83d"` reached the library as `x`, and
+  `"\ud800"` as nothing. The direct harness decoded the file's UTF-16LE itself and passed
+  the surrogate through, so the arms ran different inputs. Fix on both sides, so the
+  framing stays lossless: the real arm calls `.toWellFormed()` on the string before the
+  API call, and the harness's UTF-16 to UTF-8 conversion maps each lone surrogate to
+  U+FFFD, which is what `toWellFormed()` produces. Document the mapping at the top of
+  both files, and state the ceiling: lone surrogates are no longer an input.
+* **A returned string that cuts a code point.** When the library returns a byte range
+  (a match, a slice) that ends or starts inside a multi-byte UTF-8 sequence and the
+  binding returns it as a JS string, the partial sequence becomes U+FFFD and the bytes
+  are gone. The real side sets `lossy=1` when a returned string contains U+FFFD, and the
+  default `SOFT_DROP` (`out_len out_hash`) drops what it changed. The direct side keeps
+  hashing the raw bytes; mirroring the replacement there would hide the case rather than
+  count it.
+
 **Re-run the gate once the corpus skill has produced a real corpus.** A gate corpus
 sized to populate both arms is too small to find the ceiling: one target gated 70/70
 clean and then reported `oracle-limited=1` on 353 seeds, because the library accepts a
@@ -76,11 +118,34 @@ injected into the library build (`FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`; see
 what the addon rejects), a NUL terminator added or omitted, an option default read from
 documentation instead of from the JS.
 
+**`out_hash` differs only on rejected seeds** of a streaming or callback-driven API: the
+two sides disagree about the partial output. The real-side template collects output
+progressively (each arm's callbacks append to a `collected` buffer) and its catch branch
+hashes what was collected before the error, so the direct harness must hash the same
+partial stream on a reject, not an empty one and not nothing.
+
 A fourth shape is not a mismatch the soft field can absorb: a delivery mode whose
 transcoding flips **acceptance** (a JS-string argument replacing invalid UTF-8 with
 U+FFFD turns an invalid pattern into a valid one). `SOFT_DROP` only drops output
 fields. Gate the lossless delivery (a Buffer argument) and state that the string mode
 is not gateable for invalid input.
+
+## 4. What the sanitized real side cannot see: a system library
+
+When the harness links an instrumented static archive of a library the package loads as
+a system `.so` (`build-traps.md`, step 3b), the two sides no longer run the same build of
+the library. `REAL_ASAN` swaps the sanitized **addon** into the oracle; the library under
+it is still the distribution's uninstrumented `.so`. So:
+
+* an overflow inside the library is seen by the asan harness and not by the sanitized
+  real side, which reads CLEAN, or crashes only when the corruption reaches a signal;
+* agreement on a seed the library accepts still proves the mirroring, since both run the
+  same library version, provided the archive was built from the version the `.so` is;
+* the triage confirm table's sanitized column measures the addon only.
+
+State it in the write-up ("the sanitized real side runs the sanitized addon against the
+uninstrumented system library; it cannot see an overflow inside the library") and in the
+triage report's Scope section, on its "Instrumented:" line.
 
 ## The harness reports facts; the gate judges
 
@@ -94,6 +159,11 @@ Compare the **deepest artifact** the API will give you: the serialized document,
 decoded pixel, or for a callback-driven library the **event stream** (tag, names,
 attribute pairs, text bytes) hashed on both sides. A width and a height can agree while
 every byte differs, and an event *count* can agree while the contents differ.
+
+The gate corpus needs more than both status arms: **one seed per branch of the mirrored
+dispatch** (an unsized frame for a streaming fallback, a declared size over the ceiling,
+each entry point behind `MODE=`), or the gate proves nothing about the branches the
+corpus skill will later exercise.
 
 Compare against an **independently installed** copy (the `oracle/` install from step 1).
 Agreeing across a version and a toolchain is far stronger than agreeing with your own

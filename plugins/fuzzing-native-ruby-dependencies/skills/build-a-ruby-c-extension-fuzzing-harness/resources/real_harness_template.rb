@@ -5,6 +5,7 @@
 #   PKG=/abs/oracle/gems/<gem>-<ver> [REQUIRE=<feature>] [EXT=/abs/out/asan/<name>.so] \
 #     [EXT_MATCH=<regex> | EXT_MAP='<regex>=<path>;...'] [ALLOC_CEIL=<bytes>] \
 #     ruby real_harness.rb <input>
+# By hand: `. ./fuzz.env && $REAL <file>` (REAL carries PKG=; plain `ruby real_harness.rb x` aborts).
 # With EXT, run ruby with the sanitizer runtime preloaded (first in LD_PRELOAD):
 #   LD_PRELOAD=$(resources/find_asan_rt.sh) ASAN_OPTIONS=detect_leaks=0 EXT=... ruby real_harness.rb <input>
 # detect_leaks=0: the interpreter does not free everything at exit, so LeakSanitizer
@@ -188,7 +189,8 @@ end
 # NOT the message by default: gem messages usually embed the position ("... at line 1,
 # column 15 [file.c:376]"; measured on two gems), which makes err unique per seed.  When
 # the class is too coarse, take a STABLE field the gem's exception exposes (e.g.
-# #problem) in ERR_FIELD below, and print the same on the direct side.
+# #problem) in ERR_FIELD below, and print the same on the direct side.  A message that
+# embeds input is cut at the first ": " or " at line" before it serves as a token.
 ERR_FIELD = nil   # e.g. ->(e) { e.respond_to?(:problem) ? e.problem : nil }
 def err_token(e)
   code = e.respond_to?(:code) ? e.code : nil
@@ -209,6 +211,14 @@ end
 #    Pass `b` (BINARY) unless the API documents a String in another encoding; an arm that
 #    forces UTF-8 is a different byte space (see lossy below).
 #    Example:  default: ->(b) { d = MyGem.parse(b); d.to_s.b + "\0" + d.errors.map { |e| "#{e.code};" }.join }
+#              events:  ->(b) { MyGem.sax(b, Recorder.new); COLLECTED }   # a callback arm
+#    COLLECTED is the partial-output buffer.  A one-shot arm returns its result and leaves
+#    COLLECTED empty.  A callback arm appends each serialised event to COLLECTED as it
+#    arrives (COLLECTED << tag << bytes.b) and returns COLLECTED; when the gem raises
+#    mid-stream, the rescue below still hashes the events delivered before the error
+#    (out_len/out_hash; 0 and all-zero when none were).  The direct harness must hash the
+#    same partial stream on error (harness_template.cc section 7), or every rejected seed
+#    mismatches.
 #              strict:  ->(b) { MyGem.parse(b, strict: true).to_s }   # a SECOND mode, not the default
 #    A recovering parser (a default "recover" mode) rejects almost nothing (measured:
 #    nearly every seed took the success arm).  So put what the recovery reported (its
@@ -223,6 +233,7 @@ ENTRIES = {
   "default" => ->(b) { raise NotImplementedError, "fill in ENTRIES with the gem's real call" },
   # "file"   => ->(b) { MyGem.parse_file(as_file(b)) },   # the path entry point (raw bytes)
 }.freeze
+COLLECTED = String.new(encoding: Encoding::BINARY)   # callback arms append here; see above
 def as_file(b, ext = "")
   require "tmpdir"
   p = File.join(Dir.mktmpdir("real-"), "input" + ext)
@@ -240,7 +251,8 @@ begin
   # CALLBACK-DRIVEN (event-handler) API: subclass the gem's handler class,
   # override EVERY callback it offers, serialise each event exactly as the direct harness
   # does (event tag, length-prefixed bytes, attribute pairs in order, nil/true/false, a
-  # position trailer), and hash the concatenation.  The event stream IS the artifact.
+  # position trailer), append it to COLLECTED, and hash the concatenation.  The event
+  # stream IS the artifact, on the error path too.
   #
   # Hash the DEEPEST artifact the API gives you, not a summary: a width and a height can
   # agree while every byte differs.
@@ -260,10 +272,13 @@ begin
   # U+FFFD" test would hide real mismatches on it.  A substitution changes the LENGTH
   # too, so gate with SOFT_DROP="out_len out_hash".
   lossy = 0
+  # success: hash even an empty output; all-zero out_hash is the error path's "nothing collected"
   emit({ status: 0, out_len: out.bytesize, out_hash: fnv1a(out), lossy: lossy }, raw.bytesize)
   exit 0
 rescue Exception => e            # rubocop:disable Lint/RescueException -- NoMemoryError and
   raise if e.is_a?(SystemExit)   # SystemStackError are not StandardErrors, and both are results
-  emit({ status: 1, err: err_token(e) }, raw.bytesize)
+  # the events a callback arm delivered before the error are part of the artifact
+  part = COLLECTED.empty? ? {} : { out_len: COLLECTED.bytesize, out_hash: fnv1a(COLLECTED) }
+  emit({ status: 1, err: err_token(e) }.merge(part), raw.bytesize)
   exit 1
 end

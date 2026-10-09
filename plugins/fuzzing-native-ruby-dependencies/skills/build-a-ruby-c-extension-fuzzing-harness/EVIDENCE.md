@@ -104,3 +104,68 @@ harnesses; none was run against a new gem.
 | `gate.sh` judges NO-OUTPUT on "no line with a `status=` key" and reads keys from that line only | [measured, synthetic] | fake harnesses whose stdout is only logging are NO-OUTPUT; stray `err=` lines no longer supply a key |
 | `detect_selftest.sh`: `ALLOC_CAP_MB` in the default `ASAN_OPTIONS`, `timeout 60` in `run()` and in the seed pick, rc=124 named as a hang; header says to export `MODE=` for a mode-only fault | [carried] | the Node review; the Ruby self-tests above never hit a hang or a declared allocation |
 | `harness_template.cc`: keep `status` below 64 | [carried] | `smoke.sh` reads 86 and >127 as a crash |
+
+## Trim (2026-10-07): under the 30 KB terminal truncation
+
+| change | tag | evidence |
+|---|---|---|
+| SKILL.md 50.1 -> 29.8 KB. Moved, each behind a pointer from the step it left: the oracle/source-copy and four-question long forms, the uncovered gem shapes, what `build_ext.sh` guards against, the stub and link-error mechanics and the real-side ASAN notes to `build-traps.md`; the four boundary shapes and the mode rules' long form to the new `boundary-shapes.md`; the shim recipe to the new `ruby-shim.md`; sizes, work, byte delivery and NUL to `four-layers.md`; the swap proof, the five checks' long form and the String ceiling to `oracle-ceiling.md`; the smoke prose to the new `smoke.md`; the self-test and `rebuild_vendored.sh` recipe to the new `selftest-rebuild.md` | [tool] | every "(measured)" marker (29) still sits on its sentence wherever it moved; every reference file is pointed at from SKILL.md (7 files, 24 pointers, no dangling path); no em-dash outside the headings |
+
+## Chain review mirrored from the Node plugin (2026-10-08)
+
+| change | tag | evidence |
+|---|---|---|
+| `fuzz.env` (`init_workspace.sh`, `preflight.sh`, sourced by every command block, read as defaults by the shared scripts; Ruby key `EXT_ASAN`) | [measured, synthetic] | `init_workspace.sh` tested in `sectainer-ruby` on a stub gem: writes, merges on re-run, reads `PKG_VERSION` from the gemspec; preflight passed |
+| `gate.sh`/`smoke.sh`/`detect_selftest.sh`: `REAL_ASAN` pickup, `ASAN_OPTIONS` appended after an inherited value, MODE-leak WARN, vacuous-gate WARNs | [carried] | identical copies of the Node scripts; tested on fabricated harnesses only |
+| `harness_template.cc` `#error` markers; `rebuild.sh` instead of an eval'd REBUILD string | [carried] | from the Node review |
+| `confirm.rb` calls each arm with the input and defines `as_file(b, ext)`; `die` flushes before exiting | [measured, synthetic] | a pasted `->(b)` arm raised ArgumentError (every cell CAUGHT); `puts` then `exit!` lost the verdict line on a pipe. Stub gem under Ruby 3.3: CLEAN, NATIVE-CRASH through the file arm, version-mismatch cell, `no-such-entry` now reaches the pipe |
+
+## Second evaluation round (2026-10-08): four fresh agents, two gem shapes, both models
+
+Opus and Sonnet each took the full chain on a gem whose parser is the extension's own C
+(linked through a shim) and on a gem over a system library (rebuilt as an instrumented
+static archive), four agents at once in the `sectainer-ruby` container, campaigns
+`DURATION=300 JOBS=2`. Every run passed the gate, smoke and self-test on its first
+harness, and every campaign completed. Harness phase 5 to 11 minutes, whole chain 22 to
+30 minutes. The chain-review rows above (`fuzz.env`, `init_workspace.sh`, `preflight.sh`,
+`DETACH=1`, the `REAL_ASAN` pickup) are therefore **[measured]** on two gem shapes, not
+synthetic: no run noted any friction with them. What the runs did hit, and the fix:
+
+| what every run hit | fix | tag |
+|---|---|---|
+| `init_workspace.sh` never found an installed gem's version (the spec is in `oracle/specifications/`, and the directory-name fallback was guarded by "a gemspec was found"); all four passed `PKG_VERSION=` by hand | lookup order: `package.json`, `../../specifications/<dir>.gemspec`, `*.gemspec` under the gem dir, the `-<ver>` suffix unconditionally, else a WARN | [measured] on an installed oracle, with and without a trailing slash |
+| the triage SKILL.md told the model to rewrite arms to the no-argument form while `confirm.rb` calls them with the input: every cell would read CAUGHT (all four followed the script instead) | the text now says paste unchanged, `->(b)` form, helpers pasted above the hash | [tool] |
+| `confirm.rb` had to be edited inside the plugin install (each run copied `resources/` to work around it) | `CONFIRM=` knob; `$W/confirm.rb` is the default when present; the SKILL says to copy the template there | [measured] on an eval workspace |
+| step 1 question 3 grepped `extconf.h` and `mkmf.log`, which a gem without `create_header`, or one that cleans after building, does not have | `lift_flags.sh` first, the greps optional | [tool] |
+
+| what three runs hit | fix | tag |
+|---|---|---|
+| the real-side template's rescue branch emitted only `err`, so a callback harness that hashes the events delivered before an error mismatched on every rejected seed | `COLLECTED` buffer the callback arms append to, hashed on error; the C template says to hash the same partial stream | [measured] against an installed gem: partial stream hashed, empty stream gives 0 |
+| the corpus skill's instrumentation check ran `ldd` on the extension, which misleads for a shim or static-archive harness | check the harness binary and its archives; `ldd` only for a harness that dlopens | [tool] |
+| one seed dropped per campaign with nothing naming it (the zero-byte seed) | `campaign.sh` writes `campaigns/<name>.dropped`; afl-fuzz 4.33c skips an empty file and `README.txt` silently and names crashing seeds in a WARNING line | [measured] in a 5 s campaign with an empty, a crashing and a README seed |
+| the `rebuild.sh` example assumed a vendored archive, never showed the `EXT_OBJS`/`SHIM` form, and discarded the build log the self-test shows on failure | both forms shown, no `/dev/null`, system-library form with `cp -a` | [tool] |
+
+| by shape | fix | tag |
+|---|---|---|
+| system library: no recipe for rebuilding it instrumented, a step 1/3b contradiction, and nothing saying the real side's sanitized column cannot see inside the uninstrumented system `.so` | step 3b is the static-archive recipe (version-matched source, `--disable-shared --enable-static`, `cp -a`); the caveat is in step 5, `oracle-ceiling.md` and the triage report's Scope section | [measured] by both runs on that shape, which built the archive this way |
+| shim: `SHIM=` missing from the link block; no example of a handler-recording `rb_funcall` or of globals set in an unlinked extension object; a shim TU instrumented by afl-clang-fast under ASAN crashed in a select-instrumented branch | `link_harness.sh` compiles shim sources with plain clang plus the sanitizer; `ruby_shim_template.c` carries both examples; the link block shows `SHIM=` | [measured]: the eval workspace relinked with an uninstrumented shim gives byte-identical result lines on every seed in both variants |
+| smoke classed a crash REAL but nothing handed it to triage, which skips the `smoke/` tree | `smoke.sh` copies REAL and PERSISTENT-ONLY crashes into `crashers/` with summary rows; the corpus snippet keeps those rows | [tool] |
+| `triage_all.sh` in manifest mode wrote a no-findings report although `crashers/` held files | the crashers/hangs pass always runs; the no-findings report gains a Scope section with an `Instrumented:` line | [measured] on an eval workspace copy |
+| one `GOOD=` seed is not valid for an entry point of another encoding | `GOOD_<entry>=` | [measured] with a UTF-16 arm |
+| `error_inventory.sh` missed error strings passed as call arguments on their own line | a python pass over the arguments of `*error*` calls | [measured]: candidates 24 to 105, reached 7 to 45 on the system library's source |
+| a `NameError` from a helper not pasted into `confirm.rb` read CAUGHT | `ERROR(arm-wiring)` | [measured] on the eval's pasted hash |
+
+## Mirrored from the Node plugin's evaluation round (2026-10-08)
+
+The shared scripts changed identically in both plugins (`check_shared.sh`: 0 drift) after
+four Node runs; the rows are in the Node plugin's EVIDENCE.md files under the same heading.
+On this plugin they are **[carried]** except where the Ruby-side templates and text were
+adjusted to match (the empty-output hash rule, the framing-not-a-mode rule, `mkgate.sh`,
+`CRASHES-BOTH` and `known-crasher`, the `DONE:` marker, pristine before triage, the caller
+grouping and `DRIFT`).
+
+## AFL dictionaries (2026-10-08)
+
+| change | tag | evidence |
+|---|---|---|
+| `build_ext.sh` and `link_harness.sh` write `out/<variant>/dict.afl` via `AFL_LLVM_DICT2FILE` (separate raw files for the extension build and the harness TU, deduplicated at link; never for pristine; `AFL_LLVM_DICT2FILE_NO_MAIN=1` for the extension build only) | **[measured]** on a fabricated extension in the `sectainer-ruby` container, not on a published gem | afl-clang-fast 4.33c in PCGUARD mode honours the variable with and without ASAN; the path must be absolute (afl-cc aborts otherwise); `NO_MAIN` also drops static helpers inlined into `main` at -O2, measured on a test extension, so it is off for the harness TU; a relink neither wipes nor piles up entries |

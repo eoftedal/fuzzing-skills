@@ -1,5 +1,7 @@
 // Skeleton for a direct AFL++ harness against the C library behind a Ruby C extension.
 // Replace the marked sections; the structure around them is what you want.
+// Sections 1, 4, 6 and 7 each carry an #error line, so this file does not compile until
+// you have filled them in and deleted it; the driver, fnv1a and set_err need no edit.
 //
 // Build BOTH binaries from this one file with resources/link_harness.sh, which
 // compiles it twice (persistent, and -DNO_PERSISTENT for the fork twin) with the
@@ -34,6 +36,7 @@
 // #undef snprintf            // ruby.h maps snprintf/vsnprintf to ruby_snprintf/
 // #undef vsnprintf           // ruby_vsnprintf, which the harness does not link
 //                            // ("undefined reference to `ruby_snprintf'", measured)
+#error "harness_template: fill in section 1 (library headers) and delete this line"
 
 #include <cstdint>
 #include <cstdio>
@@ -120,7 +123,11 @@ static void set_err(Result* r, const char* name) {   // "Data corruption detecte
 // multi-call state the real process accumulates (a bug class of its own: a failed call
 // that leaves the shared context mid-frame poisons every later call), at the cost of
 // persistent-mode stability.  Say which you chose; the fork driver sidesteps it.
+// Library-wide caches that grow across iterations (name or symbol caches, hash tables)
+// are a common source of stability in the low 90s; they are not a harness bug, the
+// campaign's fork fallback handles them.
 static void harness_init(void) {
+#error "harness_template: fill in section 4 (MODE switch and Init_<name> mirroring) and delete this line"
   const char* m = getenv("MODE");
   if (m && !strcmp(m, "file")) g_mode = 1;
   if (getenv("ALLOC_CEIL")) g_alloc_ceil = strtoull(getenv("ALLOC_CEIL"), 0, 0);
@@ -176,6 +183,7 @@ static void run_one(const unsigned char* data, size_t len, Result* r) {
   //   if (over_ceiling(declared_size)) { r->status = 1; set_err(r, "alloc-ceiling"); goto done; }  // opt-in only
   //   status = ext_open_input(&descriptor);
   //   if (status != OK) { r->status = 1; set_err(r, library_error_name(status)); goto done; }
+#error "harness_template: fill in section 6 (the boundary call) and delete this line"
 
   // --- 7. make the library actually do the work ---
   // An open is not a decode and a parse is not an evaluation.  Lazy/demand-driven
@@ -190,10 +198,16 @@ static void run_one(const unsigned char* data, size_t len, Result* r) {
   // In a Ruby extension the real handlers are Ruby methods (a handler object's
   // per-event method) called through rb_funcall: the artifact is what those methods
   // receive, after the extension has converted the library's arguments to Strings.
+  // On an error mid-stream, hash the events delivered so far, exactly as the real
+  // side does (real_harness.rb keeps them in COLLECTED), so rejected seeds compare too:
+  // status=1, err=<token>, out_len/out_hash over the partial stream; out_len=0 and
+  // out_hash=0 only on this ERROR path when nothing was collected.  On SUCCESS always
+  // hash the output, even when empty (fnv1a of nothing), as both real templates do.
   // For a streaming API fed in chunks, concatenate every output chunk and hash it.
   //
   //   out = force_result(handle, &n);
   //   r->out_len = n; r->out_hash = fnv1a(out, n);
+#error "harness_template: fill in section 7 (force the work, record the artifact) and delete this line"
 
   // --- 8. teardown: copy the library's own cleanup, minus the binding calls ---
   // Check each setter's ownership convention, not just the field: some copy the

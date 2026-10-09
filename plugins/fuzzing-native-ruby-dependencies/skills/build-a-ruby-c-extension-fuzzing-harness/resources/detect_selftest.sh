@@ -25,6 +25,8 @@
 #               first seed does not take (a raw-block fault with a compressed-block
 #               seed fires nothing); the script cannot know which seed reaches it
 #   ALLOC_CAP_MB   memory ceiling (default 1024), as everywhere else
+#   WORKSPACE   the fuzz workspace (default .): its fuzz.env, when present, is sourced first
+#               (init_workspace.sh writes it), so arguments still override it
 #
 # The harness runs in the CURRENT environment: for a fault on a path only one mode reaches,
 # export that mode (MODE=...) before running this, and pick SEED= from a seed that takes it.
@@ -57,14 +59,17 @@
 #   - the faulted outcome (rc, kind) differs from the clean one;
 #   - neither run's stderr contains AFL-HARNESS-STUB (else a stubbed symbol was hit).
 set -uo pipefail
+for kv in "$@"; do case $kv in WORKSPACE=*) WORKSPACE=${kv#*=};; esac; done
+WS=${WORKSPACE:-.}; [ -f "$WS/fuzz.env" ] && { set -a; . "$WS/fuzz.env"; set +a; }
 for kv in "$@"; do case $kv in *=*) export "$kv";; esac; done
 FAULT_SRC=${FAULT_SRC:?set FAULT_SRC}
 FAULT_SED=${FAULT_SED:?set FAULT_SED}
 REBUILD=${REBUILD:?set REBUILD}
 HARNESS=${HARNESS:?set HARNESS}
 ALLOC_CAP_MB=${ALLOC_CAP_MB:-1024}
-# the chain's allocation ceiling, so a seed refused here is refused the same way everywhere
-export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:symbolize=1:exitcode=86:allocator_may_return_null=1:max_allocation_size_mb=$ALLOC_CAP_MB}"
+# the chain's allocation ceiling, so a seed refused here is refused the same way everywhere.
+# Appended after any inherited value: an inherited ASAN_OPTIONS used to replace these silently.
+export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0:symbolize=1:exitcode=86:allocator_may_return_null=1:max_allocation_size_mb=$ALLOC_CAP_MB"
 
 [ -f "$FAULT_SRC" ] || { echo "FAIL: FAULT_SRC not found: $FAULT_SRC" >&2; exit 1; }
 BK=$(mktemp)

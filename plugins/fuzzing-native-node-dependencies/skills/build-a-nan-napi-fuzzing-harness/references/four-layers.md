@@ -179,13 +179,39 @@ corpus would have been lossy for invalid sequences and made whole byte ranges
 unreachable. Mirror the lossy edges too: `toString('utf16le')` drops a trailing odd
 byte, so the harness uses `len / 2` units rather than inventing one.
 
+**Several byte arguments** (a salt and a password, a pattern and a subject) go in one
+file, framed with a separator the API's values cannot carry (NUL for a JS-string
+argument; a length prefix for a Buffer one), split identically on both arms and
+documented at the top of `harness.cc`. The corpus skill's seeds then use the same
+framing, and the gate still compares what the real API consumed after the split.
+
+**An option that selects code: framing, not a mode.** A `MODE` is for a handful of entry
+points, each a campaign of its own. A free-form API argument with a large value space
+that selects code paths is input: an encoding-name pair that picks one of about a
+hundred and fifty converters (one function pointer per name), a regex flags string, a
+format name. Frame it into the file ahead of the payload (`<from>\0<to>\0<payload>`, or
+newline separated when the values cannot hold a newline), document it at the top of
+`harness.cc`, and mirror whatever the binding does to the string on the way in: a
+fixed-size `napi_get_value_string_utf8` buffer truncates it (63 bytes plus NUL), a JS
+helper normalises it. A mode per converter would have meant a hundred and fifty
+campaigns, and the fuzzer could never cross from one converter to another. Restrict the
+framed names to bytes that map losslessly to the JS string (ASCII, say) and give both
+arms the same `err` token for the rest, rather than letting the transcoding differ.
+
+**NUL termination.** `node::Buffer::Data()` is raw and unterminated; a JS string via
+`Nan::Utf8String` / `napi_get_value_string_utf8` is NUL-terminated and transcoded, and so
+cannot carry invalid UTF-8 or anything past a NUL. Note which you have.
+
 **When the binding itself stages the input into a fixed buffer**, an over-read past the
 input really is invisible in production, and mirroring the staging buffer is the
 faithful choice even though it costs sensitivity. Say so, and offer the sensitive version
 behind an env var clearly labelled as *not* faithful and never used for the gate
 (`EXACT=1`, corresponding to C API callers who pass an exact buffer).
 
-## Reset only what is safe to reset
+## Make the library actually do the work; reset only what is safe to reset
+
+An open is not a decode. Force evaluation and record something only real work could
+produce.
 
 Read the implementation of any reset you call in a loop. Case: an image-processing
 binding's library-wide cache-drop call reads like a reset and is a *teardown* that frees its hash table

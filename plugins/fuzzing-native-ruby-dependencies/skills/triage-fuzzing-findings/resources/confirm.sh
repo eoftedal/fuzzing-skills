@@ -35,12 +35,17 @@
 #   CLEAN              no error at all, with `evidence=` of what the call produced.
 #   SKIPPED            NoMemoryError under the sanitizer allocation cap; proves nothing.
 #   ERROR              `ERROR` = confirm.rb rejected the ENTRY or could not load PKG
-#                      (exit 40); `ERROR(rc=N)` = ruby died without printing a verdict.
-#                      Neither is a finding; fix it and re-run.
+#                      (exit 40); `ERROR(rc=N)` = ruby died without printing a verdict;
+#                      `ERROR(version-mismatch=<got>!=<want>)` = PKG is not the
+#                      PKG_VERSION you harnessed (exit 41); `ERROR(arm-wiring)` = an arm
+#                      used a name confirm.rb does not define (paste its helper too).
+#                      None is a finding; fix it and re-run.
 #   EXT-NOT-SWAPPED / EXT-AMBIGUOUS   the sanitized column did not run the sanitized
 #                      extension (or one EXT replaced two extensions).  Not a verdict.
 #
-# Configure with KEY=VALUE arguments or environment:
+# Configure with KEY=VALUE arguments, then $WORKSPACE/fuzz.env (WORKSPACE default .), then
+# environment.  From fuzz.env: PKG, PKG_VERSION, ALLOC_CAP_MB, EXT (from EXT_ASAN), and
+# ASAN_RT (from $R/find_asan_rt.sh) when EXT is set.
 #   PKG       REQUIRED.  oracle/gems/<gem>-<ver> of a FRESH
 #             `gem install --install-dir oracle --platform ruby <gem> -v <version>`, pinned
 #             to the version you harnessed -- a newer release may have fixed the bug, which
@@ -59,6 +64,7 @@
 #   ASAN_RT   LD_PRELOAD for the sanitized columns (the harness skill's find_asan_rt.sh).
 #   ALLOC_CAP_MB  fallback allocation ceiling for the sanitized columns (default 1024); the
 #             per-bucket ceiling screen.sh recorded in OUT/cap.tsv takes precedence.
+#   PKG_VERSION  the version you harnessed; confirm.rb refuses a PKG of another version.
 #   ENTRIES   space-separated ENTRY names defined in confirm.rb (default: default).
 #             Confirm EVERY entry point the gem exposes: on a Node binding, 25 of 111
 #             confirmed crashes were reachable only through its second entry point, and a
@@ -66,19 +72,38 @@
 #   GOOD      a KNOWN-GOOD input (a corpus seed).  Used as a liveness check before the
 #             table: if the call does not produce evidence on a seed that works, the
 #             column is mis-wired and its CLEANs mean nothing.
+#   GOOD_<entry>  a known-good input for ONE entry point, overriding GOOD for its liveness
+#             check: entries that differ in encoding or input shape (a UTF-16 arm, an IO
+#             arm) need their own, or the UTF-8 GOOD reads NO-EVIDENCE there.  Characters of
+#             the entry name outside [A-Za-z0-9_] become _ (GOOD_sax_html for sax-html).
+#   CONFIRM   the confirm.rb holding your ENTRIES arms (default: $WORKSPACE/confirm.rb when
+#             it exists, else the copy next to this script).  Copy confirm.rb into the
+#             workspace and fill it in there; an installed plugin's copy is shared.
 #   CELL_TIMEOUT  seconds per cell (default 30).  A C loop that never releases the GVL
 #             starves confirm.rb's own watchdog; this is what stops it.
 #   OUT       triage work dir (default ./triage); BUCKETS defaults to OUT/buckets.
 #   VERDICTS  machine-readable output (default OUT/verdicts.tsv): name, entry, 3 columns.
 set -uo pipefail
+for kv in "$@"; do case $kv in WORKSPACE=*) export "$kv";; esac; done   # find fuzz.env first
+WS=${WORKSPACE:-.}; [ -f "$WS/fuzz.env" ] && { set -a; . "$WS/fuzz.env"; set +a; }
 for kv in "$@"; do case $kv in *=*) export "$kv";; esac; done
+EXT=${EXT:-${EXT_ASAN:-${ADDON_ASAN:-}}}
+# the sanitized columns need the runtime preloaded; find it the way the harness skill does
+if [ -n "$EXT" ] && [ -z "${ASAN_RT:-}" ] && [ -n "${R:-}" ] && [ -f "$R/find_asan_rt.sh" ]; then
+  rt=$(bash "$R/find_asan_rt.sh" 2>/dev/null) && [ -n "$rt" ] && ASAN_RT=$rt
+fi
 PKG=${PKG:?set PKG=oracle/gems/<gem>-<ver> of a fresh gem install --install-dir oracle --platform ruby}
 PKG=$(cd "$PKG" && pwd) || exit 2
 OUT=${OUT:-./triage}; BUCKETS=${BUCKETS:-$OUT/buckets}
 ENTRIES=${ENTRIES:-default}; CELL_TIMEOUT=${CELL_TIMEOUT:-30}
-CONF="$(cd "$(dirname "$0")" && pwd)/confirm.rb"
+CONF=${CONFIRM:-}
+if [ -z "$CONF" ]; then CONF="$WS/confirm.rb"; [ -f "$CONF" ] || CONF="$(cd "$(dirname "$0")" && pwd)/confirm.rb"; fi
+[ -f "$CONF" ] || { echo "FAIL: CONFIRM=$CONF does not exist" >&2; exit 2; }
+CONF="$(cd "$(dirname "$CONF")" && pwd)/$(basename "$CONF")"
 [ -z "${GOOD:-}" ] || [ -f "$GOOD" ] || { echo "FAIL: GOOD=$GOOD does not exist (relative to $(pwd)). A missing reference input" >&2
                                             echo "      looks 'consistent' at every ceiling and silently disables the guard." >&2; exit 2; }
+goodfor() { local v="GOOD_${1//[^A-Za-z0-9_]/_}"; printf '%s' "${!v:-${GOOD:-}}"; }   # <entry> -> its known-good input
+for E in $ENTRIES; do g=$(goodfor "$E"); [ -z "$g" ] || [ -f "$g" ] || { echo "FAIL: the known-good input for ENTRY=$E ($g) does not exist" >&2; exit 2; }; done
 # symbolize so a sanitizer report is readable; do NOT abort (let it exit 86 after printing).
 # The allocation ceiling is set PER BUCKET from OUT/cap.tsv (the ceiling the input reproduced
 # at), appended last so nothing inherited overrides it.  (On the Node sibling a fixed 4096 MB
@@ -98,8 +123,9 @@ ts() { printf '[%s +%ds] %s\n' "$(date +%H:%M:%S)" "$(( $(date +%s) - T0 ))" "$*
 # Stack exhaustion's threshold is the stack limit, not the input, and a thread the gem
 # starts has its own (RUBY_THREAD_VM_STACK_SIZE / the machine stack of that thread).
 # Record it: a depth-sensitive verdict means nothing without it.
+echo "# confirm script: $CONF"
 echo "# stack limit: $(ulimit -s) KiB   $(ruby -v)   cell timeout: ${CELL_TIMEOUT}s"
-nb=$(ls "$BUCKETS" 2>/dev/null | grep -c '^[^.]' || true)
+nb=$(ls "$BUCKETS" 2>/dev/null | grep -v '\.key$' | grep -c '^[^.]' || true)   # minimize.sh writes <name>.key beside each reproducer
 ne=$(set -- $ENTRIES; echo $#)
 ncols=1; [ -n "${EXT:-}" ] && ncols=$((ncols+1)); [ -n "${PRISTINE:-}" ] && ncols=$((ncols+1))
 ts "# $nb bucket(s) x $ne entry point(s) x $ncols column(s) = up to $((nb*ne*ncols)) ruby runs, ${CELL_TIMEOUT}s each"
@@ -155,6 +181,8 @@ run() {  # <crash file> <env assignments...>  -> prints one cell, sets LAST_OUT
     # hides every memory bug it exists to find.  That is an error, not a verdict.
     grep -q 'swap=NOT-SWAPPED'    <<<"$out" && v="EXT-NOT-SWAPPED"
     grep -q 'swap=AMBIGUOUS-SWAP' <<<"$out" && v="EXT-AMBIGUOUS"
+    local why; why=$(sed -n 's/^verdict=ERROR \(version-mismatch=[^ ]*\|arm-wiring\).*/\1/p' <<<"$out" | head -1)
+    [ -n "$why" ] && v="ERROR($why)"
     echo "$v"
   else echo "ERROR(rc=$rc)"; fi
 }
@@ -186,7 +214,8 @@ for E in $ENTRIES; do
   # Liveness check.  A column of all-CLEAN is the signature of a mis-wired call, not of a
   # clean gem; prove the call does something on an input that works before believing a
   # CLEAN on an input that crashed the harness.
-  if [ -n "${GOOD:-}" ]; then
+  G=$(goodfor "$E")
+  if [ -n "$G" ]; then
     # The sanitized columns get a liveness run too, and it must show swap=swapped: a cell
     # that crashes exits before confirm.rb can report its swap state, so this is the only
     # place a silently un-swapped EXT would show up for crashing rows.
@@ -194,29 +223,31 @@ for E in $ENTRIES; do
       so=${!col:-}; [ -n "$so" ] || continue
       m=${EXT_MAP:-}; [ "$col" = PRISTINE ] && m=${PRISTINE_MAP:-}
       lv=$(timeout -k 2 "$CELL_TIMEOUT" env -u EXT_MAP ENTRY="$E" PKG="$PKG" EXT="$so" ${EXT_MATCH:+EXT_MATCH="$EXT_MATCH"} \
-             ${m:+EXT_MAP="$m"} ${ASAN_RT:+LD_PRELOAD="$ASAN_RT"} ASAN_OPTIONS="$ASAN_BASE" ruby "$CONF" "$GOOD" 2>&1)
+             ${m:+EXT_MAP="$m"} ${ASAN_RT:+LD_PRELOAD="$ASAN_RT"} ASAN_OPTIONS="$ASAN_BASE" ruby "$CONF" "$G" 2>&1)
       sw=$(sed -n 's/.* swap=\([A-Za-z-]*\).*/\1/p' <<<"$lv" | head -1)
       echo "# liveness $col: $(sed -n 's/^verdict=\([A-Z-]*\).*/\1/p' <<<"$lv" | head -1) swap=${sw:-?}"
       [ "$sw" = swapped ] || echo "# WARN: the $col column did not prove its swap on the known-good seed; its NATIVE-CRASH/CLEAN cells may be the plain build's."
     done
     # NOT $(run ...): a command substitution is a subshell, so LAST_OUT would not come
     # back.  Capture through a file instead, and read the evidence from that one run.
-    run "$GOOD" ENTRY="$E" PKG="$PKG" > "$OUT/.liveness"
+    run "$G" ENTRY="$E" PKG="$PKG" > "$OUT/.liveness"
     g=$(cat "$OUT/.liveness"); rm -f "$OUT/.liveness"
     ev=$(sed -n 's/.*\(evidence=[^ ]*\).*/\1/p' <<<"$LAST_OUT" | head -1)
-    echo "# liveness (GOOD=$(basename "$GOOD")): $g ${ev:-NO-EVIDENCE}"
+    gv=GOOD; [ "$G" = "${GOOD:-}" ] || gv="GOOD_${E//[^A-Za-z0-9_]/_}"
+    echo "# liveness ($gv=$(basename "$G")): $g ${ev:-NO-EVIDENCE}"
     case "$g" in CLEAN) :;; *) echo "# WARN: the known-good seed is not CLEAN on this entry point;" \
         "every CLEAN below is unverified until the call is right.";; esac
     case "$ev" in ""|evidence=type=nil|evidence=bytes=0|evidence=*=0)
       echo "# WARN: the known-good seed produced ${ev:-no evidence}: the call may be returning" \
         "without doing the work, and every CLEAN below is suspect.";; esac
   else
-    echo "# no GOOD= given: the CLEAN cells below are unverified. Pass a corpus seed."
+    echo "# no GOOD= (or GOOD_${E//[^A-Za-z0-9_]/_}=) given: the CLEAN cells below are unverified. Pass a corpus seed."
   fi
   cells=0
   printf '%-34s %-24s %-24s %-24s\n' CRASH 'gem-install(plain)' 'gem+asan-ext' 'gem+pristine-ext'
   for c in "$BUCKETS"/*; do
     [ -f "$c" ] || continue
+    case $c in *.key) continue;; esac                     # minimize.sh's key file, not an input
     pname=$(basename "$c" | sed 's/^[0-9a-f]\{6\}-//')
     orig="$OUT/pool/$pname"                                  # pre-tmin bytes (see screen.sh)
     cap=$(capof "$pname"); cap=${cap:-$ALLOC_CAP_MB}

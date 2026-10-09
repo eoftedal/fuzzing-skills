@@ -10,27 +10,32 @@ findings. **Classify crashes; do not develop exploits.**
 
 The pipeline is automated. You do three things by hand, and only three:
 
-1. **Fill in the consumer calls** — the `ENTRIES` arms in `resources/confirm.mjs`.
+1. **Fill in the consumer calls**: the `ENTRIES` arms in `$W/confirm.mjs`, your copy of
+   the template.
 2. **Run the driver.**
 3. **Judge severity and write the report** from the skeleton it produces.
 
 ```sh
-# 1  resources/confirm.mjs: ENTRIES = the ENTRIES object from the harness skill's
-#    real_harness.mjs, pasted unchanged (same keys = the harness MODE values = the
-#    manifest's `entry` column; the gate already proved those calls reach the native code)
-# 2  PKG = the harness skill's oracle/ install: a fresh, pinned `npm install <pkg>` of the
-#    published package (built from source where that skill said so).  No second install.
-# 3  one command, run from the fuzz workspace: screens every campaign on the build that made
+# 0  any crash saved? build out/pristine first (Step 2)
+# 1  cp $SKILLS/triage-fuzzing-findings/resources/confirm.mjs $W/confirm.mjs, then in the copy
+#    ENTRIES = the ENTRIES object from the harness skill's real_harness.mjs, pasted unchanged
+#    (same keys = the harness MODE values = the manifest's `entry` column; the gate already
+#    proved those calls reach the native code)
+# 2  one command, run from the fuzz workspace: screens every campaign on the build that made
 #    it, buckets the raw reproducers, confirms one per bucket, minimizes those, writes REPORT.md
-resources/triage_all.sh \
-    PKG=$PWD/oracle/node_modules/<pkg> \
+cd $W && . ./fuzz.env           # $W written out as the absolute workspace path: a fresh shell has no variables
+$SKILLS/triage-fuzzing-findings/resources/triage_all.sh \
     GOOD=corpus/<a gate seed with status=0> \
-    ASAN_RT=$(../build-a-nan-napi-fuzzing-harness/resources/find_asan_rt.sh)
+    ASAN_RT=$($R/find_asan_rt.sh)
 ```
 
-With `campaigns/manifest.tsv` in the workspace (written by the campaign skill) that is the
-whole command — see "Manifest mode" in Step 2. Without one, also pass `ENTRIES`, `MODES` and
-`ALLOC_CAP_MB` by hand.
+`fuzz.env` (written by the harness skill) supplies `PKG` (the `oracle/` install: a fresh,
+pinned `npm install` of the published package, no second install), the ASAN addon,
+`MODES` and `ALLOC_CAP_MB`; an explicit `KEY=VALUE` wins. `ASAN_RT` is the runtime the
+sanitized confirm columns preload; pass it as above unless `triage_all.sh`'s header lists it
+among the `fuzz.env` defaults. With `campaigns/manifest.tsv` in the workspace (written by the
+campaign skill) that is the whole command; see "Manifest mode" in Step 2. Without one, also
+pass `ENTRIES` by hand.
 
 Without `PKG` it skips confirmation and says so — and the confirm step is the only one that
 answers whether a crash reaches a user.
@@ -51,25 +56,45 @@ segfault.
 
 ## Step 1 — Fill in the consumer calls
 
-Open `resources/confirm.mjs` and set `ENTRIES` to the `ENTRIES` object from the harness
+Copy the template into the workspace and edit the copy, never the plugin's file (a
+plugin update would overwrite it, and every workspace would share one set of arms):
+
+```sh
+cd $W && . ./fuzz.env
+cp $SKILLS/triage-fuzzing-findings/resources/confirm.mjs $W/confirm.mjs
+```
+
+`triage_all.sh` and `confirm.sh` use `$W/confirm.mjs` when it exists; `CONFIRM=<path>`
+points them elsewhere (arms for other API shapes: `references/verdict-semantics.md`,
+"Adapting confirm.mjs"). In the copy, set `ENTRIES` to the `ENTRIES` object from the harness
 skill's `real_harness.mjs`: the same arms, keyed by the harness `MODE` value, which is what
 the campaign manifest's `entry` column holds (`MODE=file` → `file`; the default mode →
 `default`). They were written once, where the gate proved they reach the native code, so do
-not rewrite them. Check two things as you paste: **no options and no error listener you
-would not expect a user to add** (an added `.on('error')` manufactures a CAUGHT verdict),
-and that every `entry` the manifest names has an arm. Helpers provided here: `asFile(ext)`
-for a path argument, `errback`/`okback` for callback-property APIs.
+not rewrite them. The paste really is unchanged: each arm takes the input buffer on both
+sides, and `asFile(b, ext)` (bytes to a temp file path) has the same signature in both files.
+Helper functions the arms call are pasted above the object too, skipping any name
+`confirm.mjs` already defines; that includes `const collected = [];` when a callback arm
+pushes onto it, since `confirm.mjs` does not define `collected`.
+Two helpers exist only in `confirm.mjs`: `errback` and `okback`, the consumer's error and
+success callbacks for callback-property APIs. Check two things as you paste: **no options and
+no error listener you would not expect a user to add** (an added `.on('error')` manufactures
+a CAUGHT verdict), and that every `entry` the manifest names has an arm.
+
+`GOOD=` is the known-good input every entry's liveness check runs. An entry that needs a
+different one (it takes another encoding or input shape, a file-path entry beside a
+string one) gets `GOOD_<entry>=<seed>` (characters outside `[A-Za-z0-9_]` in the entry
+name become `_`), or its CLEAN cells read as unverified.
 
 **Confirm every entry point the binding exposes.** Highest-value rule in this skill.
-A stylesheet-compiler binding has a string entry point and a file-path entry point, and **25
-of its 111 confirmed crashes were reachable only through the file-path one** — the string
-entry point replaces invalid UTF-8 with U+FFFD before the library sees a byte. One entry point reports those 25 as artifacts.
+One entry point can transform the input before the library sees a byte (a string entry
+point that replaces invalid UTF-8 with U+FFFD), so crashes reachable only through another
+(the file-path one) read as artifacts through the first.
 
 **A harness mode is an entry point too.** Buckets found under `MODES` need an arm that
-selects the same mode through the npm API — confirm.sh says so above any such table. The two
-bugs found under harness `MODE=2` in the image-decoding binding's next major version (a zig
-build) read CLEAN through its promise-based loader and **segfault the npm install** through
-an arm that sets the image object's MIME data mode, which is what `MODE=2` sets. Without both the mode and the arm they would have been filed "does not reproduce" twice.
+selects the same mode through the npm API; confirm.sh says so above any such table. A bug
+found under a non-default harness mode can read CLEAN through the package's usual call and
+**segfault the npm install** through an arm that sets what the mode sets. Without both the
+mode and the arm it is filed "does not reproduce" twice.
 
 An arm that returns `undefined` **must** answer from its own callbacks. If it forgets, every
 input runs into the timeout and reads `HANG` — a denial of service that does not exist.
@@ -78,10 +103,27 @@ input runs into the timeout and reads `HANG` — a denial of service that does n
 
 ## Step 2 — Run the driver
 
+### First, build `out/pristine` if any crash was saved
+
+Whenever a campaign, the smoke run or the corpus skill saved a crash, build the
+`pristine` variant (ASAN, no AFL instrumentation) before the driver, with the harness
+skill's two commands:
+
+```sh
+cd $W && . ./fuzz.env && cd <package dir>
+$R/build_addon.sh VARIANT=pristine OUT=$W/out
+cd $W && $R/link_harness.sh VARIANT=pristine MK=out/pristine/<target>.target.mk SRCDIR=<package dir> \
+    LIB="$(find out/pristine/Release/obj.target/<dep> -name '*.o')"
+```
+
+The driver finds `out/pristine/` by itself and fills the `npm-js+pristine-addon` column,
+the only one that earns "reproduces without the coverage instrumentation" (Step 4).
+Without it that column reads `(no PRISTINE)`, and `triage_all.sh` says so.
+
 ### Manifest mode (the default)
 
 If `campaigns/manifest.tsv` exists, `triage_all.sh` drives from it; run it from the
-workspace with nothing but `PKG`/`GOOD`/`ASAN_RT`. `NO_MANIFEST=1` forces discovery;
+workspace with nothing but `GOOD` (and `ASAN_RT`). `NO_MANIFEST=1` forces discovery;
 `MANIFEST=<path>` points elsewhere.
 
 | from the manifest | how |
@@ -95,8 +137,9 @@ workspace with nothing but `PKG`/`GOOD`/`ASAN_RT`. `NO_MANIFEST=1` forces discov
 Still discovered, not read: the crash and bucket contents, the `GOOD` guard and the
 ceiling ladder. It warns about any `crashes/`/`hangs/` directory with files that the manifest
 does not list (they are not triaged; re-run the campaign or use `NO_MANIFEST=1`); the
-harness skill's `smoke/` tree is skipped in that check. The corpus skill's `crashers/` and
-`hangs/` (seeds that crash or hang the harness) are triaged too: against every variant, then
+harness skill's `smoke/` tree is skipped in that check. The workspace's `crashers/` and
+`hangs/` (the corpus skill's seed policy and the smoke run's `REAL` and `PERSISTENT-ONLY`
+crashes) are triaged too, even when no campaign saved a crash: against every variant, then
 under each recorded non-default mode. A non-`completed` campaign's crashes are real; the absence of more
 is not evidence.
 
@@ -111,20 +154,19 @@ variant from the path, pairs it with `out/<variant>/harness-fork` (falling back 
 digit-stripped name, then to probing, because a second run of one build is routinely called
 `asan2` and has no `out/asan2/`), and runs, in this order:
 
-| step | script | does | cost on a stylesheet-compiler binding, 111 crashes |
+| step | script | does | cost |
 |---|---|---|---|
-| screen | `screen.sh` | what reproduces, on which build, at which allocation ceiling | 14 s |
-| bucket | `bucket.sh` | group the **raw** reproducers by root cause; one representative each | 27 s → 4 bugs |
-| confirm | `confirm.sh` | each representative, on its **original** bytes, through the npm package | ~0.1 s per cell |
-| minimize | `minimize.sh` | **only the representatives**, with afl-tmin | 7 s for 6 |
-| re-confirm | `confirm.sh` | the minimized reproducers, which are what a reader will run | ~0.1 s per cell |
+| screen | `screen.sh` | what reproduces, on which build, at which allocation ceiling | cheap |
+| bucket | `bucket.sh` | group the **raw** reproducers by root cause; one representative each | cheap |
+| confirm | `confirm.sh` | each representative, on its **original** bytes, through the npm package | cheap per cell |
+| minimize | `minimize.sh` | **only the representatives**, with afl-tmin | the expensive step |
+| re-confirm | `confirm.sh` | the minimized reproducers, which are what a reader will run | cheap per cell |
 
 The order is the point. Bucketing needs only a sanitizer report, so it runs on the raw
 crashes and does the collapsing; minimization, the expensive step, then runs once per bug
-instead of once per crash. On an image-decoding binding the whole pipeline including both confirmations takes
-61 s; the earlier "cmin, then minimize every survivor" design ran past 20 minutes. Confirming
-the original bytes before minimizing is also the safer test: the image-decoding binding's GIF
-bug reads CLEAN on the npm install once minimized and crashes it only as the original. Confirm verdicts
+instead of once per crash (the earlier "cmin, then minimize every survivor" design was far
+slower). Confirming the original bytes before minimizing is also the safer test: a minimized
+input can read CLEAN on the npm install where the original crashes it. Confirm verdicts
 **rank** buckets — a representative that is CLEAN on every column and entry point keeps its
 original bytes instead of being minimized (`MINIMIZE_ALL=1` to minimize it anyway) — but
 never remove one: a node CLEAN only means "not reachable through the arms written so far".
@@ -141,26 +183,19 @@ distinguishable from slow work and you can name the step it stalled in.
 
 **In discovery mode, each campaign starts on the harness of the build that produced it, and
 whatever does not reproduce there is offered to the other builds, then to each harness mode.** The risk of the
-wrong build runs one way, measured over 161 real crashes:
-
-| campaign | both builds | ASAN only | plain only | neither |
-|---|---|---|---|---|
-| stylesheet-compiler binding, plain (13) | 13 | 0 | 0 | 0 |
-| stylesheet-compiler binding, ASAN (111) | 0 | **111** | 0 | 0 |
-| image-decoding binding, plain (37) | 25 | **2** | 0 | 10 |
-
-An ASAN campaign minimized against the plain build loses everything — 1-2 byte over-reads
-are invisible without the sanitizer. Not one input crashed the plain build alone. And the image-
-decoding binding's two crashes that only ASAN reproduces came from the *plain* campaign, which is why
-stopping at the producing build was not enough. The 10 that reproduce nowhere are fork-mode
-non-reproducers (persistent-mode artifacts), not crashes of the other variant.
+wrong build runs one way: ASAN crashes do not reproduce on the plain build (1-2 byte
+over-reads are invisible without the sanitizer), so an ASAN campaign screened against it
+loses everything; plain crashes do reproduce on ASAN. A *plain* campaign can still hold
+crashes only ASAN reproduces, which is why stopping at the producing build is not enough.
+Inputs that reproduce nowhere are fork-mode non-reproducers (persistent-mode artifacts), not
+crashes of the other variant.
 
 **Harness modes.** Manifest mode takes them from `mode_env`. Otherwise, if the harness reads a
-mode variable (`MODE=`, `HARNESS_MODE=`), list the non-default settings in `MODES="MODE=2 MODE=3"`. A crash found in one mode does not
-reproduce in another: two crashers from the image-decoding binding's next major
-version are `rc=0` by default and `rc=134` under `MODE=2` — they are a heap over-read in the
-EXIF-orientation rotation and a 67 MB `memcpy` over-read, and a mode-blind screen filed both as non-reproducing. The driver
-cannot discover modes; you name them, the same way you name the npm entry points.
+mode variable (`MODE=`, `HARNESS_MODE=`), list the non-default settings in `MODES="MODE=2 MODE=3"`
+(`fuzz.env` carries them). A crash found in one mode does not reproduce in another: it is
+`rc=0` by default and crashes under its own mode, so a mode-blind screen files it as
+non-reproducing. The driver cannot discover modes; you name them, the same way you name the
+npm entry points.
 
 ### Reading the output
 
@@ -187,17 +222,17 @@ every bug of this class by construction. That was the old default, and it hid a 
 So `screen.sh` walks a `CAP_LADDER` (default `1024 256 64`) **per input**: each rung
 re-screens only what has not reproduced yet, and every input carries the ceiling it
 reproduced at through bucketing, confirmation and minimization (`cap.tsv`). An
-earlier version stopped at the first rung that reproduced *anything*, and a 600 MB
-declared-size input sharing a pool with heap over-reads was silently dropped. It reports the
+earlier version stopped at the first rung that reproduced *anything*, and a declared-size
+input sharing a pool with heap over-reads was silently dropped. It reports the
 **amplification** — the bytes the library demanded divided by the bytes of input:
 
 ```
-0008-...-id_000008_sig_09_src: 5 B in -> 3758096257 B demanded  (751619251x amplification)
+<input>: <N> B in -> <M> B demanded  (<M/N>x amplification)
 => RESOURCE EXHAUSTION / DoS
 ```
 
-Report that ratio and the ceiling, not just `out-of-memory`. A five-byte input that makes
-the library ask for 3.7 GB is a denial of service whatever absolute ceiling happens to catch
+Report that ratio and the ceiling, not just `out-of-memory`. A few-byte input that makes
+the library ask for gigabytes is a denial of service whatever absolute ceiling happens to catch
 it, and it is worse on the bare harness than through node: no GC, no heap limit, nothing
 between the declared size and the allocator.
 
@@ -218,9 +253,9 @@ drifted to a different bug. Hangs use `afl-tmin -H` with a short `-t` (`HANG_S`,
 2 s) and a re-check at the full timeout. A result that does not verify is discarded and the
 original bytes kept — there is no homemade fallback.
 
-**Do not hand-minimize further.** A stylesheet-compiler binding's stack-exhaustion reproducer resisted manual
-reduction because the obvious mechanism (deep nesting) is guarded and the real one is
-unbounded recursion during evaluation, past the guard.
+**Do not hand-minimize further.** A reproducer that resists manual reduction usually does so
+because the obvious mechanism (deep nesting) is guarded and the real one (unbounded recursion
+during evaluation) lies past the guard.
 
 ### Buckets
 
@@ -228,17 +263,23 @@ Keyed on the sanitizer **SUMMARY** line — kind + `file:line` + function + acce
 `WRITE-8`). Never on stack frames: template-heavy C++ frame text starts with the return
 type, so half the crashes file under `char`.
 
-**Report the second grouping, merged on function.** The SUMMARY key over-separates:
-a stylesheet-compiler binding's 25-crash over-read in an unchecked UTF-8 decoder is
-reported at three lines of one header (`:76`, `:82` and `:84`). Exact → 6
-buckets; merged → **4**, the published answer. When judging whether two reports are one bug,
+**Report the second grouping, merged on function.** The SUMMARY key over-separates: one
+over-read in an inlined decoder is reported at several lines of one header. The merged
+grouping is the one to report. `bucket.sh` also prints a third, **merged on caller**, for a
+root cause visible only in frame #1: one missing bounds check in a shared caller that
+overflows in a dozen per-format callees files a dozen functions, and that grouping
+collapses them into one bug. When judging whether two reports are one bug,
 compare the **allocation and the access**, not the frame text — inlining differs between the
 instrumented and pristine builds.
+
+**A bucket keyed on a `harness.cc` line is copied package code** (the harness copied a
+method body, so the bug is the package's). The report line is the
+package file and line named in the copy's source comment, not the `harness.cc` line.
 
 | bucket | meaning | action |
 |---|---|---|
 | `NO-REPORT signal-only sigN` | crashed, no sanitizer frame | usually **stack exhaustion** — a real DoS needing no sanitizer. Not noise. |
-| `hang in <function>` | the bare harness never returned | **DoS in the native code itself.** Keyed by interrupting the sanitized harness with SIGABRT at several points and taking the innermost frame common to every stack that never recurs. Approximate: a loop inside an interpreter's recursive walk (a stylesheet compiler's evaluate/expand passes) can land in a coarser bucket on another run |
+| `hang in <function>` | the bare harness never returned | **DoS in the native code itself.** Keyed by interrupting the sanitized harness with SIGABRT at several points and taking the innermost frame common to every stack that never recurs. Approximate: a loop inside an interpreter's recursive walk (its evaluate/expand passes) can land in a coarser bucket on another run |
 | `out-of-memory` | declared-size allocation | resource exhaustion; read the **install** column |
 | `NO-CRASH (rc=N)` | did not reproduce here | wrong build or mode, or a persistent-mode artifact |
 
@@ -272,13 +313,13 @@ Verdict ladder, most severe first:
    Deliberately not CAUGHT: absorbing our own ceiling into "a careful consumer is safe"
    would be a false acquittal.
 
-Four cells that are not verdicts — fix them, do not report them:
+Cells that are not verdicts; fix them, do not report them:
 
 * **`ADDON-NOT-SWAPPED`** — the ASAN addon never loaded, so that column duplicates the
   install column and hides every memory bug. `confirm.mjs` hooks `process.dlopen`, the one
   funnel every addon load passes through, so the swap survives packages that resolve their
-  binary by their own env var (a stylesheet-compiler binding honours the package's own
-  environment variable for its binary path; a hook on `'bindings'` never fires). `loaded=` says which `.node` actually loaded.
+  binary by their own environment variable (a hook on `'bindings'` never fires). `loaded=`
+  says which `.node` actually loaded.
 * **`ADDON-AMBIGUOUS`** — several addons, one `ADDON` swapped into all of them. Set
   `ADDON_MATCH=` or `ADDON_MAP='regex=path;regex=path'`.
 * **`ERROR`** — bare `ERROR`: `confirm.mjs` rejected the `ENTRY` name. `ERROR(rc=N)`: node
@@ -287,25 +328,34 @@ Four cells that are not verdicts — fix them, do not report them:
 * **`NO-VERDICT`** — node exited 0 without a verdict: the `ENTRIES` arm returned `undefined`
   and nothing kept the event loop alive (a callback that never fires, an arm that forgot
   `okback`/`errback`). The arm is mis-wired; it is not CLEAN.
+* **`version-mismatch`**: the package under `PKG` is not `fuzz.env`'s `PKG_VERSION`, so
+  the confirm ran a different release from the one the harness was built from. Reinstall
+  the pinned version in `oracle/`.
 * **A column of all-CLEAN** — the signature of a mis-wired consumer call, not a clean
   package. `GOOD=` runs a working seed first; no `evidence=` on it means the column measures
-  nothing. An image-decoding binding's first JS harness "confirmed" success for 18 files
-  that had all failed, because the image object's `complete` getter it checked is hardcoded `return true`.
+  nothing. A JS harness once "confirmed" success for inputs that had all failed, because
+  the property it checked was a getter hardcoded to `return true`.
 
 A CLEAN cell on the minimized input is re-tested against the pre-tmin bytes automatically
 and reported as `CLEAN->NATIVE-CRASH(...)(orig)` if those crash — minimizing happened
-against the harness's redzones, which the release install lacks. On an image-decoding binding this recovered a
-critical finding a naive pipeline drops; reproduce it with the original bytes.
+against the harness's redzones, which the release install lacks. This recovers critical
+findings a naive pipeline drops; reproduce them with the original bytes.
 
 Long form of every verdict, the cases where a CLEAN ASAN column proves nothing, stack-depth
 sensitivity, resource exhaustion, and the artifact patterns to recognise:
-`references/verdict-semantics.md`.
+`references/verdict-semantics.md`. The runs and figures behind this skill's rules are in
+`references/measured-cases.md`: other targets' results, not what to expect on yours.
 
 ---
 
 ## Step 4 — Judge and write the report
 
 `triage/REPORT.md` has one row per bucket with the facts and a "still to do by hand" list.
+The bucket table shows the minimized input's own sanitizer key beside the original's, and
+**`DRIFT`** when they differ: afl-tmin reduced the input onto another bug. `minimize.sh`
+keys drift on the first non-interceptor frame (a key of `__asan_memcpy` would hide it) and
+retries exact, but when `DRIFT` survives, report that bucket's **original** bytes as its
+reproducer; the minimized file belongs to the other bucket.
 Fill in, per bug (the **merged** bucket):
 
 * the SUMMARY — kind, `file:line`, function, `READ`/`WRITE` and size;
@@ -354,7 +404,13 @@ read the code for.
 
 **If nothing is confirmed** — including no crash files at all — cite the harness skill's
 detection self-test and the campaign's execs and stability. Without it, "nothing found" is
-indistinguishable from "the harness detects nothing", and is not a result.
+indistinguishable from "the harness detects nothing", and is not a result. The no-findings
+`REPORT.md` has a Scope section whose "Instrumented:" line you fill in: which library code
+carried coverage and sanitizers in the harness. For a library the package loads as a
+system `.so` (the harness linking an instrumented static archive of it), write that the
+sanitized confirm column ran the sanitized addon against the uninstrumented system library,
+so it cannot see an overflow inside the library; only the direct harness could
+(`references/verdict-semantics.md`, "The ASAN column is authoritative only...").
 
 Hard crashes and memory-safety bugs in a widely installed package are sensitive. Report to
 the maintainer through the package's security policy before anywhere public, with the

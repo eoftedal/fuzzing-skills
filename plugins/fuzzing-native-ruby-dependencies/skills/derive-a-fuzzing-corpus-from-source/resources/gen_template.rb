@@ -25,8 +25,10 @@ require 'fileutils'
 
 ARGS     = ARGV.map { |a| a.split('=', 2) }.select { |kv| kv.size == 2 }.to_h
 OUT      = ARGS.fetch('OUT', './corpus-derived')
-MANIFEST = ARGS.fetch('MANIFEST', "#{OUT}.manifest.tsv")
 ONLY     = ARGS['ONLY']                            # emit one family, for iterating
+# with ONLY the default manifest is <OUT>.manifest.<fam>.tsv, so iterating on one family
+# does not overwrite the full manifest with that family's rows
+MANIFEST = ARGS.fetch('MANIFEST', ONLY ? "#{OUT}.manifest.#{ONLY}.tsv" : "#{OUT}.manifest.tsv")
 FileUtils.mkdir_p(OUT)
 
 # ---- clamps: every value you WRITE goes through one of these -------------------
@@ -108,4 +110,5 @@ fam 'count'
 
 # ---- 3. manifest, outside the corpus directory ---------------------------------
 File.write(MANIFEST, (["family\tfile\tsize\twhy"] + $manifest.map { |r| r.join("\t") }).join("\n") + "\n")
-puts "#{$n} seeds -> #{OUT}  (#{$manifest.size - $n} duplicates dropped; manifest: #{MANIFEST})"
+puts "#{$n} seeds -> #{OUT}  (#{$manifest.size - $n} duplicates dropped; manifest: #{MANIFEST}" +
+     (ONLY ? ", family #{ONLY} only; the full manifest is left as it was)" : ")")

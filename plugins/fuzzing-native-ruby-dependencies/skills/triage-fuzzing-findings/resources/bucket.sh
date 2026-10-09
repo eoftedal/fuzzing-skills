@@ -11,10 +11,15 @@
 #             [HANG_SAMPLE_S="1.5 1.75 ... 4.25"]   when each (parallel) stack sample is taken
 #             [HANGS=1]   bucket hangs by stack sampling (default: from OUT/config)
 #
-# The SUMMARY key OVER-separates, so the script ALWAYS prints two groupings (there is no
-# flag; you get both) and you report the merged one:
-#   exact   kind @ file:line in function [ACCESS]
+# The SUMMARY key OVER-separates, so the script ALWAYS prints three groupings (there is no
+# flag; you get all three) and you report the merged one:
+#   exact   kind @ file:line in function [ACCESS]   (file is a basename; line `?` when the
+#           symbolizer gave none)
 #   merged  the same with the line number dropped
+#   caller  kind <- the first project frame below the crashing function [READ|WRITE].  One
+#           run: eight buckets, six per-encoding writer functions, one caller passing an
+#           unchecked remaining size to all of them.  A shared caller shows as one line;
+#           judge whether it is the bug (a dispatcher above unrelated bugs collapses too).
 # One real run (a stylesheet-compiler Node binding, 111 ASAN crashes): the exact key gives 6
 # buckets, the merged key gives 4 -- and 4 is the published answer, because one over-read
 # in an unchecked UTF-8 decoder is reported at three lines of one header (:76, :82, :84).  Merge buckets that
@@ -109,6 +114,58 @@ collapse() {
   printf '%s' "$p" | sed 's/\x01/<>/g'
 }
 
+# ---- bug key: twin of minimize.sh's copy; keep the two identical (from ICEPTOR to sum_key) ----
+# An INTERCEPTED libc call (memcpy, strlen, ...) is reported by the sanitizer at the
+# interceptor, so the SUMMARY names `__asan_memcpy`, not the code that called it -- and the
+# access size is just the caller's length argument, which changes with the input.  Measured
+# on the image-decoding Node binding's next major version: one over-read in the PNG stream
+# reader filed as four
+# buckets (READ-8, -1024, -8192, -10660) under an unsymbolized `__asan_memcpy`.  Key on the
+# first frame in project source instead, and drop the size.
+ICEPTOR='__asan_(memcpy|memmove|memset)|__interceptor_|__sanitizer_|(^|[^A-Za-z_:])(memcpy|memmove|memset|memchr|memcmp|strlen|strcpy|strncpy|strcat|strcmp|strncmp|strchr|strstr)$'
+# The faulting stack's project frames, innermost first: "function<TAB>file basename<TAB>line"
+# (line `?` when absent).  Only the first stack (the access, not the allocation); no
+# interceptor, no libc/libstdc++ (/usr/... or a relative csu/ path), no sanitizer runtime.
+frames_of() {  # <sanitizer output>
+  awk '/^ *#0 /{n++} n==1' <<<"$1" \
+    | sed -nE 's#^ *\#[0-9]+ 0x[0-9a-f]+ in (.*) (/[^ :]*)(:([0-9]+))?(:[0-9]+)?$#\1\t\2\t\4#p' \
+    | awk -F'\t' -v ic="$ICEPTOR" '$1 ~ ic || $2 ~ /^\/usr\/|compiler-rt|sanitizer_common/ {next}
+        {f=$2; sub(/.*\//,"",f); print $1 "\t" f "\t" ($3=="" ? "?" : $3)}'
+}
+# "kind @ file:line in function", file a basename and line `?` when the SUMMARY has none;
+# an interceptor's report keyed on its first project frame, "[via <interceptor>]" appended.
+# Empty when there is no SUMMARY line.  No access size: the caller adds it.
+sum_key() {  # <sanitizer output>
+  local out=$1 key ifn site sfn sfile sline
+  key=$(sed -nE 's#.*SUMMARY: [A-Za-z]*Sanitizer: ([A-Za-z-]+) ([^ (][^ ]*/)?([A-Za-z0-9_.+-]+)(:([0-9]+))?(:[0-9]+)? in (.*)#\1 @ \3:\5 in \7#p' <<<"$out" \
+        | sed -E 's/^([A-Za-z-]+ @ [^ ]*): in /\1:? in /' | head -1)
+  [ -z "$key" ] && key=$(sed -n 's/.*SUMMARY: [A-Za-z]*Sanitizer: \(.*\)/\1/p' <<<"$out" | head -1)
+  [ -n "$key" ] || return 0
+  ifn=$(sed -n 's/.* in \(.*\)$/\1/p' <<<"$key" | head -1)
+  if [ -n "$ifn" ] && grep -qE "$ICEPTOR" <<<"$ifn"; then
+    site=$(frames_of "$out" | head -1)
+    if [ -n "$site" ]; then
+      IFS=$'\t' read -r sfn sfile sline <<<"$site"
+      key="${key%% *} @ $sfile:$sline in $sfn [via $ifn]"
+    fi
+  fi
+  key=$(collapse "$key")
+  # Strip build-specific noise: a BuildId and the absolute path of the harness say nothing
+  # about the bug and make the report table unreadable.  An unsymbolized frame keeps its
+  # offset and, crucially, its function name.
+  sed -e 's/ *(BuildId: [0-9a-f]*)//g' -e 's#(/[^ )]*/\([^/ )]*\)+0x#(\1+0x#g' <<<"$key"
+}
+# ---- end of the twin ----
+# The caller grouping: the first project frame below the crashing function (the site, or the
+# frame an interceptor was keyed on), skipping recursion into it.  The harness template's
+# driver (run_one, main) is no caller: every function it calls directly would share it.
+caller_of() {  # <sanitizer output> <key> -> "function @ file", or empty
+  local site=${2#* in }; site=${site% \[via *}
+  frames_of "$1" | awk -F'\t' -v s="$site" 'NR==1{s0=$1} $1==s || $1==s0 {next}
+                                           $1 ~ /^(main|run_one|LLVMFuzzerTestOneInput)(\(|$)/ {exit}
+                                           {print $1 " @ " $2; exit}'
+}
+
 # The frames of one sample that belong to the library: symbolized with a source file, not
 # the sanitizer runtime, libc/libstdc++ (/usr/...), or the harness's own main/run loop.
 lib_frames() {
@@ -173,7 +230,7 @@ for c in "$MIN"/*; do
     key=$(hang_key "$c")
     acc=""
     prov=$(basename "$c" | sed -n 's/^[0-9]\{4\}-\([^-]*\)-.*/\1/p')
-    printf '%s\t%s\t%s\t%s\n' "$key" "$(wc -c <"$c")" "$c" "${prov:-?}" >> "$K"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$key" "$(wc -c <"$c")" "$c" "${prov:-?}" "$key" >> "$K"
     seen=$((seen+1)); prog "$seen" "$nmin" "bucketed (last key: $(cut -c1-60 <<<"$key"))"
     continue
   fi
@@ -186,42 +243,23 @@ for c in "$MIN"/*; do
     rc=$?
   fi
   acc=$(sed -n 's/.*\(READ\|WRITE\) of size \([0-9]*\).*/\1-\2/p' <<<"$out" | head -1)
-  # the column number is optional: some symbolizers print file:line, others file:line:col
-  key=$(sed -n 's#.*SUMMARY: [A-Za-z]*Sanitizer: \([a-z-]*\) [^ ]*/\([A-Za-z0-9_.+-]*\):\([0-9]*\)\(:[0-9]*\)\{0,1\} in \(.*\)#\1 @ \2:\3 in \5#p' <<<"$out" | head -1)
-  [ -z "$key" ] && key=$(sed -n 's/.*SUMMARY: [A-Za-z]*Sanitizer: \(.*\)/\1/p' <<<"$out" | head -1)
+  key=$(sum_key "$out")
   if [ -z "$key" ]; then
     if   [ "$rc" = 124 ];   then key="NO-REPORT hang (no answer in ${CELL_TIMEOUT}s)"
     elif [ "$rc" -ge 128 ]; then key="NO-REPORT signal-only sig$((rc-128))"
     elif [ "$rc" = 0 ];     then key="NO-CRASH (rc=0, did not reproduce)"
     else                         key="NO-CRASH (rc=$rc, no sanitizer report)"; fi
+    ckey=$key
+  else
+    case $key in *" [via "*) acc=${acc%%-*};; esac      # an interceptor's size is the caller's argument
+    cfn=$(caller_of "$out" "$key")
+    if [ -n "$cfn" ]; then ckey="${key%% *} <- $(collapse "$cfn")${acc:+ [${acc%%-*}]}"
+    else ckey="$(sed 's/\(@ [A-Za-z0-9_.+-]*\):[0-9?]*/\1:*/' <<<"$key")${acc:+ [${acc%%-*}]} (no caller frame)"; fi
   fi
-  # An INTERCEPTED libc call (memcpy, strlen, ...) is reported by the sanitizer at the
-  # interceptor, so the SUMMARY names `__asan_memcpy`, not the code that called it -- and the
-  # access size is just the caller's length argument, which changes with the input.  Measured
-  # on the image-decoding Node binding's next major version: one over-read in the PNG stream
-  # reader filed as four
-  # buckets (READ-8, -1024, -8192, -10660) under an unsymbolized `__asan_memcpy`.  Key on the
-  # first frame in project source instead, and drop the size.
-  iceptor='__asan_(memcpy|memmove|memset)|__interceptor_|__sanitizer_|(^|[^A-Za-z_:])(memcpy|memmove|memset|memchr|memcmp|strlen|strcpy|strncpy|strcat|strcmp|strncmp|strchr|strstr)$'
-  ifn=$(sed -n 's/.* in \(.*\)$/\1/p' <<<"$key" | head -1)
-  if [ -n "$ifn" ] && grep -qE "$iceptor" <<<"$ifn"; then
-    site=$(sed -n 's#^ *\#[0-9]* 0x[0-9a-f]* in \(.*\) \(/[^ :]*\):\([0-9]*\)\(:[0-9]*\)\{0,1\}$#\1\t\2\t\3#p' <<<"$out" \
-           | grep -vE "$iceptor" | grep -vE $'\t/usr/|compiler-rt' | head -1)
-    if [ -n "$site" ]; then
-      IFS=$'\t' read -r sfn spath sline <<<"$site"
-      key="${key%% *} @ $(basename "$spath"):$sline in $sfn [via $ifn]"
-      acc=${acc%%-*}
-    fi
-  fi
-  key=$(collapse "$key")
-  # Strip build-specific noise: a BuildId and the absolute path of the harness say nothing
-  # about the bug and make the report table unreadable.  An unsymbolized frame keeps its
-  # offset and, crucially, its function name.
-  key=$(sed -e 's/ *(BuildId: [0-9a-f]*)//g' -e 's#(/[^ )]*/\([^/ )]*\)+0x#(\1+0x#g' <<<"$key")
   [ -n "$acc" ] && key="$key [$acc]"
   # provenance (the build variant) is the middle field of the pool name screen.sh made
   prov=$(basename "$c" | sed -n 's/^[0-9a-f]\{6\}-//; s/^[0-9]\{4\}-\([^-]*\)-.*/\1/p')
-  printf '%s\t%s\t%s\t%s\n' "$key" "$(wc -c <"$c")" "$c" "${prov:-?}" >> "$K"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$key" "$(wc -c <"$c")" "$c" "${prov:-?}" "$ckey" >> "$K"
   seen=$((seen+1)); prog "$seen" "$nmin" "bucketed (last key: $(cut -c1-60 <<<"$key"))"
 done
 [ -s "$K" ] || { echo "no crashes in $MIN" >&2; exit 1; }
@@ -229,16 +267,22 @@ done
 awk -F'\t' '{n=$3; sub(/.*\//,"",n); print n "\t" $1}' "$K" | sort > "$OUT/keys.tsv"
 
 echo "== buckets (exact key; one representative each, the smallest) =="
-sort -t$'\t' -k1,1 -k2,2n "$K" | awk -F'\t' '!seen[$1]++' | while IFS=$'\t' read -r key sz c prov; do
+sort -t$'\t' -k1,1 -k2,2n "$K" | awk -F'\t' '!seen[$1]++' | while IFS=$'\t' read -r key sz c prov ckey; do
   n=$(printf '%s' "$key" | md5sum | cut -c1-6)
   cp "$c" "$OUT/buckets/$n-$(basename "$c")"
   printf '  %s  %5s B  %-8s %s\n' "$n" "$sz" "$prov" "$key"
 done
 echo "== distribution, exact key ($(cut -f1 "$K" | sort -u | wc -l) buckets) =="
 cut -f1 "$K" | sort | uniq -c | sort -rn | sed 's/^/  /'
-echo "== distribution, MERGED on function ($(sed 's/\(@ [A-Za-z0-9_.+-]*\):[0-9]*/\1:*/' <(cut -f1 "$K") | sort -u | wc -l) group(s)) =="
+echo "== distribution, MERGED on function ($(sed 's/\(@ [A-Za-z0-9_.+-]*\):[0-9?]*/\1:*/' <(cut -f1 "$K") | sort -u | wc -l) group(s)) =="
 echo "   report these: one row per group. The per-line split above over-separates."
-cut -f1 "$K" | sed 's/\(@ [A-Za-z0-9_.+-]*\):[0-9]*/\1:*/' | sort | uniq -c | sort -rn | sed 's/^/  /'
+echo "   When the caller grouping below collapses several functions into one, judge whether that is the bug."
+cut -f1 "$K" | sed 's/\(@ [A-Za-z0-9_.+-]*\):[0-9?]*/\1:*/' | sort | uniq -c | sort -rn | sed 's/^/  /'
+echo "== distribution, MERGED on caller ($(cut -f5 "$K" | sort -u | wc -l) group(s)) =="
+echo "   kind <- the first project frame below the crashing function; the functions it covers in ()"
+awk -F'\t' '{fn=$1; sub(/ \[[A-Z]+(-[0-9]+)?\]$/,"",fn); sub(/ \[via [^]]*\]$/,"",fn); sub(/^.* in /,"",fn)
+             n[$5]++; if (!((($5) SUBSEP fn) in s)) {s[$5,fn]=1; f[$5]=f[$5] (f[$5]=="" ? "" : ", ") fn; nf[$5]++}}
+     END{for (k in n) printf "%7d %s  (%d function%s: %s)\n", n[k], k, nf[k], (nf[k]==1 ? "" : "s"), f[k]}' "$K" | sort -rn | sed 's/^/  /'
 # An out-of-memory bucket is a declared-size DoS; the ratio is the severity, so surface it
 # here rather than leaving it in screen.sh's log.
 # Keyed on the amplification file, not on the bucket text: ASAN names the same class

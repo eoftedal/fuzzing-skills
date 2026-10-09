@@ -25,8 +25,11 @@ build-a-nan-napi-fuzzing-harness/resources/find_asan_rt.sh build-a-ruby-c-extens
 build-a-nan-napi-fuzzing-harness/resources/afl_shim.h build-a-ruby-c-extension-fuzzing-harness/resources/afl_shim.h
 build-a-nan-napi-fuzzing-harness/resources/covstub.c build-a-ruby-c-extension-fuzzing-harness/resources/covstub.c
 build-a-nan-napi-fuzzing-harness/resources/undef_fuzzmode.h build-a-ruby-c-extension-fuzzing-harness/resources/undef_fuzzmode.h
+build-a-nan-napi-fuzzing-harness/resources/preflight.sh build-a-ruby-c-extension-fuzzing-harness/resources/preflight.sh
+build-a-nan-napi-fuzzing-harness/resources/init_workspace.sh build-a-ruby-c-extension-fuzzing-harness/resources/init_workspace.sh
+build-a-nan-napi-fuzzing-harness/resources/mkgate.sh build-a-ruby-c-extension-fuzzing-harness/resources/mkgate.sh
 "
-for f in compare.sh cost.sh cover.sh enumerate_constants.sh errenum_template.c error_inventory.sh measure.sh minimise.sh sweep.sh validate.sh; do
+for f in compare.sh cost.sh cover.sh dict.sh enumerate_constants.sh errenum_template.c error_inventory.sh measure.sh minimise.sh nondet.sh sweep.sh validate.sh; do
   PAIRS="$PAIRS
 derive-a-fuzzing-corpus-from-source/resources/$f derive-a-fuzzing-corpus-from-source/resources/$f"
 done

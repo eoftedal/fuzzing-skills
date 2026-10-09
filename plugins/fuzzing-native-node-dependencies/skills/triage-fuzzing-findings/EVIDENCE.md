@@ -115,3 +115,22 @@ reported to the maintainer through the package's security policy with the minimi
 and the sanitizer trace, not posted publicly ahead of a fix. The two image-decoding binding findings
 above are in a currently published version and have not been reported anywhere; they are evidence
 for this skill, and filing them is a separate, deliberate act.
+
+## Chain review (2026-10-08)
+
+| change | tag | what was checked |
+|---|---|---|
+| `confirm.mjs` calls each ENTRIES arm with the buffer and defines `asFile(b, ext)`, matching `real_harness.mjs`; `version-mismatch` (exit 41) when `PKG_VERSION` differs from the installed package | [measured, synthetic] | pasting the harness skill's arms "unchanged" used to run them on `undefined`: every cell CAUGHT. Stub package: CLEAN with the right byte count, NATIVE-CRASH through the file arm, `ERROR(version-mismatch=1.0.0!=9.9.9)` through `confirm.sh` |
+| `triage_all.sh` and `confirm.sh` default `PKG`, the addon, `MODES`, `ALLOC_CAP_MB` and `ASAN_RT` (via `$R/find_asan_rt.sh`) from `fuzz.env`; manifest values rank above the file | [measured, synthetic] | `bash -x` run: `ASAN_RT` resolved to the container's runtime, `MODES` lost its `:min_arms` suffix |
+| SKILL.md: run figures and target anecdotes moved to `references/measured-cases.md` | [tool] | anchoring, as above |
+
+## Node evaluation round (2026-10-08)
+
+| what the runs hit | fix | tag |
+|---|---|---|
+| `minimize.sh`'s drift check keyed on frame #0, the ASAN memcpy interceptor, so a reproducer that afl-tmin minimized into a different bug (another function, same interceptor) passed as "no drift" and was reported, and confirmed, under the wrong bucket | the key skips interceptor frames exactly as `bucket.sh` does (shared functions, twin-named); a drift retries with `AFL_TMIN_EXACT=1` and keeps the original bytes if it still drifts; `OUT/min/<name>.key` records the minimized key; the report shows it and marks `DRIFT`; `LABEL_FORK` names the sanitized harness so plain-campaign buckets get a key at all | [measured] on the drifted bucket: free minimization drifted, EXACT gave a same-key result |
+| eight bucket rows shared one root cause visible only in frame #1 (a caller passing an unchecked remaining size to many per-encoding writers); the function-level merge could not collapse them | a third grouping "merged on caller", stopping at the template's driver so unrelated bugs do not collapse under `run_one` | [measured]: 5 exact rows became 1 caller group on that run's pool, and the two unrelated bugs of the other target stayed apart |
+| some SUMMARY lines carry no line number; the key then showed an absolute workspace path | basename always, `:?` when the line is missing | [measured] |
+| the pristine column read `(no PRISTINE)` in three runs: nothing told the agent to build it before triage | SKILL.md: build `out/pristine` first whenever a crash was saved; `triage_all.sh` prints a NOTE and a to-do item when it is missing | [tool] |
+| bucket keys name harness.cc lines for copied code; the mapping to package lines was done by hand in every run on that shape | a "copied code" note per bucket, pointing at the copy's source comment | [tool] |
+| pasting ENTRIES unchanged worked in all four runs (two by hand, one by a scripted splice); the only snag was a callback arm's `collected` array, which `confirm.mjs` does not define | SKILL.md: paste `const collected = []` with the helpers | [measured] |

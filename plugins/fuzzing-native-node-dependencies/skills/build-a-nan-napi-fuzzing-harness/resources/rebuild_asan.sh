@@ -4,7 +4,7 @@
 # asan harness.  Pass the SAME KEY=VALUE arguments you gave build_addon.sh and
 # link_harness.sh; both ignore the ones they do not use.
 #
-#   REBUILD="resources/rebuild_asan.sh PKG=/path/to/pkg OUT=/abs/fuzz/out \
+#   REBUILD="resources/rebuild_asan.sh PKGDIR=/path/to/pkg OUT=/abs/fuzz/out \
 #            MK=/abs/fuzz/out/asan/<target>.target.mk SRCDIR=/path/to/pkg \
 #            HARNESS=/abs/fuzz/harness.cc LIB='...' [ADDON_OBJS='...'] [EXTRA_LIBS='...']"
 #
@@ -15,10 +15,24 @@
 # tree plus a relink of the harness -- see detect_selftest.sh's header.
 set -uo pipefail
 for kv in "$@"; do case $kv in *=*) export "$kv";; esac; done
-PKG=${PKG:?set PKG=<package dir>}
+# PKGDIR, not PKG: fuzz.env exports PKG as the ORACLE path, and a rebuild.sh that forgot the
+# argument would otherwise cd into the oracle and rebuild there.  PKG= is still accepted as
+# the package dir only when it holds a binding.gyp AND its path has no /oracle/ or
+# /node_modules/: an oracle built from source on install holds a binding.gyp too.
+PKGDIR=${PKGDIR:-}
+if [ -z "$PKGDIR" ] && [ -n "${PKG:-}" ]; then
+  case /${PKG#/}/ in
+    */oracle/*|*/node_modules/*)
+      echo "FAIL: PKG=$PKG looks like the oracle install (/oracle/ or /node_modules/ in the path): rebuilding" >&2
+      echo "      there would patch the oracle, not the build tree.  Pass PKGDIR=<package source dir>." >&2
+      exit 2;;
+  esac
+  [ -f "$PKG/binding.gyp" ] && PKGDIR=$PKG
+fi
+[ -n "$PKGDIR" ] || { echo "FAIL: set PKGDIR=<package dir, where binding.gyp is> (PKG=${PKG:-unset} is fuzz.env's oracle path, not the source)" >&2; exit 2; }
 HERE=$(cd "$(dirname "$0")" && pwd)
 export AFL_USE_ASAN=1
 # output is NOT discarded: detect_selftest.sh captures it as the build log it shows you
 # when the faulted rebuild fails
-( cd "$PKG" && "$HERE/build_addon.sh" VARIANT=asan "$@" ) || exit 1
+( cd "$PKGDIR" && "$HERE/build_addon.sh" VARIANT=asan "$@" ) || exit 1
 "$HERE/link_harness.sh" VARIANT=asan "$@"

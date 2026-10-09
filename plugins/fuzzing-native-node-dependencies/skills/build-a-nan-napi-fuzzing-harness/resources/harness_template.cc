@@ -1,7 +1,11 @@
 // Skeleton for a direct AFL++ harness against a NAN/N-API dependency.
 // Replace the marked sections; the structure around them is what you want.
+// Each section you MUST edit (1 the headers, 4 the MODE switch and library init,
+// 6 the boundary call, 7 forcing the work) carries an #error line, so this file does
+// not compile until all four are filled in: delete each line with its section.  The
+// rest (the drivers, fnv1a, set_err) may legitimately stay as it is.
 //
-// Build BOTH binaries from this one file with resources/link_harness.sh, which
+// Build BOTH binaries from this one file with $R/link_harness.sh, which
 // compiles it twice (persistent, and -DNO_PERSISTENT for the fork twin) with the
 // flags lifted from the addon's generated makefile.  -D feature macros and -fno-rtti
 // matter: the latter must match the object you link.
@@ -23,6 +27,7 @@
 // #include <library.h>
 // #include "common.h"        // the addon's header; it may pull in napi.h/nan.h --
 //                            // fine, you never call them, the stubs catch it.
+#error "harness_template: fill in section 1 (the library headers) and delete this line"
 
 #include <cstdint>
 #include <cstdio>
@@ -106,7 +111,11 @@ static void set_err(Result* r, const char* name) {   // "Data corruption detecte
 // multi-call state the real process accumulates (a bug class of its own: a failed call
 // that leaves the shared context mid-frame poisons every later call), at the cost of
 // persistent-mode stability.  Say which you chose; the fork driver sidesteps it.
+// Library-wide caches that grow across iterations (name or symbol caches, hash tables)
+// are a common source of stability in the low 90s; they are not a harness bug, the
+// campaign's fork fallback handles them.
 static void harness_init(void) {
+#error "harness_template: fill in section 4 (the MODE switch and library init in harness_init) and delete this line"
   const char* m = getenv("MODE");
   if (m && !strcmp(m, "file")) g_mode = 1;
   if (getenv("ALLOC_CEIL")) g_alloc_ceil = strtoull(getenv("ALLOC_CEIL"), 0, 0);
@@ -154,6 +163,7 @@ static void run_one(const unsigned char* data, size_t len, Result* r) {
   //   if (over_ceiling(declared_size)) { r->status = 1; set_err(r, "alloc-ceiling"); goto done; }  // opt-in only
   //   status = addon_ns::OpenInput(&descriptor);
   //   if (status != OK) { r->status = 1; set_err(r, library_error_name(status)); goto done; }
+#error "harness_template: fill in section 6 (the boundary call) and delete this line"
 
   // --- 7. make the library actually do the work ---
   // An open is not a decode and a parse is not an evaluation.  Lazy/demand-driven
@@ -165,10 +175,16 @@ static void run_one(const unsigned char* data, size_t len, Result* r) {
   // append every event and every argument the real handlers read to a buffer
   // (tag, name bytes length-prefixed, attribute pairs in order, text bytes, a
   // position trailer) and hash that; real_harness.mjs serialises identically.
+  // On an error mid-stream, hash the events delivered so far, exactly as the real
+  // side does (real_harness.mjs keeps them in `collected`), so rejected seeds compare too:
+  // status=1, err=<token>, out_len/out_hash over the partial stream; out_len=0 and
+  // out_hash=0 only on this ERROR path when nothing was collected.  On SUCCESS always
+  // hash the output, even when empty (fnv1a of nothing), as both real templates do.
   // For a streaming API fed in chunks, concatenate every output chunk and hash it.
   //
   //   out = force_result(handle, &n);
   //   r->out_len = n; r->out_hash = fnv1a(out, n);
+#error "harness_template: fill in section 7 (force the work, hash the artifact) and delete this line"
 
   // --- 8. teardown: copy the library's own cleanup, minus the binding calls ---
   // Check each setter's ownership convention, not just the field: some copy the

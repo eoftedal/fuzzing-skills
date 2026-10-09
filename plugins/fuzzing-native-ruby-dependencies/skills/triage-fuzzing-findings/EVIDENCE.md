@@ -75,3 +75,26 @@ One evaluation run (Sonnet), the 5-minute campaign in the campaign skill's EVIDE
 Hangs and memory-amplification entries from a real campaign (target C had none), a gem
 that loads several extensions (`EXT_MAP`), non-default harness modes (`MODES`), and
 non-reproducers are **[carried]**.
+
+## Chain review mirrored from the Node plugin (2026-10-08)
+
+| change | tag | evidence |
+|---|---|---|
+| `triage_all.sh`/`confirm.sh` default `PKG`, `EXT`, `MODES`, `ALLOC_CAP_MB` and `ASAN_RT` from `fuzz.env`; `confirm.rb` arms take the input, `as_file(b, ext)`, version-mismatch cell, flushed `die` | [measured, synthetic] | stub gem under Ruby 3.3 in the container (see the harness skill's EVIDENCE for the arity bug this fixed) |
+
+## Second evaluation round (2026-10-08)
+
+Four fresh agents (Opus and Sonnet, a gem whose parser is the extension's own C and a gem
+over a system library) ran the chain end to end; the per-run friction and the fixes are
+tabulated in the harness skill's EVIDENCE.md under the same heading, including the rows
+that belong to this skill. Corpus phases took 3 to 6 minutes, campaigns were
+`DURATION=300 JOBS=2` and all completed, triage ran in 1 to 13 minutes.
+
+## Mirrored from the Node plugin's evaluation round (2026-10-08)
+
+The shared scripts changed identically in both plugins (`check_shared.sh`: 0 drift) after
+four Node runs; the rows are in the Node plugin's EVIDENCE.md files under the same heading.
+On this plugin they are **[carried]** except where the Ruby-side templates and text were
+adjusted to match (the empty-output hash rule, the framing-not-a-mode rule, `mkgate.sh`,
+`CRASHES-BOTH` and `known-crasher`, the `DONE:` marker, pristine before triage, the caller
+grouping and `DRIFT`).

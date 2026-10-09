@@ -10,30 +10,32 @@ findings. **Classify crashes; do not develop exploits.**
 
 The pipeline is automated. You do three things by hand, and only three:
 
-1. **Fill in the consumer calls**: the `ENTRIES` arms in `resources/confirm.rb`.
+1. **Fill in the consumer calls**: the `ENTRIES` arms in the workspace's copy of `confirm.rb`.
 2. **Run the driver.**
 3. **Judge severity and write the report** from the skeleton it produces.
 
 ```sh
-# 1  resources/confirm.rb: ENTRIES = the harness skill's real_harness.rb ENTRIES, same keys
-#    (= the harness MODE values = the manifest's `entry` column), each arm rewritten from
-#    ->(b) { ... } to -> { ... } over RAW (Step 1).  The gate already proved they reach the C.
-# 2  PKG = the harness skill's oracle/ install, built from source and pinned:
-#      gem install --install-dir oracle --platform ruby <gem> -v <ver>
+cd $W && . ./fuzz.env
+# 1  cp $SKILLS/triage-fuzzing-findings/resources/confirm.rb $W/confirm.rb, then paste
+#    real_harness.rb's ENTRIES hash into $W/confirm.rb UNCHANGED (->(b) arms, same keys =
+#    the harness MODE values = the manifest's `entry` column), with the helpers the arms
+#    call (Step 1).  Never edit the plugin's own copy.
+# 2  PKG = the harness skill's oracle/ install, built from source and pinned (fuzz.env's PKG).
 #    No second install.
 # 3  one command, run from the fuzz workspace: screens every campaign on the build that made
 #    it, buckets the raw reproducers, confirms one per bucket, minimizes those, writes REPORT.md
-resources/triage_all.sh \
-    PKG=$PWD/oracle/gems/<gem>-<ver> \
-    GOOD=corpus/<a gate seed with status=0> \
-    ASAN_RT=$(../build-a-ruby-c-extension-fuzzing-harness/resources/find_asan_rt.sh)
+$SKILLS/triage-fuzzing-findings/resources/triage_all.sh GOOD=corpus/<a gate seed with status=0>
 ```
 
-With `campaigns/manifest.tsv` in the workspace (the campaign skill writes it), that is the
-whole command. See "Manifest mode" in Step 2. Without a manifest, also pass `ENTRIES`, `MODES` and
-`ALLOC_CAP_MB` by hand. Add `REQUIRE=<feature>` when the gem's `require` name differs
-from its gem name, and `TIMEOUT_MS=` (confirm.rb's own answer budget, default 10000) if
-needed. Both reach `confirm.rb` through the environment.
+Every command block starts with `cd $W && . ./fuzz.env` (`$W` spelled out): each tool call
+is a fresh shell, and `fuzz.env` (the harness skill wrote it; if missing, run its
+`init_workspace.sh`) supplies `PKG`, the ASAN extension (`EXT_ASAN`), `ASAN_RT`, `MODES`
+and `ALLOC_CAP_MB` as defaults below explicit arguments. With `campaigns/manifest.tsv` in
+the workspace (the campaign skill writes it), that is the whole command. See "Manifest
+mode" in Step 2. Without a manifest, also pass `ENTRIES` by hand. Add `REQUIRE=<feature>`
+when the gem's `require` name differs from its gem name, and `TIMEOUT_MS=` (confirm.rb's
+own answer budget, default 10000) if needed. Both reach `confirm.rb` through the
+environment.
 
 Without `PKG` it skips confirmation and says so. The confirm step is the only one that
 answers whether a crash reaches a user.
@@ -61,21 +63,35 @@ file does not quote what earlier campaigns found: your findings are yours to est
 
 ## Step 1: Fill in the consumer calls
 
-Set `ENTRIES` in `resources/confirm.rb` from the `ENTRIES` hash in the harness skill's
-`real_harness.rb`. Use the same keys: the harness `MODE` value, which is what the campaign
-manifest's `entry` column holds (`MODE=file` maps to `file`, the default mode to
-`default`). The arms were written once, where the gate proved they reach the native code,
-so do not rewrite what they call. Transfer them mechanically:
+Copy the template into the workspace and edit it there, never the plugin's own file (an
+installed plugin is shared, and two workspaces would overwrite each other's arms):
 
-| in `real_harness.rb` | in `confirm.rb` |
-|---|---|
-| `"default" => ->(b) { MyGem.parse(b).inspect }` | `"default" => -> { MyGem.parse(RAW).inspect }` |
-| `as_file(b, ".dat")` | `as_file(".dat")` (writes RAW to a temp file) |
-| an `over_ceiling?` / `over_work?` guard before the call | **drop it**: those ceilings are the gate's, and no user has them |
+```sh
+cd $W && . ./fuzz.env
+cp $SKILLS/triage-fuzzing-findings/resources/confirm.rb $W/confirm.rb
+```
 
-`RAW` is the input as a BINARY String, the exact bytes. A `nil` return is reported as
-`CLEAN evidence=type=nil`, which the liveness check flags. Check two things while you
-transfer:
+`triage_all.sh` and `confirm.sh` use `$W/confirm.rb` when it exists; `CONFIRM=<path>`
+points them elsewhere.
+
+**Paste the `ENTRIES` hash from the harness skill's `real_harness.rb` unchanged.** The keys
+are the harness `MODE` values, which is what the campaign manifest's `entry` column holds
+(`MODE=file` maps to `file`, the default mode to `default`). Each arm keeps its `->(b)`
+form: `confirm.rb` calls it as `arm.call(RAW)`, with `RAW` the input as a BINARY String,
+and `as_file(b, ext)` has the same signature on both sides. A lambda checks its arity, so
+an arm rewritten to `-> { }` raises ArgumentError and every cell reads CAUGHT. The arms
+were written once, where the gate proved they reach the native code: do not rewrite them.
+
+**Paste the helpers the arms use above the hash too**: a handler class the callback arms
+instantiate, a tree walker, a global handler object. A name the arms call that
+`confirm.rb` does not define reads as a wiring error. The helpers `real_harness.rb`'s
+template itself provides (`as_file`, `fnv1a`, `over_ceiling?`, `over_work?`) are already
+in `confirm.rb` with the same names and signatures. For a callback arm, check whether
+`confirm.rb` already defines `COLLECTED` (the buffer the arm appends events to and
+returns); paste its one line only if it does not.
+
+A `nil` return is reported as `CLEAN evidence=type=nil`, which the liveness check flags.
+Check two things while you paste:
 
 * **No `rescue` and no options you would not expect a user to write.** A `rescue` inside
   an arm manufactures a CAUGHT verdict. A `Thread#join`/`#value` the README does not show
@@ -83,6 +99,11 @@ transfer:
 * **Every `entry` the manifest names has an arm.** The template's `default` arm raises
   `NotImplementedError`, which is a ScriptError, not a StandardError. An unfilled arm
   therefore reads **UNCAUGHT on every cell**, not ERROR.
+
+**One known-good input per entry point when they differ.** `GOOD=` feeds every arm's
+liveness check; an entry point with another encoding or input shape (a UTF-16 arm, an IO
+arm) reads NO-EVIDENCE on a UTF-8 seed. Pass `GOOD_<entry>=<seed>` for it (characters
+outside `[A-Za-z0-9_]` become `_`).
 
 **Confirm every entry point the gem exposes.** This is the highest-value rule in this skill.
 A Ruby String carries arbitrary bytes, so the Node trap does not carry over as-is: on the
@@ -104,10 +125,20 @@ both the mode and the arm, they would have been filed as "does not reproduce" tw
 
 ## Step 2: Run the driver
 
+**Build `out/pristine/` first whenever campaigns saved crashes**: only the pristine column
+earns "reproduces without instrumentation", and `triage_all.sh` notes crashes with no
+`out/pristine/`. The harness skill's two commands, linked as plain was:
+
+```sh
+cd $W && . ./fuzz.env
+(cd $X && $R/build_ext.sh VARIANT=pristine OUT=$W/out ORACLE=$PKG GEM_PATH=$W/oracle EXTCONF_ARGS="$EXTCONF_ARGS")
+$R/link_harness.sh VARIANT=pristine MK=out/pristine/Makefile SRCDIR=$X OUT=$W/out <plain's LIB=/EXT_OBJS=/SHIM=>
+```
+
 ### Manifest mode (the default)
 
 If `campaigns/manifest.tsv` exists, `triage_all.sh` drives from it. Run it from the
-workspace with nothing but `PKG`, `GOOD` and `ASAN_RT`. `NO_MANIFEST=1` forces discovery,
+workspace with nothing but `GOOD` (the rest comes from `fuzz.env`). `NO_MANIFEST=1` forces discovery,
 and `MANIFEST=<path>` points elsewhere.
 
 | from the manifest | how |
@@ -121,13 +152,13 @@ and `MANIFEST=<path>` points elsewhere.
 These are still discovered, not read: the crash and bucket contents, the `GOOD` guard, the
 ceiling ladder, and the extension `.so` files (the first `*.so` at the top of
 `out/asan/` and `out/pristine/`; pass `EXT=`/`PRISTINE=`, or `EXT_MAP`/`PRISTINE_MAP` when
-the gem loads several). With no `out/pristine/` build the driver says so up front: build
-`VARIANT=pristine` as soon as there are crashes, or the column that rules out an
-instrumentation artifact stays empty. The driver warns about any `crashes/`/`hangs/` directory with files
+the gem loads several). The driver warns about any `crashes/`/`hangs/` directory with files
 that the manifest does not list. Those are not triaged: re-run the campaign or use
 `NO_MANIFEST=1`. The harness skill's `smoke/` tree is skipped in that check. The corpus
-skill's `crashers/` and `hangs/` are triaged too: against every variant, then under each
-recorded non-default mode. A non-`completed` campaign's crashes are real; the absence of
+skill's `crashers/` and `hangs/` are triaged too, even when no campaign saved a crash:
+against every variant, then under each recorded non-default mode. The harness skill's
+`smoke.sh` puts its `REAL` and `PERSISTENT-ONLY` crashes there itself, with a row in
+`crashers.summary.tsv`, so nothing needs copying by hand. A non-`completed` campaign's crashes are real; the absence of
 more crashes is not evidence.
 
 Each campaign gets these settings, with a timestamped line each: `exec_timeout_ms` sets its
@@ -173,20 +204,9 @@ heartbeat interval inside long loops (default 20).
 
 **In discovery mode, each campaign starts on the harness of the build that produced it.
 Whatever does not reproduce there is offered to the other builds, then to each harness
-mode.** The risk of using the wrong build runs one way. Measured on the Node sibling over
-161 real crashes:
-
-| campaign (Node bindings) | both builds | ASAN only | plain only | neither |
-|---|---|---|---|---|
-| stylesheet-compiler binding, plain (13) | 13 | 0 | 0 | 0 |
-| stylesheet-compiler binding, ASAN (111) | 0 | **111** | 0 | 0 |
-| image-decoding binding, plain (37) | 25 | **2** | 0 | 10 |
-
-An ASAN campaign minimized against the plain build loses everything, because 1-2 byte
-over-reads are invisible without the sanitizer. Not one input crashed the plain build
-alone. The two crashes that only ASAN reproduces came from the *plain* campaign, which is
-why stopping at the producing build was not enough. The 10 that reproduce nowhere are
-fork-mode non-reproducers (persistent-mode artifacts), not crashes of the other variant.
+mode.** The risk of using the wrong build runs one way: an ASAN campaign minimized against
+the plain build loses everything (the measured table: `references/afl-tool-reliability.md`,
+"Which build reproduces").
 
 **Harness modes.** Manifest mode takes them from `mode_env`. Otherwise, list the non-default
 settings of the harness's mode variable yourself (`MODES="MODE=file"`). A crash found in one mode
@@ -249,9 +269,10 @@ different bug. Hangs use `afl-tmin -H` with a short `-t` (`HANG_S`, default 2 s)
 re-check at the full timeout. A result that does not verify is discarded and the original
 bytes are kept. There is no homemade fallback.
 
-**Do not hand-minimize further.** On the Node sibling, a stack-exhaustion reproducer
-resisted manual reduction. The obvious mechanism (deep nesting) was guarded; the real one
-was unbounded recursion during evaluation, past the guard.
+Drift is keyed on the first non-interceptor frame, so a `memcpy` interceptor is not the
+key. **Read the minimized input's key** against its bucket's: a `DRIFT` row in REPORT.md
+means minimization wandered to another bug, so report the original bytes. Do not
+hand-minimize further (same reference).
 
 ### Buckets
 
@@ -264,6 +285,9 @@ Node sibling, a 25-crash over-read in an unchecked UTF-8 decoder was reported at
 of one header: the exact key gave 6 buckets, and the merged key gave **4**, the published
 answer. To judge whether two reports are one bug, compare the **allocation and the access**,
 not the frame text, because inlining differs between the instrumented and pristine builds.
+A third grouping, **merged on caller**, catches a root cause visible only in frame #1 (one
+bad length into a shared helper from several sites). A bucket keyed on a `harness.cc` or
+`shim.c` line is copied code: name the extension's line from the copy's source comment.
 
 | bucket | meaning | action |
 |---|---|---|
@@ -308,7 +332,7 @@ Verdict ladder, most severe first:
    gem, so the cell proves nothing. It is deliberately not CAUGHT. In the plain column, a
    NoMemoryError is the gem's real behaviour and reads UNCAUGHT.
 
-Four kinds of cell are not verdicts. Fix them; do not report them:
+Six kinds of cell are not verdicts. Fix them; do not report them:
 
 * **`EXT-NOT-SWAPPED`**: the ASAN extension never loaded, so that column duplicates the
   install column and hides every memory bug. `confirm.rb` intercepts `require` and
@@ -322,17 +346,20 @@ Four kinds of cell are not verdicts. Fix them; do not report them:
   `PKG-NOT-A-GEM`, `LOAD-FAILED`, `EXT-MISSING`; exit 40). `ERROR(rc=N)` means ruby died
   without a verdict line. A `PKG` that will not load usually means it is not a fresh
   `oracle/` install.
+* **`ERROR(version-mismatch=<got>!=<want>)`**: the installed gem is not `PKG_VERSION`;
+  reinstall the pinned version in `oracle/`.
+* **`ERROR(arm-wiring)`**: a `NameError` on a `confirm.rb` line, a helper the arm needs
+  that was not pasted above the hash; not CAUGHT.
 * **A column of all-CLEAN**: the signature of a mis-wired call, not a clean gem. `GOOD=` runs
   a working seed through the **plain** column first and prints its `evidence=`. A
-  `type=nil`, `bytes=0` or `…=0` result means the column measures nothing. The fixture's
-  liveness line read `CLEAN evidence=bytes=12`. On the Node sibling, a JS harness
-  "confirmed" success for 18 files that had all failed, because the getter it checked was
-  hardcoded `return true`.
+  `type=nil`, `bytes=0` or `…=0` result means the column measures nothing (a getter
+  hardcoded to succeed once passed a whole column of failed files).
 
 The liveness run does not prove the ASAN swap. Every non-NATIVE cell proves it per cell
 (`swap=swapped`), but a NATIVE-CRASH pre-empts that check. Prove the swap once by hand:
-`LD_PRELOAD=$ASAN_RT ASAN_OPTIONS=detect_leaks=0 PKG=… EXT=out/asan/<name>.so ruby resources/confirm.rb <GOOD>`
-should print `swap=swapped loaded=<name>.so`.
+`cd $W && . ./fuzz.env && LD_PRELOAD=$($R/find_asan_rt.sh) ASAN_OPTIONS=detect_leaks=0 PKG=$PKG
+EXT=$EXT_ASAN ruby $W/confirm.rb <GOOD>` should print
+`swap=swapped loaded=<name>.so`.
 
 When a minimized input is CLEAN, it is re-tested against the pre-tmin bytes automatically
 and reported as `CLEAN->NATIVE-CRASH(...)(orig)` if those crash. Minimizing happened against
@@ -399,12 +426,31 @@ State what was instrumented. "I fuzzed the gem" and "I fuzzed its vendored C lib
 the extension" are different claims. A bucket pointing inside an uninstrumented dependency
 (a system library the extension links) is a hard-crash-only result.
 
+**Over a system library rebuilt as an instrumented static archive** (the harness skill's
+step 3b), the harness fuzzed the instrumented library, but the `gem+asan-ext` column swaps
+in only the sanitized extension: the process still loads the uninstrumented system `.so`,
+so that column cannot see an overflow inside the library. A bucket whose frame is in the
+library's source can therefore read CLEAN or CAUGHT there while being real; only the plain
+column's hard crash, or a sanitized build of the library put first on `LD_LIBRARY_PATH`
+for that column (the harness skill's `references/oracle-ceiling.md`), is real-stack
+evidence. Say so in the bug's write-up.
+
 Do not quote crash counts as a measure of anything. Do not state a mechanism you have not
 read the code for.
 
 **If nothing is confirmed, including when there are no crash files at all**, cite the
 harness skill's detection self-test and the campaign's execs and stability. Without them,
 "nothing found" is indistinguishable from "the harness detects nothing", and is not a result.
+The no-findings `REPORT.md` the driver writes carries both, plus a **Scope** section for
+you to finish: the public API calls the entry points correspond to, those not covered, and
+an `Instrumented:` line naming what the harness instrumented and sanitized. For a gem over
+a system library rebuilt as a static archive, write that the library `<lib> <version>`
+(upstream source matching the distro package) was instrumented and sanitized in the
+direct harness only, and that the real stack's sanitized column runs the extension
+against the uninstrumented system `.so`. For a parser in the extension, name the linked
+objects and say what the shim mirrors. With no findings, `confirm.rb` never runs: prove
+its wiring once by hand on a few corpus seeds (`$SKILLS/triage-fuzzing-findings/resources/confirm.sh
+OUT=./triage-wiring ...`), or say it is unproven.
 
 Hard crashes and memory-safety bugs in a widely installed gem are sensitive. Report to the
 maintainer through the gem's security policy before posting anywhere public, with the

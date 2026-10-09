@@ -15,7 +15,7 @@
 # already kept do not.  For a whole corpus use cover.sh over its maps (afl-cmin does
 # the same job but can hang on some hosts); this is for triaging an additive batch.
 set -uo pipefail
-for kv in "$@"; do export "$kv"; done
+for kv in "$@"; do case $kv in *=*) export "$kv";; esac; done
 : "${HAVE:?set HAVE}" "${CAND:?set CAND}" "${HARNESS:?set HARNESS}" "${KEEP:=./corpus-extra}" "${TIMEOUT:=5}"
 MODES=${MODES:-}
 # A HAVE directory that does not exist (a mistyped sweep.sh name: it writes

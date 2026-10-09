@@ -24,12 +24,13 @@ Each skill under `plugins/<plugin>/skills/<name>/` has:
 
 Order: harness (`build-a-nan-napi-fuzzing-harness` / `build-a-ruby-c-extension-fuzzing-harness`) → `derive-a-fuzzing-corpus-from-source` → `run-a-fuzzing-campaign` → `triage-fuzzing-findings`.
 
-The skills communicate through files in the fuzz workspace, so names must stay identical across all four. Each plugin's `skills/README.md` artifact table is the contract: `out/<variant>/{harness,harness-fork,map_size}`, `corpus/`, `corpus-final/`, `crashers/`, `hangs/`, the real-stack harness (`real_harness.mjs` / `real_harness.rb`), `oracle/`, `selftest.txt` (with a `PASS:` line), `campaigns/manifest.tsv`, `triage/REPORT.md`. Renaming or changing the format of one in a skill means updating every skill that reads it.
+The skills communicate through files in the fuzz workspace, so names must stay identical across all four. Each plugin's `skills/README.md` artifact table is the contract: `out/<variant>/{harness,harness-fork,map_size}`, `corpus/`, `corpus-final/`, `crashers/`, `hangs/`, the real-stack harness (`real_harness.mjs` / `real_harness.rb`), `oracle/`, `selftest.txt` (with a `PASS:` line), `campaigns/manifest.tsv`, `triage/REPORT.md`, and the AFL dictionaries `out/<variant>/dict.afl` (written by the builds via `AFL_LLVM_DICT2FILE`) and `$W/dict.afl` (the corpus skill's `dict.sh` merge, which `campaign.sh` passes as `-x` and records in the manifest's `dict` column). Renaming or changing the format of one in a skill means updating every skill that reads it.
 
 Shared conventions (changing one touches several skills' scripts):
 - **Harness mode = entry point, named after it.** The harness reads `MODE=<value>` from the environment, never from an input byte. The real harness and triage's confirm script share one `ENTRIES` object/hash keyed by that value, and the campaign manifest's `entry` column is that value. `MODES="MODE=file"` means the same thing to `gate.sh`, `smoke.sh`, `campaign.sh` and `triage_all.sh`.
 - **One allocation ceiling, `ALLOC_CAP_MB` (default 1024)**, used by the gate, campaign (`-m` / `max_allocation_size_mb`), corpus crasher pass and triage's first rung, so a bug found in one step reproduces in the next.
 - **`err=` is a single token** (the library's own error name or code), identical on both sides of the gate; corpus histograms and the error inventory key on it.
+- **`fuzz.env` in the workspace** is written by the harness skill's `init_workspace.sh` (re-run with only the new keys as they become known) and sourced by every command block (`cd $W && . ./fuzz.env`), since a model's shell does not persist between tool calls. Keys: `SKILLS R RC W PKG_NAME PKG PKG_VERSION ADDON_ASAN MODES FIELDS SOFT_FIELD SOFT_DROP ALLOC_CAP_MB REAL REAL_ASAN`. Scripts read it as defaults; an explicit argument always wins.
 
 ## The two plugins share code by copy
 
@@ -40,5 +41,6 @@ The ecosystem-specific parts are the build (node-gyp vs mkmf), stub generation (
 ## Editing notes
 
 - Scripts have no repo-local test runner. Validate changes by running them in a real fuzz workspace, and record what you observed in the skill's `EVIDENCE.md`. Anything learned on Node and reused in the Ruby plugin is **[carried]**, never [measured], until it has been run on a Ruby gem.
+- Command examples in `SKILL.md` and `references/` use `$R/` (harness skill) and `$RC/` (corpus skill) from `fuzz.env`, never a bare `resources/` path, which would resolve against the workspace rather than the skill.
 - Fuzzing runs in the `sectainer` Docker image (AFL++ 4.33c, clang 21, aarch64 Linux, Ruby 3.3), built from `~/research/sectainer`. That is the platform the EVIDENCE files record.
 - `EVIDENCE.md` files carry "review corrections" tables of past mistakes that are easy to reintroduce (for example, killing a wrapper subshell's pid instead of `afl-fuzz`, or recording a campaign as `completed` when it aborted). Read the relevant one before changing a script's control flow.

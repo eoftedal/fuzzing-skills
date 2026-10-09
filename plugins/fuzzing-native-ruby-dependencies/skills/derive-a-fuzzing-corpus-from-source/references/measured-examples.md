@@ -126,9 +126,21 @@ plugin's `EVIDENCE.md` maps each target to its totals.
   all 123 edges**.
 * **Noise floor.** One target was stable at the union level and jittered 21 edges per
   seed; another was byte-identical per seed while the *union* moved by 6. Take the larger
-  of the two as the floor.
+  of the two as the floor. A library that seeds its hash tables from the clock or the pid
+  jitters a few edges on every run; that is the floor, not a bug in your corpus.
+* **The final re-gate finds fidelity gaps the gate corpus was too small to reach.** On one
+  target, re-gating `corpus-final/` was what exposed a library accepting inputs the real
+  stack rejects.
 * **Sweep and minimise.** One sweep of 258 single-byte-flip candidates yielded **10
   keepers for +20 edges**.
+* **The ASAN crasher pass needs a long timeout** (carried from Node evaluation runs). At
+  5 s per seed, under a parallel load, sanitizer symbolization alone outran the timeout,
+  the run was killed before it printed `SUMMARY:`, and the pass recorded no crasher and
+  said nothing. Step 7 now runs it at 30 s and warns on a crash exit with no `SUMMARY:`.
+* **The ASAN crasher pass uses the campaign's and the gate's `ASAN_OPTIONS`**, allocation
+  ceiling included (`max_allocation_size_mb=$ALLOC_CAP_MB`): without it a seed that merely
+  *declares* a huge size aborts with `allocation-size-too-big` and is filed as a crasher
+  it is not. It runs the default mode only; the other modes are the campaign's.
 
 ## Step 8 — The success path
 

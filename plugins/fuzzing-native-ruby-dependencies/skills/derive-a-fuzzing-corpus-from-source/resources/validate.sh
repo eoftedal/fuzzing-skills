@@ -38,7 +38,7 @@ else
     [ -f "$f" ] || continue
     case "$(basename "$f")" in ${PREFIX}*) ;; *) continue ;; esac
     out=$(timeout -k1 "${TIMEOUT:-5}" "$HARNESS" "$f" 2>/dev/null); rc=$?
-    line=${out%%$'\n'*}
+    line=$(grep -m1 -E '(^| )status=' <<<"$out")   # as gate.sh: library stdout may come first
     case $rc in 124|137) rc=hang ;; esac
     printf '%s\t%s\t%s\n' "$rc" "$line" "$(basename "$f")"
   done > "$T/r"

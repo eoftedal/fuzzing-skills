@@ -5,6 +5,11 @@
 set -uo pipefail
 for kv in "$@"; do export "$kv"; done
 : "${A:?set A}" "${B:?set B}"
+# A mistyped directory reads as zero edges, and an empty A then says "B subsumes A": a stop signal.
+for d in "$A" "$B"; do
+  [ -n "$(find "$d" -maxdepth 1 -type f ! -name '.*' 2>/dev/null | head -1)" ] \
+    || { echo "FAIL: $d does not exist or holds no map files (a measure.sh maps_<BASE>/ directory?)" >&2; exit 2; }
+done
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 cat "$A"/* 2>/dev/null | cut -d: -f1 | sort -u > "$T/a"
 cat "$B"/* 2>/dev/null | cut -d: -f1 | sort -u > "$T/b"

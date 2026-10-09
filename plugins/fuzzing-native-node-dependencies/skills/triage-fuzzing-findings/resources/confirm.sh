@@ -35,12 +35,16 @@
 #   SKIPPED            the JS layer wanted more than ALLOC_CEIL; proves nothing either way.
 #   ERROR              bare `ERROR` = confirm.mjs rejected the ENTRY name (exit 40);
 #                      `ERROR(rc=N)` = node died without printing a verdict, usually a PKG
-#                      that will not load.  Neither is a finding; fix it and re-run.
+#                      that will not load.  `ERROR(version-mismatch=<got>!=<want>)` = PKG
+#                      is not the PKG_VERSION you harnessed (exit 41).  None is a finding;
+#                      fix it and re-run.
 #   NO-VERDICT         node exited 0 without a verdict: the ENTRIES arm returned undefined
 #                      and nothing kept the loop alive (a callback that never fires).  The
 #                      arm is mis-wired; not CLEAN.
 #
-# Configure with KEY=VALUE arguments or environment:
+# Configure with KEY=VALUE arguments, then $WORKSPACE/fuzz.env (WORKSPACE default .), then
+# environment.  From fuzz.env: PKG, PKG_VERSION, ALLOC_CAP_MB, ADDON (from ADDON_ASAN), and
+# ASAN_RT (from $R/find_asan_rt.sh) when ADDON is set.
 #   PKG       REQUIRED.  node_modules/<pkg> of a FRESH `npm install <pkg>@<version>`, pinned
 #             to the version you harnessed -- a newer npm release may have fixed the bug,
 #             which is itself a result worth reporting.  Not your build tree, not the oracle.
@@ -58,6 +62,7 @@
 #   ASAN_RT   LD_PRELOAD for the sanitized columns (the harness skill's find_asan_rt.sh).
 #   ALLOC_CAP_MB  fallback allocation ceiling for the sanitized columns (default 1024); the
 #             per-bucket ceiling screen.sh recorded in OUT/cap.tsv takes precedence.
+#   PKG_VERSION  the version you harnessed; confirm.mjs refuses a PKG of another version.
 #   ENTRIES   space-separated ENTRY names defined in confirm.mjs (default: default).
 #             Confirm EVERY entry point the binding exposes: 25 of a stylesheet-
 #             compiler binding's 111
@@ -66,18 +71,37 @@
 #   GOOD      a KNOWN-GOOD input (a corpus seed).  Used as a liveness check before the
 #             table: if the consumer call does not produce evidence on a seed that works,
 #             the column is mis-wired and its CLEANs mean nothing.
+#   GOOD_<entry>  a known-good input for ONE entry point, overriding GOOD for its liveness
+#             check: entries that differ in encoding or input shape (a UTF-16 arm, a stream
+#             arm) need their own, or the UTF-8 GOOD reads NO-EVIDENCE there.  Characters of
+#             the entry name outside [A-Za-z0-9_] become _ (GOOD_from_file for from-file).
+#   CONFIRM   the confirm.mjs holding your ENTRIES arms (default: $WORKSPACE/confirm.mjs
+#             when it exists, else the copy next to this script).  Copy confirm.mjs into the
+#             workspace and fill it in there; an installed plugin's copy is shared.
 #   CELL_TIMEOUT  seconds per cell (default 30).  A native infinite loop would otherwise
 #             wedge the whole table.
 #   OUT       triage work dir (default ./triage); BUCKETS defaults to OUT/buckets.
 #   VERDICTS  machine-readable output (default OUT/verdicts.tsv): name, entry, 3 columns.
 set -uo pipefail
+for kv in "$@"; do case $kv in WORKSPACE=*) export "$kv";; esac; done   # find fuzz.env first
+WS=${WORKSPACE:-.}; [ -f "$WS/fuzz.env" ] && { set -a; . "$WS/fuzz.env"; set +a; }
 for kv in "$@"; do case $kv in *=*) export "$kv";; esac; done
 PKG=${PKG:?set PKG=node_modules/<pkg> of a fresh npm install}
+ADDON=${ADDON:-${ADDON_ASAN:-}}
+# the sanitized columns need the runtime preloaded; find it the way the harness skill does
+if [ -n "$ADDON" ] && [ -z "${ASAN_RT:-}" ] && [ -n "${R:-}" ] && [ -f "$R/find_asan_rt.sh" ]; then
+  rt=$(bash "$R/find_asan_rt.sh" 2>/dev/null) && [ -n "$rt" ] && ASAN_RT=$rt
+fi
 OUT=${OUT:-./triage}; BUCKETS=${BUCKETS:-$OUT/buckets}
 ENTRIES=${ENTRIES:-default}; CELL_TIMEOUT=${CELL_TIMEOUT:-30}
-CONF="$(cd "$(dirname "$0")" && pwd)/confirm.mjs"
+CONF=${CONFIRM:-}
+if [ -z "$CONF" ]; then CONF="$WS/confirm.mjs"; [ -f "$CONF" ] || CONF="$(cd "$(dirname "$0")" && pwd)/confirm.mjs"; fi
+[ -f "$CONF" ] || { echo "FAIL: CONFIRM=$CONF does not exist" >&2; exit 2; }
+CONF="$(cd "$(dirname "$CONF")" && pwd)/$(basename "$CONF")"
 [ -z "${GOOD:-}" ] || [ -f "$GOOD" ] || { echo "FAIL: GOOD=$GOOD does not exist (relative to $(pwd)). A missing reference input" >&2
                                             echo "      looks 'consistent' at every ceiling and silently disables the guard." >&2; exit 2; }
+goodfor() { local v="GOOD_${1//[^A-Za-z0-9_]/_}"; printf '%s' "${!v:-${GOOD:-}}"; }   # <entry> -> its known-good input
+for E in $ENTRIES; do g=$(goodfor "$E"); [ -z "$g" ] || [ -f "$g" ] || { echo "FAIL: the known-good input for ENTRY=$E ($g) does not exist" >&2; exit 2; }; done
 # symbolize so a sanitizer report is readable; do NOT abort (let it exit 86 after printing).
 # The allocation ceiling is set PER BUCKET from OUT/cap.tsv (the ceiling the input reproduced
 # at), appended last so nothing inherited overrides it.  It used to be a fixed 4096 MB here,
@@ -103,8 +127,9 @@ ts() { printf '[%s +%ds] %s\n' "$(date +%H:%M:%S)" "$(( $(date +%s) - T0 ))" "$*
 # Stack exhaustion's threshold is the stack limit, not the input, and an async entry point
 # runs on a libuv thread with its own stack.  Record it: a depth-sensitive verdict means
 # nothing without it.
+echo "# confirm script: $CONF"
 echo "# stack limit: $(ulimit -s) KiB   node: $(node -v)   cell timeout: ${CELL_TIMEOUT}s"
-nb=$(ls "$BUCKETS" 2>/dev/null | grep -c '^[^.]' || true)
+nb=$(ls "$BUCKETS" 2>/dev/null | grep -v '\.key$' | grep -c '^[^.]' || true)   # minimize.sh writes <name>.key beside each reproducer
 ne=$(set -- $ENTRIES; echo $#)
 ncols=1; [ -n "${ADDON:-}" ] && ncols=$((ncols+1)); [ -n "${PRISTINE:-}" ] && ncols=$((ncols+1))
 ts "# $nb bucket(s) x $ne entry point(s) x $ncols column(s) = up to $((nb*ne*ncols)) node runs, ${CELL_TIMEOUT}s each"
@@ -149,6 +174,8 @@ run() {  # <crash file> <env assignments...>  -> prints one cell, sets LAST_OUT
     # hides every memory bug it exists to find.  That is an error, not a verdict.
     grep -q 'addon=NOT-SWAPPED'    <<<"$out" && v="ADDON-NOT-SWAPPED"
     grep -q 'addon=AMBIGUOUS-SWAP' <<<"$out" && v="ADDON-AMBIGUOUS"
+    local why; why=$(sed -n 's/^verdict=ERROR \(version-mismatch=[^ ]*\).*/\1/p' <<<"$out" | head -1)
+    [ -n "$why" ] && v="ERROR($why)"
     echo "$v"
   # rc=0 with no verdict line: the ENTRIES arm returned undefined and nothing kept the event
   # loop alive (its callback never fired, or it forgot to call okback/errback), so node simply
@@ -184,24 +211,27 @@ for E in $ENTRIES; do
   # Liveness check.  A column of all-CLEAN is the signature of a mis-wired consumer call,
   # not of a clean package; prove the call does something on an input that works before
   # believing a CLEAN on an input that crashed the harness.
-  if [ -n "${GOOD:-}" ]; then
+  G=$(goodfor "$E")
+  if [ -n "$G" ]; then
     # NOT $(run ...): a command substitution is a subshell, so LAST_OUT would not come
     # back.  Capture through a file instead, and read the evidence from that one run.
-    run "$GOOD" ENTRY="$E" PKG="$PKG" > "$OUT/.liveness"
+    run "$G" ENTRY="$E" PKG="$PKG" > "$OUT/.liveness"
     g=$(cat "$OUT/.liveness"); rm -f "$OUT/.liveness"
     ev=$(sed -n 's/.*\(evidence=[^ ]*\).*/\1/p' <<<"$LAST_OUT" | head -1)
-    echo "# liveness (GOOD=$(basename "$GOOD")): $g ${ev:-NO-EVIDENCE}"
+    gv=GOOD; [ "$G" = "${GOOD:-}" ] || gv="GOOD_${E//[^A-Za-z0-9_]/_}"
+    echo "# liveness ($gv=$(basename "$G")): $g ${ev:-NO-EVIDENCE}"
     case "$g" in CLEAN) :;; *) echo "# WARN: the known-good seed is not CLEAN on this entry point;" \
         "every CLEAN below is unverified until the consumer call is right.";; esac
     [ -z "$ev" ] && echo "# WARN: no evidence= on the known-good seed: the call may be returning" \
         "without doing the work (an image-decoding binding's hardcoded completion getter 'confirmed' 18 failures)."
   else
-    echo "# no GOOD= given: the CLEAN cells below are unverified. Pass a corpus seed."
+    echo "# no GOOD= (or GOOD_${E//[^A-Za-z0-9_]/_}=) given: the CLEAN cells below are unverified. Pass a corpus seed."
   fi
   cells=0
   printf '%-34s %-24s %-24s %-24s\n' CRASH 'npm-install(plain)' 'npm-js+asan-addon' 'npm-js+pristine-addon'
   for c in "$BUCKETS"/*; do
     [ -f "$c" ] || continue
+    case $c in *.key) continue;; esac                     # minimize.sh's key file, not an input
     pname=$(basename "$c" | sed 's/^[0-9a-f]\{6\}-//')
     orig="$OUT/pool/$pname"                                  # pre-tmin bytes (see screen.sh)
     cap=$(capof "$pname"); export ASAN_OPTIONS="$ASAN_BASE:allocator_may_return_null=1:max_allocation_size_mb=${cap:-$ALLOC_CAP_MB}"

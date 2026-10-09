@@ -28,7 +28,7 @@ appendable flag list. So:
    resolve to weak no-ops and plain node can still `dlopen` it. Under the harness the
    real runtime interposes.
 4. The harness TU is compiled by `zig cc`, not by `afl-clang-fast`, so the persistent
-   macros come from `-include resources/afl_shim.h`. The shim defines all five
+   macros come from `-include $R/afl_shim.h`. The shim defines all five
    (`__AFL_INIT`, `__AFL_LOOP`, `__AFL_FUZZ_INIT`, `__AFL_FUZZ_TESTCASE_BUF`,
    `__AFL_FUZZ_TESTCASE_LEN`); with only the first two, the template's persistent path
    is silently compiled out. Check: `strings harness | grep -c SIG_AFL_PERSISTENT`.
@@ -39,9 +39,10 @@ afl-clang-fast wrapper defines it, and zig cc does not. `undef_fuzzmode.h` is mo
 ## Setting it up
 
 ```sh
+cd $W && . ./fuzz.env
 mkdir zbuild && cd zbuild
-cp resources/wrapper_build.zig build.zig
-cp resources/covstub.c .
+cp $R/wrapper_build.zig build.zig
+cp $R/covstub.c .
 cat > build.zig.zon <<'EOF'
 .{ .name = .zbuild, .version = "0.0.0", .fingerprint = 0x0,
    .dependencies = .{ .pkg = .{ .path = "../<pkg>" } }, .paths = .{""} }
@@ -53,13 +54,14 @@ Match the publish workflow's target and optimize mode (read `.github/workflows/`
 the real stack and the harness are not the same code:
 
 ```sh
+cd $W && . ./fuzz.env && cd zbuild
 T="-Dtarget=aarch64-linux-gnu.2.28 -Doptimize=ReleaseFast"
-zig build $T --prefix /abs/out/plain                       # .node, lib<name>glue.a, lib<dep>.a
-resources/gen_stubs.sh /abs/out/plain/lib/lib<name>glue.a > /abs/out/plain/stubs.cc   # see below
-zig build harness $T -Dharness=/abs/harness.cc -Dstubs=/abs/out/plain/stubs.cc \
-    -Dshim=/abs/resources/afl_shim.h -Dafl_rt=$(resources/find_afl_rt.sh) --prefix /abs/out/plain
-zig build $T -Dasan=true --prefix /abs/out/asan
-zig build harness $T -Dasan=true -Dasan_rt=$(dirname $(resources/find_asan_rt.sh)) ... --prefix /abs/out/asan
+zig build $T --prefix $W/out/plain                       # .node, lib<name>glue.a, lib<dep>.a
+$R/gen_stubs.sh $W/out/plain/lib/lib<name>glue.a > $W/out/plain/stubs.cc   # see below
+zig build harness $T -Dharness=$W/harness.cc -Dstubs=$W/out/plain/stubs.cc \
+    -Dshim=$R/afl_shim.h -Dafl_rt=$($R/find_afl_rt.sh) --prefix $W/out/plain
+zig build $T -Dasan=true --prefix $W/out/asan
+zig build harness $T -Dasan=true -Dasan_rt=$(dirname $($R/find_asan_rt.sh)) ... --prefix $W/out/asan
 ```
 
 The addon is installed to `lib/<name>.node`; point the real-stack harness at it with

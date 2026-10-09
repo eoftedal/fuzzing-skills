@@ -28,10 +28,14 @@
 #               gate check 5 is N/A -- say so.
 #   SHIM        source files of a Ruby-runtime shim (resources/ruby_shim_template.c): real
 #               definitions of the few rb_* calls an extension's own parser makes on the
-#               input path.  Compiled here for THIS variant (its compiler, sanitizer and
-#               the lifted flags, plus -I for each file's own directory), linked like LIB,
-#               and excluded from stub generation.  rebuild_asan.sh passes it through, so
-#               the self-test rebuilds the shim with everything else.
+#               input path.  Compiled here for THIS variant (its sanitizer and the lifted
+#               flags, plus -I for each file's own directory), linked like LIB, and
+#               excluded from stub generation.  rebuild_asan.sh passes it through, so the
+#               self-test rebuilds the shim with everything else.
+#               Always with plain clang/clang++, never afl-clang-fast: the shim stands in
+#               for the runtime, so its coverage is noise, and one shim TU instrumented
+#               under ASAN crashed in a select-instrumented branch (the guard slot held a
+#               relocated pointer) until it was rewritten.
 #   HARNESS_CXX compiler for the harness TU only, when a header refuses clang; the TU
 #               is then compiled uninstrumented with afl_shim.h providing the persistent
 #               macros, and the AFL runtime still arrives via the afl-clang-fast++ link.
@@ -79,10 +83,16 @@ if [ "${LIBS_FROM_MK:-0}" = 1 ]; then
   EXTRA_LIBS="$EXTRA_LIBS $(tr ' ' '\n' <<<"$mkl" | grep -vE '^-lruby|afl-compiler-rt' | tr '\n' ' ')"
 fi
 
+# The harness TU's compare constants join the build's dict.afl (build script: dict2file.raw).
+# Its own raw file, so a relink neither wipes the library's entries nor accumulates; stubs
+# and shims are not recorded.  An absolute path, or afl-cc aborts.  No _NO_MAIN here: at -O2
+# the harness's static helpers are inlined into main and their constants would be lost.
+HDICT=""
+if [ "$VARIANT" != pristine ]; then HDICT=$(cd "$D" && pwd)/dict2file-harness.raw; rm -f "$HDICT"; fi
 echo "== harness TU ($VARIANT) with lifted flags =="
 for drv in harness harness-fork; do
   extra=""; [ "$drv" = harness-fork ] && extra="-DNO_PERSISTENT"
-  $HCXX -c -o "$D/$drv.o" "$HARNESS" $FLAGS $AFLSHIM $extra $SAN $QUIET \
+  ${HDICT:+env AFL_LLVM_DICT2FILE=$HDICT} $HCXX -c -o "$D/$drv.o" "$HARNESS" $FLAGS $AFLSHIM $extra $SAN $QUIET \
     || { echo "FAIL: compiling $HARNESS ($drv)" >&2; exit 1; }
 done
 
@@ -91,7 +101,7 @@ if [ -n "$SHIM_SRC" ]; then
   SHIM_OBJS=""
   for f in $SHIM_SRC; do
     o=$D/shim-$(basename "${f%.*}").o
-    case $f in *.c) cc=$CC ;; *) cc=$CXX ;; esac
+    case $f in *.c) cc=clang ;; *) cc=clang++ ;; esac    # uninstrumented: see SHIM above
     $cc -c -o "$o" "$f" $FLAGS -I"$(cd "$(dirname "$f")" && pwd)" $SAN $QUIET \
       || { echo "FAIL: compiling shim $f" >&2; exit 1; }
     SHIM_OBJS="$SHIM_OBJS $o"
@@ -172,5 +182,15 @@ if [ "$VARIANT" != pristine ]; then
   ms=$(AFL_DUMP_MAP_SIZE=1 "$D/harness" 2>/dev/null | tail -1)
   echo "  map size: ${ms:-?}   (pass MAP_SIZE=$ms to gate.sh / measure.sh; it differs per variant)"
   echo "$ms" > "$D/map_size"
+fi
+if [ -n "$HDICT" ]; then   # same filter as the build script: dedup, drop empty or >128-byte tokens
+  ndict=$(cat "$D/dict2file.raw" "$HDICT" 2>/dev/null | LC_ALL=C sort -u | awk -v out="$D/dict.afl.tmp" '
+    !/^".*"$/ { next }
+    { d = substr($0, 2, length($0) - 2); gsub(/\\x[0-9A-Fa-f][0-9A-Fa-f]|\\./, "x", d)
+      if (d == "" || length(d) > 128) next
+      print > out; n++ }
+    END { print n + 0 }')
+  if [ "$ndict" -gt 0 ]; then mv "$D/dict.afl.tmp" "$D/dict.afl"; echo "  dict: $ndict entries in $D/dict.afl (library + harness compare constants)"
+  else rm -f "$D/dict.afl.tmp"; fi
 fi
 echo "built $D/harness and $D/harness-fork"

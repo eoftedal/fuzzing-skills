@@ -359,25 +359,28 @@ bucket alone, which saves filing them and saves counting them.
 
 ## Adapting confirm.rb for non-one-shot APIs
 
-The `ENTRIES` arms are zero-argument lambdas over `RAW` that return the result. Replace or add
-arms for other shapes, keyed like the harness modes. Keep the scaffolding, the `evidence=`
+The `ENTRIES` arms are the `->(b)` lambdas pasted unchanged from `real_harness.rb`;
+`confirm.rb` calls each as `arm.call(RAW)`, so `b` is the exact input bytes. Write a new
+shape in `real_harness.rb` first, where the gate proves it, then paste it, keyed like the
+harness modes. Keep the scaffolding, the `evidence=`
 and the timeout. A `nil` return is CLEAN with `evidence=type=nil`, so return what the call
 produced.
 
-* **A path argument**: `-> { MyGem.parse_file(as_file(".ext")) }`. `as_file` writes the exact
+* **A path argument**: `->(b) { MyGem.parse_file(as_file(b, ".ext")) }`. `as_file` writes the exact
   bytes to a temp file. It is the raw-byte entry point when the String one cuts at NUL.
-* **An IO argument**: `-> { MyGem.parse(StringIO.new(RAW)) }`, or `File.open(as_file)`
+* **An IO argument**: `->(b) { MyGem.parse(StringIO.new(b)) }`, or `File.open(as_file(b))`
   when the gem treats a real File differently, for example by reading its `fileno`. These
   can reach different readers; if the README shows both, add both as arms.
 * **A block-yielding API**: collect what the block yields and return it:
-  `-> { evs = []; MyGem.each_event(RAW) { |e| evs << e }; evs }`, which gives
+  `->(b) { evs = []; MyGem.each_event(b) { |e| evs << e }; evs }`, which gives
   `evidence=array=N`.
 * **A handler object**: subclass the gem's handler (as `real_harness.rb` did), let it
   collect, then return the collection:
-  `-> { h = Collector.new; MyGem::EventParser.new(h).parse(RAW); h.events }`. An
+  `->(b) { h = Collector.new; MyGem::EventParser.new(h).parse(b); h.events }`, with the
+  `Collector` class pasted above the hash. An
   exception raised inside a handler callback that the gem does not rescue propagates out of
   the call, and its class decides the verdict.
-* **A push/streaming parser**: `-> { p = MyGem::PushParser.new(h); p << RAW; p.finish; h.events }`.
+* **A push/streaming parser**: `->(b) { p = MyGem::PushParser.new(h); p << b; p.finish; h.events }`.
   Whether to wrap it in the error handling the README shows is the whole question. Leave it
   off to measure the default caller, put it on to measure the careful one, and run it both
   ways as two arms if the README shows both.
@@ -407,10 +410,10 @@ version and say the confirmation is against that, not against the exact tree.
 A crash the harness produces that the gem reports CLEAN on **every** entry point is usually
 one of these:
 
-* an over-read of the input buffer that the gem's String layout masks (the oracle ceiling)
-  — a result, reported from the direct harness;
+* an over-read of the input buffer that the gem's String layout masks (the oracle ceiling):
+  a result, reported from the direct harness;
 * an input the gem's API cannot express (`nul=1` through `StringValueCStr`, a transcoding
-  arm) with no raw-byte entry point — out of scope and legitimate;
+  arm) with no raw-byte entry point: out of scope and legitimate;
 * a path the harness reached by mirroring a dispatch the gem's Ruby does differently;
 * a feature compiled into your build but not into the install (compare `extconf.h` from
   both);

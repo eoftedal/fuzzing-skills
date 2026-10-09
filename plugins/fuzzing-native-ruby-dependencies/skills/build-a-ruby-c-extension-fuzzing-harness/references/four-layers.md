@@ -73,9 +73,11 @@ the same order, and mirror its **ceiling**: where the size is attacker-declared,
 omitting the limit turns a correctly-refused input into a harness-only OOM that looks
 like a finding, and *inventing* the limit silently refuses inputs the real gem accepts.
 
-Ask the runtime for that limit; do not quote one. A Ruby String's length is a `long`
-(`RSTRING_LEN`), so the ceiling is far larger than it looks and differs between
-architectures:
+Ask the runtime for that limit; do not quote one, and make the harness `#error` when the
+macro is missing rather than defaulting it
+(`EXTRA_FLAGS="-DRUBY_LONG_MAX=$(ruby -rrbconfig/sizeof -e 'p RbConfig::LIMITS["LONG_MAX"]')"`).
+A Ruby String's length is a `long` (`RSTRING_LEN`), so the ceiling is far larger than it
+looks and differs between architectures:
 
 ```sh
 ruby -rrbconfig/sizeof -e 'p RbConfig::LIMITS["LONG_MAX"]'
@@ -105,6 +107,34 @@ Never wrap `String.new`, `malloc` or `ruby_xmalloc` globally: that also refuses 
 gem's internal buffers and the harness's own input copy. Say in the write-up that a
 ceiling was on, and turn it off for the gate on the real corpus, because every input it
 refuses is one the comparison no longer covers.
+An invented cap was measured, on the Node sibling, to reject inputs the real package
+accepts: that is why the default is none.
+
+**Attacker-chosen work** is the same problem in time: an input field that sets an
+iteration count, a cost or rounds exponent, a dimension of a loop. Mirror the gem's own
+bound if it has one (read the Ruby validation and the C parser), and otherwise add an
+**opt-in** `WORK_CEIL=<units>` applied identically on both arms at that field and reported
+as `err=work-ceiling`. Set it for the campaign (the smoke's hangs are otherwise all that
+field), and keep high-cost seeds out of `corpus-final/` as hangs. An unbounded
+input-controlled work factor is itself a finding for triage: quote the field and the
+time at its minimum and maximum.
+
+**Tables the Ruby side consults** are limits too: ask the runtime for them at build time.
+A gem's serializer that calls `Encoding.find(<document encoding>)` raises ArgumentError
+for encodings the library accepts and Ruby does not know (measured), so the direct side
+needs Ruby's `Encoding.name_list`, generated into a header at build time, never typed in
+(one evaluation run found this; the gate would otherwise mismatch on those encodings).
+
+**Recovering parsers** (a recovering parse mode as the gem's default) reject almost
+nothing: almost every seed takes the success arm. Keep the default arm what a user gets,
+put what the recovery reported (the gem's error list) into the artifact, and add its
+strict option set as its own `MODE` if the gate's check 3 needs rejects.
+
+**Mirroring a library from C++.** A library's newer API changed pointer constness and
+`void*` fields (an error struct's node field, the error callback's argument, an output
+write callback's buffer); cast as needed. Each was a compile error in an evaluation run.
+Include only the library's headers there; the harness does not need `ruby.h` at all when
+no extension object is linked.
 
 ## Layer 3 — process-global state the init block installs
 
@@ -184,6 +214,37 @@ Mirror the state machine, not just the options, and note the byte pattern for th
 skill.
 
 ## How the bytes are delivered
+
+The rules SKILL.md step 4 states, in full:
+
+* `RSTRING_PTR`/`RSTRING_LEN` or `StringValuePtr` is length-delimited: copy exactly.
+  `StringValueCStr` raises `ArgumentError` ("string contains null byte") for any embedded
+  NUL: mirror that rejection before the call (status=1, `err=ArgumentError`). A transcode
+  (`rb_str_conv_enc`, `#encode` in `lib/`) changes the bytes: mirror it or mark those
+  inputs lossy.
+* **Several byte arguments** (a pattern and a subject) go in one file, framed with a
+  separator the API's values cannot carry (NUL before a `StringValueCStr`; a length
+  prefix otherwise), split identically on both arms and documented at the top of
+  `harness.cc`; the corpus skill's seeds then use the same framing.
+* **A free-form string argument that selects code paths** (an encoding name, an options
+  string, a converter name) has a value space too large for modes, and the fuzzer should
+  explore it: frame it into the input (NUL or newline separated, documented at the top of
+  `harness.cc`) rather than making it a `MODE`. A mode is an environment setting, which
+  the fuzzer never mutates, and is for a handful of entry points (`boundary-shapes.md`).
+* **Empty output is still output.** On success, hash the output even when it is empty, so
+  an empty result and a different empty-looking result compare as bytes; print
+  `out_hash=0` only on the error path when nothing was collected (a partial stream on error
+  is hashed, like the real side's `COLLECTED`).
+* **NUL termination.** Do not add one unless the extension relies on one. Every Ruby
+  String keeps a NUL after its bytes (measured), so a library that reads to NUL works on
+  the real stack and over-reads in the harness: that is a finding, not a harness choice.
+  The exception is by design: an extension that takes the String's length with `strlen`
+  (rather than `RSTRING_LEN`) relies on Ruby's NUL, so the harness copies the bytes plus
+  exactly one NUL (an embedded NUL then ends the input on both sides). Read the read path
+  (the buffer setup, any `strlen` on the pointer) to decide.
+* **Make the library actually do the work.** An open is not a decode, and a parse is not
+  an evaluation. Force it, record something only real work could produce, and reset only
+  what is safe to reset (below).
 
 The native signature can hide the whole input contract.
 

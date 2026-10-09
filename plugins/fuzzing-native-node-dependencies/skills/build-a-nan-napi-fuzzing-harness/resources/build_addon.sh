@@ -91,6 +91,27 @@ export AFL_QUIET=1
 mkdir -p "$OUT/$VARIANT"
 LOG=$OUT/$VARIANT/build.log
 
+# Build-time dictionary: afl-clang-fast writes every constant its compares use (strcmp,
+# memcmp, switch, integer ==) to AFL_LLVM_DICT2FILE, one AFL `"..."` line each, appended per
+# TU, so the raw file is removed first.  The path must be absolute (afl-cc aborts otherwise).
+# NO_MAIN skips main(): configure and mkmf conftests put all their constants there.
+DICT_RAW=""
+if [ "$NEED_AFL" = 1 ]; then
+  DICT_RAW=$(cd "$OUT/$VARIANT" && pwd)/dict2file.raw; rm -f "$DICT_RAW" "$OUT/$VARIANT/dict.afl"
+  export AFL_LLVM_DICT2FILE=$DICT_RAW AFL_LLVM_DICT2FILE_NO_MAIN=1
+else unset AFL_LLVM_DICT2FILE AFL_LLVM_DICT2FILE_NO_MAIN; fi
+# raw -> dict.afl: dedup, and drop what afl-fuzz -x aborts on (an empty token, or one over
+# MAX_DICT_FILE = 128 decoded bytes; \xNN, \\ and \" decode to one byte).  Prints "<kept> <dropped>".
+mkdict() {  # <dict.afl> <raw>...
+  local out=$1; shift; rm -f "$out"
+  cat "$@" 2>/dev/null | LC_ALL=C sort -u | awk -v out="$out" '
+    !/^".*"$/ { next }
+    { d = substr($0, 2, length($0) - 2); gsub(/\\x[0-9A-Fa-f][0-9A-Fa-f]|\\./, "x", d)
+      if (d == "" || length(d) > 128) { drop++; next }
+      print > out; n++ }
+    END { printf "%d %d\n", n, drop }'
+}
+
 echo "== configure ($VARIANT) =="
 rm -rf build
 CC=$CC_ CXX=$CXX_ CFLAGS="$SAN" CXXFLAGS="$SAN" LDFLAGS="${SAN//$UNDEF/}" $NODE_GYP configure > "$LOG" 2>&1 \
@@ -127,6 +148,8 @@ make -C build -j"$JOBS" "$TARGET" V=1 \
 
 NODE_FILE=$(ls build/Release/*.node 2>/dev/null | head -1)
 [ -n "$NODE_FILE" ] || { echo "FAIL: no .node produced in build/Release" >&2; exit 1; }
+DICT_N=""
+[ -n "$DICT_RAW" ] && read -r DICT_N DICT_DROP < <(mkdict "$OUT/$VARIANT/dict.afl" "$DICT_RAW")
 
 echo "== verify =="
 fail=0
@@ -177,5 +200,9 @@ rmdir "$OUT/$VARIANT/lib" 2>/dev/null
 echo "  addon:    $OUT/$VARIANT/Release/$(basename "$NODE_FILE")"
 echo "  objects:  $(find "$OUT/$VARIANT/Release/obj.target" -name '*.o' | wc -l) under $OUT/$VARIANT/Release/obj.target"
 [ -d "$OUT/$VARIANT/lib" ] && echo "  archives: $(ls "$OUT/$VARIANT/lib" | tr '\n' ' ') under $OUT/$VARIANT/lib  (use as LIB= for link_harness.sh)"
+if [ -n "$DICT_RAW" ]; then
+  if [ "$DICT_N" -gt 0 ]; then echo "  dict:     $DICT_N entries in $OUT/$VARIANT/dict.afl (compare constants; campaign.sh -x)$([ "$DICT_DROP" -gt 0 ] && echo ", $DICT_DROP over 128 bytes dropped")"
+  else echo "  dict:     no compare constants recorded; no dict.afl"; fi
+fi
 echo "  flags:    $HERE/lift_flags.sh $OUT/$VARIANT/$(basename "$MK") SRCDIR=$PWD"
 exit $fail

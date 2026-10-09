@@ -105,6 +105,27 @@ export AFL_QUIET=1
 mkdir -p "$OUT/$VARIANT"
 LOG=$OUT/$VARIANT/build.log
 
+# Build-time dictionary: afl-clang-fast writes every constant its compares use (strcmp,
+# memcmp, switch, integer ==) to AFL_LLVM_DICT2FILE, one AFL `"..."` line each, appended per
+# TU, so the raw file is removed first.  The path must be absolute (afl-cc aborts otherwise).
+# NO_MAIN skips main(): configure and mkmf conftests put all their constants there.
+DICT_RAW=""
+if [ "$NEED_AFL" = 1 ]; then
+  DICT_RAW=$(cd "$OUT/$VARIANT" && pwd)/dict2file.raw; rm -f "$DICT_RAW" "$OUT/$VARIANT/dict.afl"
+  export AFL_LLVM_DICT2FILE=$DICT_RAW AFL_LLVM_DICT2FILE_NO_MAIN=1
+else unset AFL_LLVM_DICT2FILE AFL_LLVM_DICT2FILE_NO_MAIN; fi
+# raw -> dict.afl: dedup, and drop what afl-fuzz -x aborts on (an empty token, or one over
+# MAX_DICT_FILE = 128 decoded bytes; \xNN, \\ and \" decode to one byte).  Prints "<kept> <dropped>".
+mkdict() {  # <dict.afl> <raw>...
+  local out=$1; shift; rm -f "$out"
+  cat "$@" 2>/dev/null | LC_ALL=C sort -u | awk -v out="$out" '
+    !/^".*"$/ { next }
+    { d = substr($0, 2, length($0) - 2); gsub(/\\x[0-9A-Fa-f][0-9A-Fa-f]|\\./, "x", d)
+      if (d == "" || length(d) > 128) { drop++; next }
+      print > out; n++ }
+    END { printf "%d %d\n", n, drop }'
+}
+
 # Downloaded recipe tarballs are kept OUTSIDE the source tree, in OUT/vendor-archives:
 # An extconf.rb's cleanup may delete ports/ including ports/archives/ (measured), so a
 # second variant re-downloaded its libraries and an offline container would fail.  Saved before the
@@ -266,6 +287,8 @@ make -j"$JOBS" V=1 CC="$CC_" CXX="$CXX_" ARCH_FLAG="$SAN" \
 DLLIB=$("$HERE/mkvar.sh" Makefile DLLIB | sed -n 's/^DLLIB=//p')
 SO=$PWD/$DLLIB
 [ -f "$SO" ] || { echo "FAIL: make produced no $DLLIB" >&2; exit 1; }
+DICT_N=""
+[ -n "$DICT_RAW" ] && read -r DICT_N DICT_DROP < <(mkdict "$OUT/$VARIANT/dict.afl" "$DICT_RAW")
 
 OBJS=$(ls ./*.o 2>/dev/null)
 
@@ -338,5 +361,9 @@ cp $OBJS "$OUT/$VARIANT/obj/"
 echo "  extension: $OUT/$VARIANT/$DLLIB"
 echo "  objects:   $(ls "$OUT/$VARIANT/obj" | wc -l) under $OUT/$VARIANT/obj  (EXT_OBJS= for link_harness.sh, if the boundary is in them)"
 [ -d "$OUT/$VARIANT/lib" ] && echo "  archives:  $(ls "$OUT/$VARIANT/lib" | tr '\n' ' ')under $OUT/$VARIANT/lib  (LIB= for link_harness.sh)"
+if [ -n "$DICT_RAW" ]; then
+  if [ "$DICT_N" -gt 0 ]; then echo "  dict:      $DICT_N entries in $OUT/$VARIANT/dict.afl (compare constants; campaign.sh -x)$([ "$DICT_DROP" -gt 0 ] && echo ", $DICT_DROP over 128 bytes dropped")"
+  else echo "  dict:      no compare constants recorded; no dict.afl"; fi
+fi
 echo "  flags:     $HERE/lift_flags.sh $OUT/$VARIANT/Makefile SRCDIR=$PWD"
 exit $fail

@@ -57,3 +57,26 @@ Two bugs worth keeping in mind:
 Scope: this skill runs campaigns and records them. It does not build the harness
 (`build-a-nan-napi-fuzzing-harness`), derive the corpus (`derive-a-fuzzing-corpus-from-source`)
 or decide which crashes are real (`triage-fuzzing-findings`).
+
+## Chain review (2026-10-08)
+
+| change | tag | what was checked |
+|---|---|---|
+| `DETACH=1`: re-exec under `setsid nohup`, log to `campaigns/campaign.log`, print the pid and how to follow, return at once | [measured, synthetic] | a Bash tool call stops at ten minutes and kills the process group, which orphaned afl-fuzz and left the manifest without rows; with `DETACH=1` the call returned in under a second and both afl-fuzz ran in the detached group |
+| `AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1` set with a NOTE when core_pattern is piped | [tool] | afl-fuzz aborts otherwise; not exercised, the container's core_pattern is `core` |
+| MODE-leak WARN and `env -u` for the default campaign; `MODES`, `ALLOC_CAP_MB` from `fuzz.env` below the manifest | [measured, synthetic] | see the harness skill's row; the manifest had `default` and `MODE=2` rows, both completed |
+| SKILL.md: "Running it from a tool call" section; run figures moved to `references/measured-cases.md` | [tool] | the Ruby plugin's evidence shows a weaker agent reading earlier figures as expected outcomes |
+
+## Node evaluation round (2026-10-08)
+
+| what the runs hit | fix | tag |
+|---|---|---|
+| no documented end marker: one run's wait loop grepped for a word that never appears and lost six minutes | `DONE: <n> campaign(s) finished; manifest <path>` as the last log line, also on interrupt or a failed launch (`k of n planned ...`), so a waiter never hangs | [measured] on a 5 s run and a killed run |
+| ASAN-only crasher seeds are loaded but not fuzzed ("crashed in the dry run"), so the code past them is reached only by mutation | said in SKILL.md | [tool] |
+| `DETACH=1`, the heartbeat and the manifest drew no friction note in four runs | none | [measured] |
+
+## AFL dictionaries (2026-10-08)
+
+| change | tag | evidence |
+|---|---|---|
+| `DICT=` passes `afl-fuzz -x`; default `$W/dict.afl`, else the variant's `out/<variant>/dict.afl`, `DICT=none` disables; new last manifest column `dict`, with an older manifest upgraded in place; smoke runs pick the same default | **[carried]** | tested on the Ruby plugin (see its EVIDENCE.md): a 5 s run picked `$W/dict.afl`, the log shows the dictionary loaded, the manifest row carries it on completed and interrupted paths; `triage_all.sh` and `smoke.sh` read the 26-column manifest unchanged. Not yet run on a Node target |

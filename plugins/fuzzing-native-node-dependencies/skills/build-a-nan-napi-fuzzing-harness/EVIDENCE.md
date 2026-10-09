@@ -159,5 +159,80 @@ synthetic cases, never on a new target.
 | SKILL.md description names node-gyp, `binding.gyp`, prebuilt `.node`, what the skill proves, and the chain | **[tool]** | triggering vocabulary; the campaign skill's description already carried the chain pointer |
 | SKILL.md: prefer the published tarball (`npm pack`) over a clone as the build tree, state both versions in the write-up | **[carried]** | from the Ruby sibling, where a clone lacked sources a release step generates; the Node skill already met the symptom (a `prepare` step running `tsc`). Not yet seen to matter on a Node target |
 | SKILL.md: the self-test runs in the current environment, so export `MODE=` for a fault on a mode-only path | **[tool]** | `detect_selftest.sh` never applied a mode; the text did not say so |
-| SKILL.md trimmed from 40.0 to 39.0 KB: allocation/work-ceiling long form to `four-layers.md` layer 2, REBUILD out-of-tree recipe and zig REBUILD to the new `selftest-rebuild.md`, mode-budget cost anecdotes dropped (this file keeps them) | **[tool]** | every imperative rule stayed in SKILL.md; the three blocks were 4.5 KB, so the file is still above the 30 KB terminal truncation and the read-with-a-file-reader note stays |
+| SKILL.md trimmed from 40.0 to 39.0 KB: allocation/work-ceiling long form to `four-layers.md` layer 2, REBUILD out-of-tree recipe and zig REBUILD to the new `selftest-rebuild.md`, mode-budget cost anecdotes dropped (this file keeps them) | **[tool]** | every imperative rule stayed in SKILL.md; the three blocks were 4.5 KB, so the file was still above the 30 KB terminal truncation at that point (see the second trim below) |
 | pristine-variant count: "on the evaluation targets" | **[tool]** | SKILL.md said five, this file said three or more |
+
+### Second trim (2026-10-07, later): under the 30 KB terminal truncation
+
+| change | tag | what was checked |
+|---|---|---|
+| SKILL.md 39.0 -> 28.8 KB. Moved, each behind a pointer from the step it left: step 1's node-gyp lookup, no-`binding.gyp`, old-nan and system-library-oracle text and the glue-finding explanation to `build-traps.md`; step 2's three boundary shapes to the new `boundary-shapes.md`; step 3's description of `build_addon.sh`, the `ADDON_CXX` split and the pristine note to `build-traps.md`; step 4's byte-delivery, NUL and do-the-work bullets to `four-layers.md` and the link-error paragraph to `build-traps.md`; step 5's swap mechanics, preload symptoms and check-3 examples to `oracle-ceiling.md`; step 6's smoke prose to the new `smoke.md` and the self-test explanation to `selftest-rebuild.md` | **[tool]** | every imperative rule stayed in SKILL.md as a line; every reference file is pointed at from SKILL.md (checked by script: 7 files, 25 pointers, no dangling path); no em-dash outside the step headings; the KB figure left the read-with-a-file-reader note |
+
+## Chain review (2026-10-08): what a weaker model running the chain through tool calls would hit
+
+A read of all four skills as one system, asking where the design still relied on the
+model's shell memory, on hand-copying between files, or on reading a number and judging
+it. Script behaviour was checked in the `sectainer` image on fabricated harnesses and
+stub packages; nothing ran on a new target, so the tags are [tool] and [measured, synthetic].
+
+| change | tag | what was checked |
+|---|---|---|
+| `fuzz.env` in the workspace, written by the new `init_workspace.sh`, sourced at the top of every command block (`cd $W && . ./fuzz.env`) and read as defaults by `gate.sh`, `smoke.sh`, `detect_selftest.sh`, `sweep.sh`, `nondet.sh`, `campaign.sh`, `triage_all.sh` and `confirm.sh`; explicit arguments win | [measured, synthetic] | a Bash tool call is a fresh shell, so `R`, `W`, `MODES` and the rest were lost between blocks and `resources/` paths resolved against the workspace; `init_workspace.sh` writes, merges on re-run, re-reads `PKG_VERSION` once the oracle exists, and defaults `W` to the current directory when it holds a `fuzz.env`. Every command example now uses `$R/`, `$RC/` or `$SKILLS/` |
+| `gate.sh` picks `REAL_ASAN` by itself when `DIRECT` is sanitized; `smoke.sh`'s `HOSTSAN` defaults to it | [measured, synthetic] | fake plain and ASAN harnesses: the first output line names the source; an explicit `REAL=` wins |
+| new `preflight.sh` (run by `init_workspace.sh`): toolchain, GNU sed, `timeout`, coreutils `stat`, `date +%N`, the plugin's runtime, core_pattern | [tool] | on BSD sed the gate's `\b` matched nothing and every seed AGREED on empty keys; a piped core_pattern aborts afl-fuzz. Passed in the container |
+| `gate.sh` and `detect_selftest.sh` append the non-negotiable `ASAN_OPTIONS` after any inherited value | [tool] | an exported `ASAN_OPTIONS` used to replace `exitcode=86` and the ceiling silently; the triage scripts already did this |
+| MODE-leak WARN in `gate.sh`, `smoke.sh` and `campaign.sh`: a variable named in `MODES` that is already set is reported and unset for the default run | [measured, synthetic] | `MODE=string` exported: the WARN fired; `/proc/<pid>/environ` of the default campaign held no `MODE`, the mode campaign held its own |
+| `gate.sh` WARNs when `FIELDS` lacks `out_hash`, when every AGREED seed shares one hash, and when check 4's unique maps are below half the seeds or min tuples above 80 percent of max | [measured, synthetic] | a harness printing a constant hash: all three fired; the verdict stayed PASS, as intended for a WARN |
+| `rebuild_asan.sh` takes `PKGDIR=`; `PKG=` is accepted only when it holds a `binding.gyp` | [tool] | `fuzz.env` exports `PKG` as the oracle path, so a `rebuild.sh` that forgot the argument would have cd'd into the oracle and rebuilt there |
+| step 6: `REBUILD=./rebuild.sh`, a four-line file sourcing `fuzz.env`, instead of an eval'd quoted string | [tool] | the quoting of that string failed in run after run (above); the eval warning is one sentence in `selftest-rebuild.md` |
+| `harness_template.cc` carries `#error` under the four sections that must be edited | [tool] | an unfilled section fails to compile rather than failing the gate later; `clang++ -fsyntax-only` gives exactly the four errors, none once they are removed |
+| `real_harness_template.mjs` defines `asFile(b, ext)`; the triage skill's `confirm.mjs` now calls each arm with the buffer and has the same helper, so the ENTRIES object pastes unchanged | [measured, synthetic] | before, `confirm.mjs` called arms with no argument, so a pasted `(b) => ...` arm ran on `undefined` and every cell read CAUGHT. Stub package: the default arm is CLEAN with the right byte count, the file arm passes the bytes through |
+| SKILL.md: the first action is `init_workspace.sh`; the `$W` in `cd $W` is written out as the absolute path; smoke and the self-test rebuild may run for minutes, so use a generous timeout or run detached | [tool] | the harness skill's traps table moved to `build-traps.md` to keep the file under 30 KB (29.9 KB) |
+
+## Carried from the Ruby plugin's second evaluation round (2026-10-08)
+
+Four runs on two gem shapes exercised the chain-review changes for real (see the Ruby
+harness skill's EVIDENCE.md): `fuzz.env`, `init_workspace.sh`, `preflight.sh` and `DETACH=1`
+drew no friction note in any run. The fixes mirrored here are **[carried]** until a Node
+target shows them: `init_workspace.sh`'s version lookup; `smoke.sh` handing REAL and
+PERSISTENT-ONLY crashes to `crashers/`; the real-side template's `collected` buffer hashed
+on error; the instrumented-static-archive route as step 3b's first choice with the
+sanitized-column caveat; the corpus skill's instrumentation check on the harness binary;
+`campaigns/<name>.dropped`; `CONFIRM=`, `GOOD_<entry>=` and the no-findings Scope section
+in triage; the `rebuild.sh` forms without `/dev/null`.
+
+## Node evaluation round (2026-10-08): four fresh agents, two addon shapes, both models
+
+Opus and Sonnet each took the full chain on a regex-engine binding (NAN, the engine and its
+support library vendored into the addon's own gyp target, the work in ObjectWrap methods
+copied into the harness) and on a transcoding binding (C N-API glue, the library compiled
+in, the conversion state machine in JavaScript), four agents at once in the shared container,
+campaigns `DURATION=300 JOBS=2`. All eight harnesses passed the gate, smoke and self-test
+first time; every campaign completed. Harness phase 6 to 41 minutes (the 41 was 25 minutes
+of smoke replay, below), whole chain 22 to 92 minutes. The two models converged on the same
+bugs on both targets from separately written harnesses, which is the strongest check of the
+method so far. The chain-review rows are now **[measured]** on Node too: no run noted friction
+with `fuzz.env`, `init_workspace.sh`, `preflight.sh` or `DETACH=1`.
+
+| what the runs hit | fix | tag |
+|---|---|---|
+| `smoke.sh` replayed every saved crash on the real stack one by one: 17 crashes in one site took 7 minutes, 112 in three sites 25 minutes, under a tool call that stops at 10 | one replay per (variant, mode, site); the rest take the representative's class marked "(same site)"; one representative per site handed to `crashers/` | [measured] on a fabricated two-site harness: 18 crashes, 2 replays, same verdict |
+| a seed that crashes both sides during the gate (a finding met early) read `NO-OUTPUT rc=86` with a hint about LD_PRELOAD; an ASAN-only crasher kept in `corpus-final` and picked by the cover failed the asan re-gate the same way | `gate.sh` classes `CRASHES-BOTH` (a finding, excluded from the exit status, banner) and skips seeds present in `crashers/` as `known-crasher` | [measured] with fake harnesses; a genuine fidelity failure still fails |
+| no step wrote the gate corpus; every run on both plugins invented 14 to 65 seeds by hand | new `mkgate.sh` (truncations, deterministic flips, `empty`) plus a step 5 paragraph: one valid sample per entry point and dispatch branch, then the helper, 15 to 40 seeds | [measured] output reproducible by md5 |
+| the glue grep had no `*.c`, so C N-API glue was invisible (`GLUE=[]`, then `grep` reading stdin); questions 2 and 3 ran before `build/` existed; question 4's example throws for a plain `require('./build/Release/x.node')` | `--include='*.c'`, an empty-result guard, `N-API (C)`; the questions moved after the first build; the plain-require case named | [tool] |
+| the oracle was installed unpinned (one run fuzzed a newer version than it meant to) and npm 11 printed an `allowScripts` warning nobody could interpret | `npm install $PKG_NAME@<version>`, check the oracle's addon exists, the warning explained | [tool] |
+| the `PKGDIR` guard accepted `PKG=` when the directory held a `binding.gyp`, which a source-built oracle does | `PKG=` refused under `oracle/` or `node_modules/` | [measured] |
+| `harness_template.cc` said `out_hash=0` when no output while both real templates hash the empty output on success: an empty-payload seed mismatched | one rule: hash on success even when empty; `0` only on the error path with nothing collected | [tool] |
+| the real template's default `errToken` (message, spaces to `_`) embeds the input for any "<text>: <argument>" library, which the skill forbids | `e.code`, else the message up to the first `": "` | [tool]; note the precedence change: a string `code` now beats a numeric `errno` |
+| an API argument with a large value space (an encoding-name pair selecting one of ~150 converters) is neither a MODE nor data; both runs on that shape framed it into the file and asked | step 4: frame such arguments (NUL or newline separated), a MODE is for a handful of entry points | [tool] |
+| two oracle ceilings in string mode: lone surrogates dropped by the string-to-Buffer conversion, and a match that cuts a code point returning U+FFFD | `oracle-ceiling.md` section 2, with the `toWellFormed()` / U+FFFD mapping and `lossy=1` fixes | [measured] by one run, which worked them out by experiment |
+| `init_workspace.sh`'s version WARN listed gemspec paths in a Node workspace and wrote a guessed `REAL` before the real harness existed | per-plugin paths; `REAL` written once the file exists | [measured] |
+| the self-test's auto-picked seed used a different matching engine than the faulted code | the dispatch-branch rule gains "a pattern that selects another engine" | [tool] |
+
+Corpus, campaign and triage rows from the same runs are in those skills' EVIDENCE.md.
+
+## AFL dictionaries (2026-10-08)
+
+| change | tag | evidence |
+|---|---|---|
+| `build_addon.sh` and `link_harness.sh` write `out/<variant>/dict.afl` via `AFL_LLVM_DICT2FILE` (library build and harness TU in separate raw files, deduplicated at link; never for pristine; `AFL_LLVM_DICT2FILE_NO_MAIN=1` for the library build only, because configure test programs keep their constants in `main` while the harness TU wants its input helpers) | **[carried]** | tested on the Ruby plugin (see its EVIDENCE.md): afl-clang-fast 4.33c in PCGUARD mode honours the variable with and without ASAN; the path must be absolute (afl-cc aborts otherwise); `NO_MAIN` also drops static helpers inlined into `main` at -O2, measured on a test extension, so it is off for the harness TU; a relink neither wipes nor piles up entries. Not yet run on a Node target |

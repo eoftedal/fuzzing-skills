@@ -16,13 +16,15 @@
 //   * de-duplication of identical bytes across families.
 //
 //   node gen.mjs OUT=./corpus-derived [MANIFEST=./corpus-derived.manifest.tsv] [ONLY=fam]
+//   With ONLY=fam the default manifest is ${OUT}.manifest.<fam>.tsv, so iterating on one
+//   family does not overwrite the full manifest with that family's rows.
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 const args = Object.fromEntries(process.argv.slice(2).map(a => a.split(/=(.*)/s).slice(0, 2)));
 const OUT      = args.OUT ?? './corpus-derived';
-const MANIFEST = args.MANIFEST ?? `${OUT}.manifest.tsv`;
 const ONLY     = args.ONLY;                       // emit one family, for iterating
+const MANIFEST = args.MANIFEST ?? (ONLY ? `${OUT}.manifest.${ONLY}.tsv` : `${OUT}.manifest.tsv`);
 mkdirSync(OUT, { recursive: true });
 
 // ---- clamps: every value you WRITE goes through one of these -------------------
@@ -97,4 +99,5 @@ for (const c of [0, 1, 2, 50, 255]) emit(`count${c}`, mkrecord({ count: c }), 'r
 
 // ---- 3. manifest, outside the corpus directory ---------------------------------
 writeFileSync(MANIFEST, ['family\tfile\tsize\twhy', ...manifest.map(r => r.join('\t'))].join('\n') + '\n');
-console.log(`${n} seeds -> ${OUT}  (${manifest.length - n} duplicates dropped; manifest: ${MANIFEST})`);
+console.log(`${n} seeds -> ${OUT}  (${manifest.length - n} duplicates dropped; manifest: ${MANIFEST}` +
+            (ONLY ? `, family ${ONLY} only; the full manifest is left as it was)` : ')'));

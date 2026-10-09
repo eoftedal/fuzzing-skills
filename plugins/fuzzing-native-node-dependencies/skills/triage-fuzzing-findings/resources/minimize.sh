@@ -18,8 +18,11 @@
 #     requires the identical execution path and rejected 97 of 112 candidates on an image-
 #     decoding binding's GIF input (0 % reduction).  Without it tmin may wander to a different crash (a stylesheet-compiler
 #     binding: an over-read in one function minimized into one in an unchecked UTF-8 decoder).  So the
-#     result's sanitizer key (kind + function) is compared with the original's, and EXACT
-#     is the retry, not the default.
+#     result's sanitizer key (kind + file + function, line dropped) is compared with the
+#     original's, and EXACT is the retry, not the default.  The key is bucket.sh's, from the
+#     same code: an intercepted call (__asan_memcpy) is keyed on its first project frame.
+#     Keyed on frame #0, a 12-byte over-read in one function minimized to a 1-byte one in
+#     another, both reported at the memcpy interceptor, and the check saw no drift.
 #   * Hangs: afl-tmin -H with a SHORT -t (HANG_S), then the result is re-checked at the full
 #     timeout -- each candidate that keeps hanging costs the whole -t.
 #   * Never trust afl-tmin's exit code: the result must be non-empty, reproduce, and keep its
@@ -27,6 +30,7 @@
 #
 # Products:
 #   OUT/min/<name>    one reproducer per representative, same name as in buckets/
+#   OUT/min/<name>.key  the reproducer's own key, as checked (triage_all.sh flags DRIFT from it)
 #   OUT/amplification.min.tsv   out-of-memory representatives: demanded bytes / MINIMIZED size
 #   OUT/tmin.log      everything afl-tmin said
 #
@@ -36,6 +40,9 @@
 #             subset: representatives CLEAN on every column and entry point keep their
 #             original bytes unless MINIMIZE_ALL=1.
 #   FORK HARNESS_ENV HANGS   default to what screen.sh recorded in OUT/config
+#   LABEL_FORK  the harness the drift check KEYS with (default: OUT/config, else FORK).  A
+#             plain harness prints no sanitizer report, so keying with it checks nothing;
+#             triage_all.sh records the sanitized one bucket.sh labelled with.
 #   TIMEOUT   per-exec timeout in ms for crashes, and the final hang check (default: what
 #             screen.sh recorded in OUT/config, else 5000)
 #   EXEC_PAD_S  start-up seconds added to TIMEOUT (default: OUT/config, else 5)
@@ -48,6 +55,7 @@ OUT=${OUT:-./triage}
 cfg() { sed -n "s/^$1=//p" "$OUT/config" 2>/dev/null; }
 FORK=${FORK:-$(cfg FORK)}; FORK=${FORK:?set FORK, or run screen.sh first so OUT/config has it}
 HARNESS_ENV=${HARNESS_ENV:-$(cfg HARNESS_ENV)}
+LABEL_FORK=${LABEL_FORK:-$(cfg LABEL_FORK)}; LABEL_FORK=${LABEL_FORK:-$FORK}
 HANGS=${HANGS:-$(cfg HANGS)}; HANGS=${HANGS:-0}
 for kv in ${HARNESS_ENV//,/ }; do export "$kv"; done   # several settings may be joined with commas
 REPS=${REPS:-$OUT/buckets}
@@ -66,17 +74,72 @@ reproduces_rc() {
   if [ "$HANGS" = 1 ]; then [ "$1" = 124 ]; else [ "$1" -ge 128 ] || [ "$1" = 86 ]; fi
 }
 run1() { R_OUT=$( { timeout "$EXEC_S" "$FORK" "$1" >/dev/null; } 2>&1 ); R_RC=$?; }
-# The bug's identity, for the drift check: sanitizer kind + function (not the line -- a
-# minimized input may reach the same bug at another line of the same function).
+# Collapse C++ template arguments to <>, innermost first, to a fixpoint (twin of bucket.sh's).
+collapse() {
+  local p=$1 n
+  while :; do n=$(printf '%s' "$p" | sed 's/<[^<>]*>/\x01/g'); [ "$n" = "$p" ] && break; p=$n; done
+  printf '%s' "$p" | sed 's/\x01/<>/g'
+}
+
+# ---- bug key: twin of bucket.sh's copy; keep the two identical (from ICEPTOR to sum_key) ----
+# An INTERCEPTED libc call (memcpy, strlen, ...) is reported by the sanitizer at the
+# interceptor, so the SUMMARY names `__asan_memcpy`, not the code that called it -- and the
+# access size is just the caller's length argument, which changes with the input.  Measured
+# on the image-decoding binding's next major version: one over-read in the PNG stream
+# reader filed as four
+# buckets (READ-8, -1024, -8192, -10660) under an unsymbolized `__asan_memcpy`.  Key on the
+# first frame in project source instead, and drop the size.
+ICEPTOR='__asan_(memcpy|memmove|memset)|__interceptor_|__sanitizer_|(^|[^A-Za-z_:])(memcpy|memmove|memset|memchr|memcmp|strlen|strcpy|strncpy|strcat|strcmp|strncmp|strchr|strstr)$'
+# The faulting stack's project frames, innermost first: "function<TAB>file basename<TAB>line"
+# (line `?` when absent).  Only the first stack (the access, not the allocation); no
+# interceptor, no libc/libstdc++ (/usr/... or a relative csu/ path), no sanitizer runtime.
+frames_of() {  # <sanitizer output>
+  awk '/^ *#0 /{n++} n==1' <<<"$1" \
+    | sed -nE 's#^ *\#[0-9]+ 0x[0-9a-f]+ in (.*) (/[^ :]*)(:([0-9]+))?(:[0-9]+)?$#\1\t\2\t\4#p' \
+    | awk -F'\t' -v ic="$ICEPTOR" '$1 ~ ic || $2 ~ /^\/usr\/|compiler-rt|sanitizer_common/ {next}
+        {f=$2; sub(/.*\//,"",f); print $1 "\t" f "\t" ($3=="" ? "?" : $3)}'
+}
+# "kind @ file:line in function", file a basename and line `?` when the SUMMARY has none;
+# an interceptor's report keyed on its first project frame, "[via <interceptor>]" appended.
+# Empty when there is no SUMMARY line.  No access size: the caller adds it.
+sum_key() {  # <sanitizer output>
+  local out=$1 key ifn site sfn sfile sline
+  key=$(sed -nE 's#.*SUMMARY: [A-Za-z]*Sanitizer: ([A-Za-z-]+) ([^ (][^ ]*/)?([A-Za-z0-9_.+-]+)(:([0-9]+))?(:[0-9]+)? in (.*)#\1 @ \3:\5 in \7#p' <<<"$out" \
+        | sed -E 's/^([A-Za-z-]+ @ [^ ]*): in /\1:? in /' | head -1)
+  [ -z "$key" ] && key=$(sed -n 's/.*SUMMARY: [A-Za-z]*Sanitizer: \(.*\)/\1/p' <<<"$out" | head -1)
+  [ -n "$key" ] || return 0
+  ifn=$(sed -n 's/.* in \(.*\)$/\1/p' <<<"$key" | head -1)
+  if [ -n "$ifn" ] && grep -qE "$ICEPTOR" <<<"$ifn"; then
+    site=$(frames_of "$out" | head -1)
+    if [ -n "$site" ]; then
+      IFS=$'\t' read -r sfn sfile sline <<<"$site"
+      key="${key%% *} @ $sfile:$sline in $sfn [via $ifn]"
+    fi
+  fi
+  key=$(collapse "$key")
+  # Strip build-specific noise: a BuildId and the absolute path of the harness say nothing
+  # about the bug and make the report table unreadable.  An unsymbolized frame keeps its
+  # offset and, crucially, its function name.
+  sed -e 's/ *(BuildId: [0-9a-f]*)//g' -e 's#(/[^ )]*/\([^/ )]*\)+0x#(\1+0x#g' <<<"$key"
+}
+# ---- end of the twin ----
+# The bug's identity, for the drift check: bucket.sh's key without the line (a minimized
+# input may reach the same bug at another line of the same function).
 key_of() {
-  ASAN_OPTIONS="${ASAN_OPTIONS/symbolize=0/symbolize=1}" timeout "$EXEC_S" "$FORK" "$1" 2>&1 >/dev/null \
-    | sed -n 's#.*SUMMARY: [A-Za-z]*Sanitizer: \([a-z-]*\) .* in \([^(]*\).*#\1 in \2#p' | head -1
+  local out
+  out=$(ASAN_OPTIONS="${ASAN_OPTIONS/symbolize=0/symbolize=1}" timeout "$EXEC_S" "$LABEL_FORK" "$1" 2>&1 >/dev/null)
+  sum_key "$out" | sed -E 's/^([A-Za-z-]+ @ [^ ]*):[0-9?]+ in /\1 in /'
 }
 verified() {  # <candidate> <original key> -> 0 if non-empty, reproduces, same bug
   [ -s "$1" ] || return 1
   run1 "$1"; reproduces_rc "$R_RC" || return 1
   [ "$HANGS" = 1 ] && return 0
   [ "$(key_of "$1")" = "$2" ]
+}
+keyfile() {  # <reproducer> -> <reproducer>.key: its own key, or why it has none
+  local k=""
+  if [ "$HANGS" = 1 ]; then k="(hang: not keyed)"; else k=$(key_of "$1"); fi
+  printf '%s\n' "${k:-(no sanitizer report from $(basename "$LABEL_FORK"))}" > "$1.key"
 }
 capof() { awk -F'\t' -v n="$1" '$1==n{print $2; exit}' "$OUT/cap.tsv" 2>/dev/null; }
 
@@ -87,6 +150,7 @@ TL="$OUT/tmin.log"; : > "$TL"
 if [ "$HANGS" = 1 ]; then TMIN_T=$(( HANG_S * 1000 )); HFLAG=(-H); else TMIN_T=$TIMEOUT; HFLAG=(); fi
 n=$(ls "$REPS" | grep -c .); i=0; nfree=0; nexact=0; nkept=0
 ts "== minimize $n representative(s) from $REPS with afl-tmin${HARNESS_ENV:+ under $HARNESS_ENV} =="
+[ "$LABEL_FORK" != "$FORK" ] && ts "  drift check keyed with $LABEL_FORK"
 for c in "$REPS"/*; do
   [ -f "$c" ] || continue
   name=$(basename "$c"); pname=${name#??????-}          # bucket files are <6 hex>-<pool name>
@@ -96,7 +160,7 @@ for c in "$REPS"/*; do
   # Can this harness take its input through /dev/stdin?  If not, afl-tmin cannot be fed.
   if { timeout "$EXEC_S" "$FORK" /dev/stdin <"$c" >/dev/null; } 2>/dev/null; then rc=0; else rc=$?; fi
   if ! reproduces_rc "$rc"; then
-    cp "$c" "$dst"; nkept=$((nkept+1))
+    cp "$c" "$dst"; nkept=$((nkept+1)); keyfile "$dst"
     ts "    harness does not reproduce it through /dev/stdin (rc=$rc): afl-tmin cannot be steered; original kept"
     continue
   fi
@@ -117,7 +181,10 @@ for c in "$REPS"/*; do
     exact) nexact=$((nexact+1));;
     *)     cp "$c" "$dst"; nkept=$((nkept+1)); ts "    afl-tmin produced no verified reproducer; original kept (see $TL)";;
   esac
+  keyfile "$dst"
   ts "    $(wc -c <"$c") B -> $(wc -c <"$dst") B${how:+ ($how)}${okey:+  key: $okey}"
+  [ "$(cat "$dst.key")" = "${okey:-(no sanitizer report from $(basename "$LABEL_FORK"))}" ] || [ "$HANGS" = 1 ] \
+    || ts "    WARN: the kept reproducer's key is now '$(cat "$dst.key")' (nondeterministic report?)"
   run1 "$dst"
   hex=$(sed -n 's/.*\(trying\|failed\) to allocate 0x\([0-9a-f]*\) bytes.*/\2/p' <<<"$R_OUT" | head -1)
   if [ -n "$hex" ]; then

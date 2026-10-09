@@ -25,7 +25,7 @@ grep -nE 'extras|ignored|skip|whitespace|comment' <grammar file>
 ## Constants: which part of the output matters depends on the code's age
 
 ```sh
-resources/enumerate_constants.sh src/parser.c | head -40
+$RC/enumerate_constants.sh src/parser.c | head -40
 ```
 
 Hand-rolled parsers compare against literals, and the literal histogram *is* the axis
@@ -44,6 +44,14 @@ contained only one.
 For each field emit **every accepted value, every explicitly rejected value, one
 unlisted value** (the `default:` arm), and **the boundary either side** of every range
 check.
+
+**Only when the value selects a branch.** Names looked up in one table by one loop
+(Unicode property names, script names) are data: the lookup runs the same code for every
+name, and on a Node binding 516 seeds for them bought 11 edges. A table of **function
+pointers**, one converter or handler per name, is the opposite: each name selects its own
+code, so the name list is an axis and wants one seed per entry. Read what the table holds
+before deciding (`grep -n '{ *"[a-z0-9_-]*", *[a-z_]*,' src/`: a string beside a function
+name is a dispatch table).
 
 ## The option axis: flags and modes gate whole subsystems
 
@@ -68,9 +76,29 @@ different settings: validation, recovery, entity substitution, a second grammar.
 * **Expect a near-null result sometimes.** Measure it, then move on.
 
 Keep seeds that need a particular setting in their **own corpus directory** (the setting
-applies to a whole run), sweep with `resources/sweep.sh`, and **sweep the baseline over
+applies to a whole run), sweep with `$RC/sweep.sh`, and **sweep the baseline over
 the same settings** or the two numbers are not comparable. The harness's own `getenv`
 names are the same axis: `grep -n getenv harness.cc` is the whole discovery step.
+
+## Several modes: how each script handles them
+
+A harness with several entry points (`MODE=` settings, from the harness skill) is one
+corpus measured several times. `measure.sh` runs in one environment, so
+`sweep.sh SWEEP='MODE=... MODE=...'` is how you measure every mode. It writes the per-seed
+union, `maps_<base>_union/`, and names the per-mode directories `maps_<base>_default` and
+`maps_<base>_MODE_compress` (`=` becomes `_`); the current environment is always included,
+so do not list it in `SWEEP`.
+
+* `compare.sh` takes the unions.
+* `minimise.sh MODES=` keeps a candidate that adds an edge in **any** mode, and `HAVE=`
+  takes every per-mode map directory (it refuses one that does not exist).
+* `cover.sh MAPS=` takes several directories and unions each seed's maps, so the cover is
+  not biased to the default mode.
+* The seed policy and the final gate loop over modes (SKILL.md step 7).
+
+A setting is not a seed byte, so a mode-dependent corpus is still one directory: the
+campaign skill runs one campaign per mode (`campaign.sh MODES=`) over the same
+`corpus-final/`.
 
 ## Parallel implementations
 

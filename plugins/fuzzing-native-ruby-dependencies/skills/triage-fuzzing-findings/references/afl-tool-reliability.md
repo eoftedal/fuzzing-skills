@@ -2,7 +2,7 @@
 
 Read this if `triage/min/` looks wrong, if afl-tmin seems to do nothing, or before
 believing a minimized reproducer. The rule behind every choice here: **the skill steers the
-tools — how they are fed, how strict they are, what counts as success — and never
+tools (how they are fed, how strict they are, what counts as success) and never
 reimplements them.** Everything below was measured in the Node sibling plugin, on harnesses
 around Node bindings, with AFL++ 4.33c, aarch64, container kernel 6.12, Python 3.14. The
 behaviour is AFL++'s, not the binding's, so it applies to a Ruby C extension harness
@@ -20,8 +20,8 @@ direct:            [child] argc=2 argv1=in n=4 b0=C          -> SIGSEGV
 under afl-tmin @@: [child] argc=2 argv1=./.afl-tmin-temp-6589 n=0 b0=.
 ```
 
-afl-tmin's temp file reaches the harness **empty** — with `@@` and with an explicit `-f`
-alike — so every candidate "terminates normally". afl-fuzz (`.cur_input`) and afl-showmap
+afl-tmin's temp file reaches the harness **empty**, with `@@` and with an explicit `-f`
+alike, so every candidate "terminates normally". afl-fuzz (`.cur_input`) and afl-showmap
 deliver the same bytes to the same binaries correctly, and the forkserver does not use
 shared-memory testcases (`Forkserver options received: (0x00000001)`), so this is afl-tmin's
 file delivery. There is no environment switch for it.
@@ -47,7 +47,13 @@ minimized into one in an unchecked UTF-8 decoder.
 So `minimize.sh` lets afl-tmin minimize freely, compares the result's sanitizer key (kind +
 function, not line) with the original's, and only on drift re-runs with `AFL_TMIN_EXACT=1`.
 On the stylesheet-compiler Node binding's 6 representatives: 5 minimized freely, 1 drifted and was recovered by the
-EXACT retry, 0 kept as original — 7 seconds for all six.
+EXACT retry, 0 kept as original: 7 seconds for all six.
+
+Drift is judged on the **first non-interceptor frame**: a report whose frame #0 is an ASAN
+interceptor (`__asan_memcpy`, `strlen`) keys on the caller, since every over-read through
+`memcpy` would otherwise share one key. A result whose key still differs after the EXACT
+retry is marked `DRIFT` in `triage/REPORT.md`: the minimized file is another bug's
+reproducer, so the report gives the original bytes.
 
 ## afl-tmin's exit code means nothing
 
@@ -69,7 +75,7 @@ For scale: shrinking one real 252-byte hang in a stylesheet-compiler Node bindin
 ## afl-cmin is not used, and the Python one hangs
 
 `afl-cmin` ships twice. The Python rewrite dies in a forkserver worker
-(`TypeError: array() argument 1 must be a unicode character, not None` — a module global
+(`TypeError: array() argument 1 must be a unicode character, not None`: a module global
 set only in the parent; Python 3.14 defaults multiprocessing to forkserver) and the parent
 then waits forever at 0 % CPU. `afl-cmin.bash` works: `-C` on a 38-crash pool from an image-decoding Node binding kept
 15, all of which crash.
@@ -87,4 +93,29 @@ it can see). Bucketing needs `symbolize=1` to read the SUMMARY line. `bucket.sh`
 occurrence): running steps in one shell used to leave `symbolize=0` behind and every bucket
 key degraded to `heap-buffer-overflow (harness-fork+0x152744) (BuildId: ...)`. The
 allocation ceiling and `allocator_may_return_null=1` are forced too, per input, from
-`cap.tsv` — the key must describe the crash as screened.
+`cap.tsv`: the key must describe the crash as screened.
+
+## Do not hand-minimize past afl-tmin
+
+On the Node sibling, a stack-exhaustion reproducer resisted manual reduction. The obvious
+mechanism (deep nesting) was guarded; the real one was unbounded recursion during
+evaluation, past the guard. A hand-reduced input that still crashes may crash for another
+reason; afl-tmin's result is checked against the key, a hand edit is not.
+
+## Which build reproduces
+
+Discovery mode starts each campaign on the harness of the build that produced it, then
+offers what does not reproduce to the other builds and each harness mode. Measured on the
+Node sibling over 161 real crashes:
+
+| campaign (Node bindings) | both builds | ASAN only | plain only | neither |
+|---|---|---|---|---|
+| stylesheet-compiler binding, plain (13) | 13 | 0 | 0 | 0 |
+| stylesheet-compiler binding, ASAN (111) | 0 | **111** | 0 | 0 |
+| image-decoding binding, plain (37) | 25 | **2** | 0 | 10 |
+
+An ASAN campaign minimized against the plain build loses everything, because 1-2 byte
+over-reads are invisible without the sanitizer. Not one input crashed the plain build
+alone. The two crashes that only ASAN reproduces came from the *plain* campaign, which is
+why stopping at the producing build was not enough. The 10 that reproduce nowhere are
+fork-mode non-reproducers (persistent-mode artifacts), not crashes of the other variant.

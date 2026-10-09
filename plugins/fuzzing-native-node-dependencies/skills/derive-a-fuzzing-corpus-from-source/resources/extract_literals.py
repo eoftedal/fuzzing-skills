@@ -31,7 +31,9 @@ in the binding's repo hints it exists.
 Handles what actually bites: C and JS escapes including \\xNN, \\NNN octal, \\uNNNN and
 \\u{...}; line continuations; both quote styles; and ADJACENT LITERAL CONCATENATION, which
 is how multi-line documents are written in C test suites. Comments between adjacent
-literals are tolerated.
+literals are tolerated. JS template literals (backticks) are one literal each, may span
+lines and use the same escapes; quotes inside one are part of its text, not literals.
+A ${...} interpolation is dropped and the text around it joined: its value only exists at run time.
 """
 import os, re, sys, glob
 
@@ -103,6 +105,56 @@ def unescape(text, lang):
         out.extend(n.encode('utf-8', 'surrogatepass')); i += 2
     return bytes(out)
 
+# a regex literal at the scanner's position, skipped so a quote or backtick in it opens nothing
+JSRE_AT = re.compile(r'/(?![/*])(?:[^/\\\n\[]|\\.|\[(?:[^\]\\\n]|\\.)*\])+/[gimsuyd]*')
+
+def js_templates(text):
+    """-> (template literal texts with ${...} removed, text with those texts masked out).
+    Comments, quoted strings and regex literals are skipped so a backtick in them opens nothing;
+    code inside an interpolation is scanned too, so a nested template is found as its own literal."""
+    n, found, spans = len(text), [], []
+    def code(i, inside):          # -> index after the interpolation's closing } (or the end)
+        braces, last = 0, ''
+        while i < n:
+            c = text[i]
+            if c in ' \t\r\n': i += 1; continue
+            if text.startswith('//', i): j = text.find('\n', i); i = n if j < 0 else j; continue
+            if text.startswith('/*', i): j = text.find('*/', i + 2); i = n if j < 0 else j + 2; continue
+            if c in '"\'':
+                j = i + 1
+                while j < n and text[j] not in (c, '\n'): j += 2 if text[j] == '\\' else 1
+                i, last = j + 1, c; continue
+            if c == '/' and (last == '' or last in '(,=:[!&|?{};'):
+                m = JSRE_AT.match(text, i)
+                if m: i, last = m.end(), '/'; continue
+            if c == '`': i, last = template(i), c; continue
+            if c == '{': braces += 1
+            elif c == '}':
+                if inside and braces == 0: return i + 1
+                braces -= 1
+            i, last = i + 1, c
+        return n
+    def template(i):              # i at the opening backtick -> index after the closing one
+        parts, a, j, s = [], i + 1, i + 1, i
+        while j < n:
+            c = text[j]
+            if c == '\\': j += 2; continue
+            if c == '`': break
+            if text.startswith('${', j):
+                parts.append(text[a:j]); spans.append((s, j + 2))
+                j = code(j + 2, True); a, s = j, j - 1    # the closing } is masked with the text
+                continue
+            j += 1
+        j = min(j, n)
+        parts.append(text[a:j]); spans.append((s, min(j + 1, n)))
+        found.append(''.join(parts))
+        return j + 1
+    code(0, False)
+    out, k = [], 0
+    for a, b in sorted(spans):    # each masked piece becomes one backtick, which ends a run
+        out.append(text[k:a] + '`'); k = b
+    return found, ''.join(out) + text[k:]
+
 # one literal, either quote style, escapes allowed; then runs of adjacent literals
 LIT = r'"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\''
 RUN = re.compile(rf'(?:{LIT}|\s|/\*.*?\*/|//[^\n]*\n)+', re.S)
@@ -116,7 +168,9 @@ for src in srcs:
     except OSError as e:
         print(f'skip {src}: {e}', file=sys.stderr); continue
     read_ok += 1
-    cands = [(''.join(p[1:-1] for p in ONE.findall(run.group(0))), False) for run in RUN.finditer(text)]
+    tmpls, quoted = js_templates(text) if lang == 'js' else ([], text)
+    cands = [(''.join(p[1:-1] for p in ONE.findall(run.group(0))), False) for run in RUN.finditer(quoted)]
+    cands += [(t, False) for t in tmpls]           # a template literal is one literal, never joined
     if JSREGEX and lang == 'js':
         cands += [(m.group(1)[1:-1], True) for m in JSRE.finditer(text)]
     for joined, is_regex in cands:

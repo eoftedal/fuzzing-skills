@@ -21,6 +21,8 @@
 //                 no try/catch can stop.  NOT a clean run.
 //   SKIPPED (30)  the input asked the JS layer to allocate more than ALLOC_CEIL, so this
 //                 run proves nothing either way.  Re-run with ALLOC_CEIL raised.
+//   ERROR   (40)  no such ENTRY.  (41) PKG is not PKG_VERSION (`version-mismatch=got!=want`):
+//                 a confirmation against another release says nothing about the harnessed one.
 //
 // A NATIVE crash (SIGSEGV/SIGABRT/SIGBUS, or an ASAN abort) kills node before ANY of these
 // can run and before this file prints anything.  No JavaScript handler -- not try/catch,
@@ -89,6 +91,16 @@ for (const fn of ['allocUnsafe', 'alloc', 'allocUnsafeSlow']) {
 
 // `require`, NOT `await import(PKG)`: PKG is a DIRECTORY, ESM has no directory resolution,
 // and import() would bypass the CJS loader the addon travels through.
+// The version you harnessed (confirm.sh passes PKG_VERSION from fuzz.env): checked before
+// the package loads, so a stale or newer install cannot answer for it.
+if (process.env.PKG_VERSION) {
+  let got = 'unreadable';
+  try { got = require(path.resolve(PKG, 'package.json')).version; } catch {}
+  if (got !== process.env.PKG_VERSION) {
+    process.stdout.write(`verdict=ERROR version-mismatch=${got}!=${process.env.PKG_VERSION}\n`);
+    process.exit(41);
+  }
+}
 const ns  = require(PKG);
 const lib = ns && ns.default ? ns.default : ns;
 const tok = (e) => String(e && (e.code ?? e.message) || e).replace(/\s+/g, '_').slice(0, 60);
@@ -111,9 +123,10 @@ const expressible = Buffer.from(buf.toString('utf8'), 'utf8').equals(buf) && !bu
 // Buffer.  That path is not a formality: 25 of a stylesheet-compiler binding's 111
 // confirmed crashes were reachable ONLY through its file-path entry point, because the
 // binding's string entry point replaces invalid UTF-8 with U+FFFD before the library sees a byte.
-const asFile = (ext = '') => {
+// Same signature as in real_harness.mjs, so a pasted `file` arm works unchanged.
+const asFile = (b, ext = '') => {
   const p = path.join(mkdtempSync(path.join(os.tmpdir(), 'confirm-')), 'input' + ext);
-  writeFileSync(p, buf); return p;
+  writeFileSync(p, b); return p;
 };
 
 let done = false;
@@ -123,8 +136,10 @@ const finish = (v, code, extra = '') => {
              : swappedFrom.size === 0        ? 'NOT-SWAPPED'
              : (swappedFrom.size > 1 && !ADDON_MAP.length) ? 'AMBIGUOUS-SWAP'
              : 'swapped';
+  // no ADDON: `loaded=` names the install's own addon; say no swap was asked for
+  const ld = (loaded.join(',') || 'none') + (swap === 'absent' ? ' (no swap requested)' : '');
   process.stdout.write(`verdict=${v} entry=${process.env.ENTRY || 'default'} ` +
-    `addon=${swap} loaded=${loaded.join(',') || 'none'} expressible=${expressible ? 1 : 0}${extra}\n`);
+    `addon=${swap} loaded=${ld} expressible=${expressible ? 1 : 0}${extra}\n`);
   process.exit(code);
 };
 // These fire only when nothing at the call site caught it.  They rank as UNCAUGHT, below
@@ -175,20 +190,24 @@ setTimeout(() => finish('HANG', 25, ` note=no-answer-in-${process.env.TIMEOUT_MS
 // idiom and the one image-decoding bindings use -- the error IS delivered to a callback the consumer
 // supplied, so it is CAUGHT (a consumer who wires onerror is safe), not UNCAUGHT and
 // certainly not HANG.  `errback`/`okback` below are those two arms.
+//
+// PASTE real_harness.mjs's ENTRIES object here as is: each arm is called as arm(buf), with
+// the same unpooled Buffer, and asFile(b, ext) is the same helper.  errback and okback exist
+// only here; use them in an arm that answers through callbacks.
 const errback = (e) => finish('CAUGHT', 10, ` via=callback err=${tok(e)}`);
 const okback  = (r) => finish('CLEAN', 0, ` evidence=${describe(r)}`);
 const ENTRIES = {
-  default: () => lib.doTheThing(buf),
+  default: (b) => lib.doTheThing(b),
   // Uncomment / adapt the arms the package actually has, and confirm each:
-  // file:  () => lib.doTheThingFromFile(asFile('.ext')),   // the RAW-BYTE path
-  // async: () => lib.doTheThingAsync(buf),                 // libuv threadpool, own stack
-  // callback: () => { const obj = new lib.Thing();         // the callback-property shape
-  //                   obj.onerror = errback;               // the consumer's own handler
-  //                   obj.onload  = () => okback(obj);
-  //                   obj.src = buf; },                    // returns undefined
-  // stream: () => { const s = lib.createStream();          // NO .on('error')
-  //                 s.on('data', () => {}); s.on('end', () => okback('stream-end'));
-  //                 s.end(buf); },
+  // file:  (b) => lib.doTheThingFromFile(asFile(b)),        // the RAW-BYTE path
+  // async: (b) => lib.doTheThingAsync(b),                   // libuv threadpool, own stack
+  // callback: (b) => { const obj = new lib.Thing();         // the callback-property shape
+  //                    obj.onerror = errback;               // the consumer's own handler
+  //                    obj.onload  = () => okback(obj);
+  //                    obj.src = b; },                      // returns undefined
+  // stream: (b) => { const s = lib.createStream();          // NO .on('error')
+  //                  s.on('data', () => {}); s.on('end', () => okback('stream-end'));
+  //                  s.end(b); },
 };
 // ---------------------------------------------------------------------------------------
 
@@ -197,7 +216,7 @@ const call = ENTRIES[entry];
 if (!call) { process.stdout.write(`verdict=ERROR no-such-entry=${entry}\n`); process.exit(40); }
 
 try {
-  const result = call();
+  const result = call(buf);
   if (result && typeof result.then === 'function') {
     result.then((r) => finish('CLEAN', 0, ` evidence=${describe(r)}`),
                 (e) => finish('CAUGHT', 10, ` err=${tok(e)}`));

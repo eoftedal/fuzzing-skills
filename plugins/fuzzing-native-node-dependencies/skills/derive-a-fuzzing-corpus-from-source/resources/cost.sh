@@ -1,17 +1,21 @@
 #!/bin/bash
 # Per-seed execution cost, to find the few seeds that dominate a campaign.
-#   HARNESS=./out/plain/harness-fork CORPUS=./corpus [REPS=20] [TIMEOUT=5] ./cost.sh
+#   HARNESS=./out/plain/harness-fork CORPUS=./corpus [REPS=20] [TIMEOUT=5] [SLOW_MS=1000] ./cost.sh
 #
 # TIMEOUT (seconds, default 5) bounds each run; a seed that exceeds it is listed as
 # `hang` (not timed further) and counted at the end.
+#
+# SLOW_MS (default 1000): seeds whose per-seed work exceeds it are listed after the
+# ranking.  afl-fuzz calibrates its exec timeout far below a second, so the campaign
+# drops them silently under AFL_IGNORE_SEED_PROBLEMS.
 #
 # Each run is one fork+exec, which costs far more than the parse itself, so the raw
 # number is useless on its own.  An empty input is measured first as the startup
 # baseline and subtracted; what remains is the per-seed work.  Treat it as a ranking,
 # not an absolute -- for absolute numbers, time the parse in-process.
 set -uo pipefail
-for kv in "$@"; do export "$kv"; done
-: "${HARNESS:?set HARNESS}" "${CORPUS:?set CORPUS}" "${REPS:=20}" "${TIMEOUT:=5}"
+for kv in "$@"; do case $kv in *=*) export "$kv";; esac; done
+: "${HARNESS:?set HARNESS}" "${CORPUS:?set CORPUS}" "${REPS:=20}" "${TIMEOUT:=5}" "${SLOW_MS:=1000}"
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 : > "$T/empty"
 run() { local f=$1 s e i rc; s=$(date +%s%N)
@@ -35,3 +39,10 @@ done | sort -rn > "$T/rows"
 echo "hangs: $(cat "$T/hangs" 2>/dev/null | wc -l) (over TIMEOUT=${TIMEOUT}s; listed first)"
 printf '%10s %10s  %s\n' "us-work" "bytes" "seed"
 cat "$T/hangs" "$T/rows" 2>/dev/null
+awk -v us=$((SLOW_MS * 1000)) '$1 > us' "$T/rows" > "$T/slow"
+echo "slow seeds (over SLOW_MS=${SLOW_MS} ms of work): $(wc -l < "$T/slow")"
+if [ -s "$T/slow" ]; then
+  cat "$T/slow"
+  echo "  afl-fuzz calibrates its exec timeout far below this, and the campaign's AFL_IGNORE_SEED_PROBLEMS"
+  echo "  drops such seeds silently (see seeds_loaded in campaigns/manifest.tsv): move them to hangs/ or cap their declared work."
+fi

@@ -7,10 +7,15 @@
 #   logging) is ignored, and a side that prints no such line is judged NO-OUTPUT.
 #
 # Configure with KEY=VALUE arguments or environment variables:
+#   WORKSPACE   the fuzz workspace (default .): its fuzz.env, when present, is sourced
+#               first (init_workspace.sh writes it), so arguments still override it
 #   DIRECT      command for the direct harness; the input path is appended
-#   REAL        command for the real stack;      the input path is appended
+#   REAL        command for the real stack;      the input path is appended.  When it is
+#               not an argument, DIRECT is sanitized and fuzz.env has REAL_ASAN, that is used
+#   REAL_ASAN   the sanitized real-side command (fuzz.env); see the rule above
 #   CORPUS      directory of seeds
-#   FIELDS      keys that must match exactly          (default: status)
+#   FIELDS      keys that must match exactly          (default: status).  Without out_hash
+#               the gate WARNs: matching status alone says nothing about the artifact
 #   ARM_FIELD   key whose distinct values are the "arms" (default: status)
 #   MIN_ARMS    distinct ARM_FIELD values required    (default: 2; 1 for a target
 #               that cannot reject its input, e.g. a compressor or serialiser)
@@ -43,10 +48,27 @@
 #             FIELDS="status err out_len out_hash" SOFT_FIELD=lossy SOFT_DROP="out_len out_hash" \
 #             MODES="MODE=file"
 #
+# Seeds the gate sets aside (reported, never a FAIL):
+#   known-crasher  a seed whose basename is also in $WORKSPACE/crashers/ (an ASAN-only
+#                  crasher the corpus skill kept in corpus-final, a smoke finding): skipped
+#                  unjudged, so a re-gate over corpus-min needs no hand-filtered copy
+#   CRASHES-BOTH   the direct side exited 86 or on a signal AND so did the real side (or its
+#                  stderr holds "Sanitizer:"): a finding met during the gate, not a fidelity
+#                  failure.  Printed prominently; move it to crashers/ (with a row in
+#                  crashers.summary.tsv) and out of the gate corpus
+#
 # Exit status is 0 only when every check passes in every mode, so it can gate a build script.
 set -uo pipefail
-for kv in "$@"; do case $kv in *=*) export "$kv";; esac; done
+for kv in "$@"; do case $kv in WORKSPACE=*) WORKSPACE=${kv#*=};; esac; done
+WS=${WORKSPACE:-.}; [ -f "$WS/fuzz.env" ] && { set -a; . "$WS/fuzz.env"; set +a; }
+REAL_ARG=0
+for kv in "$@"; do case $kv in REAL=*) REAL_ARG=1;; esac; case $kv in *=*) export "$kv";; esac; done
 DIRECT=${DIRECT:?set DIRECT}
+# a sanitized DIRECT against a plain real side calls every library abort DIRECT-only
+if [ "$REAL_ARG" = 0 ] && [ -n "${REAL_ASAN:-}" ] && grep -qa __asan_report_load "${DIRECT%% *}" 2>/dev/null; then
+  REAL=$REAL_ASAN; echo "real side: REAL_ASAN from fuzz.env (DIRECT is sanitized): $REAL"
+else src="fuzz.env or environment"; [ "$REAL_ARG" = 1 ] && src=argument
+  echo "real side: REAL from $src: ${REAL:-}"; fi
 REAL=${REAL:?set REAL}
 CORPUS=${CORPUS:?set CORPUS}
 FIELDS=${FIELDS:-status}
@@ -58,13 +80,16 @@ MODES=${MODES:-}
 JOBS=${JOBS:-8}
 ALLOC_CAP_MB=${ALLOC_CAP_MB:-1024}
 export AFL_MAP_SIZE=${MAP_SIZE:-131072}
+KNOWN=""; [ -d "$WS/crashers" ] && KNOWN=$(cd "$WS/crashers" && pwd)
 # A harness that keeps one-time state (a shared context created in init) trips
 # LeakSanitizer at exit and prints nothing; the leak is not what the gate tests.  The
 # allocation ceiling matches the campaign's, so declared-size seeds fail identically on both
 # sides (ASAN's default is to abort with "allocation-size-too-big" and print no result line).
-export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:exitcode=86:allocator_may_return_null=1:max_allocation_size_mb=$ALLOC_CAP_MB}"
+# Appended after any inherited value, never replaced by it: an inherited ASAN_OPTIONS used to
+# drop these silently (later options win in ASAN's parser).
+export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0:exitcode=86:allocator_may_return_null=1:max_allocation_size_mb=$ALLOC_CAP_MB"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-export DIRECT REAL FIELDS ARM_FIELD SOFT_FIELD SOFT_DROP TMP
+export DIRECT REAL FIELDS ARM_FIELD SOFT_FIELD SOFT_DROP TMP KNOWN
 
 first_err() { grep -m1 -E 'ERROR:|Error|error|Cannot|SUMMARY' "$1" | cut -c1-110; }
 # keys come from the result line only, so stray stdout logging cannot supply one
@@ -83,6 +108,10 @@ judge() {
   if marker=$(grep -m1 -oE 'AFL-HARNESS-(STUB|RUBYPATH):.*' "$err"); then
     printf 'BINDING\t%s\t\t%s\n' "$n" "$marker"; return; fi
   r=$(timeout 30 $REAL "$f" 2>"$rerr"); nrc=$?
+  # 86 = ASAN's exitcode here; >128 a signal (124 is the timeout, 137 its KILL: not crashes)
+  if { [ "$drc" = 86 ] || { [ "$drc" -gt 128 ] && [ "$drc" != 137 ]; }; } \
+     && { [ "$nrc" = 86 ] || { [ "$nrc" -gt 128 ] && [ "$nrc" != 137 ]; } || grep -q 'Sanitizer:' "$rerr"; }; then
+    printf 'CRASHES-BOTH\t%s\t\tdirect rc=%s, real rc=%s: %s\n' "$n" "$drc" "$nrc" "$(grep -h -m1 -oE 'Sanitizer: [^ ]+' "$err" "$rerr" | head -1)"; return; fi
   # (rc=124 means the 30 s timeout fired: a hang, named like any other no-output seed.)
   # A seed with no output is the interesting case: a sanitizer abort on one side (a real
   # finding) or a broken real-side command (a wrong EXT= path).  Say which.
@@ -91,7 +120,8 @@ judge() {
   if ! grep -qE '(^| )status=' <<<"$d"; then printf 'NO-OUTPUT\t%s\t\tdirect printed no result line (status=...), rc=%s: %s\n' "$n" "$drc" "$(first_err "$err")"; return; fi
   if ! grep -qE '(^| )status=' <<<"$r"; then printf 'NO-OUTPUT\t%s\t\treal printed no result line (status=...), rc=%s: %s\n' "$n" "$nrc" "$(first_err "$rerr")"; return; fi
   local arm; arm=$(get "$d" "$ARM_FIELD")
-  if [ "$(key "$d")" = "$(key "$r")" ]; then printf 'AGREED\t%s\t%s\t\n' "$n" "$arm"
+  # AGREED carries its out_hash in the detail column: one hash for every seed is a vacuous gate
+  if [ "$(key "$d")" = "$(key "$r")" ]; then printf 'AGREED\t%s\t%s\t%s\n' "$n" "$arm" "$(get "$d" out_hash)"
   elif [ -n "$SOFT_FIELD" ] && [ "$(get "$r" "$SOFT_FIELD")" = 1 ] \
        && [ "$(key "$d" "$SOFT_DROP")" = "$(key "$r" "$SOFT_DROP")" ]; then
     printf 'LIMITED\t%s\t%s\t\n' "$n" "$arm"
@@ -101,8 +131,12 @@ judge() {
 }
 export -f first_err get key judge
 
-seeds() { find "$CORPUS" -maxdepth 1 -type f -print0 | sort -z; }
+# a seed whose name is in crashers/ is a known crasher: listed, never judged or mapped
+allseeds() { find "$CORPUS" -maxdepth 1 -type f -print0 | sort -z; }
+isknown() { [ -n "$KNOWN" ] && [ -e "$KNOWN/$(basename "$1")" ]; }
+seeds() { allseeds | while IFS= read -r -d '' f; do isknown "$f" || printf '%s\0' "$f"; done; }
 NSEEDS=$(seeds | tr -cd '\0' | wc -c)
+NKNOWN=$(allseeds | while IFS= read -r -d '' f; do isknown "$f" && echo; done | wc -l)
 
 one_mode() {   # runs the whole gate in the current environment; prints and returns its status
   echo "== 1+2. every seed reaches the library, and agrees with the real stack =="
@@ -110,12 +144,24 @@ one_mode() {   # runs the whole gate in the current environment; prints and retu
   awk -F'\t' '$1=="BINDING"  {printf "  BINDING     %-34s %s\n", $2, $4}
               $1=="NO-OUTPUT"{printf "  NO-OUTPUT   %-34s %s\n", $2, $4}
               $1=="MISMATCH" {split($4, kv, " real="); printf "  MISMATCH    %-34s\n     direct=%s\n     real  =%s\n", $2, substr(kv[1], 8), kv[2]}' "$TMP/judged"
-  local ok mism limited empty stub
+  local ok mism limited empty stub both
   ok=$(grep -c '^AGREED' "$TMP/judged"); limited=$(grep -c '^LIMITED' "$TMP/judged")
   mism=$(grep -c '^MISMATCH' "$TMP/judged"); empty=$(grep -c '^NO-OUTPUT' "$TMP/judged")
-  stub=$(grep -c '^BINDING' "$TMP/judged")
-  echo "  agreed=$ok  oracle-limited=$limited  mismatched=$mism  no-output=$empty  entered-binding=$stub"
-  if [ "$empty" = "$NSEEDS" ] && [ "$empty" -gt 0 ]; then
+  stub=$(grep -c '^BINDING' "$TMP/judged"); both=$(grep -c '^CRASHES-BOTH' "$TMP/judged")
+  echo "  agreed=$ok  oracle-limited=$limited  mismatched=$mism  no-output=$empty  entered-binding=$stub  crashes-both=$both  known-crasher=$NKNOWN"
+  [ "$NKNOWN" -gt 0 ] && echo "  ($NKNOWN seed(s) skipped as known-crasher: the same name is in $KNOWN/)"
+  if [ "$both" -gt 0 ]; then
+    echo "  !!!!!!!! $both seed(s) CRASH BOTH SIDES: a finding, not a fidelity failure: move it to crashers/ and out of the gate corpus"
+    awk -F'\t' '$1=="CRASHES-BOTH"{printf "  !! CRASHES-BOTH %-31s %s\n", $2, $4}' "$TMP/judged"
+    echo "  !! (cp <seed> crashers/ with a row in crashers.summary.tsv; a re-run then skips it as known-crasher)"
+  fi
+  # a harness that hashes a constant (or nothing) agrees with any real side
+  local hashes; hashes=$(awk -F'\t' '$1=="AGREED"{print $4}' "$TMP/judged" | sort -u | wc -l)
+  if [ "$ok" -gt 1 ] && [ "$hashes" = 1 ] && [[ " $FIELDS " == *" out_hash "* ]]; then
+    echo "  WARN: all $ok agreed seeds share ONE out_hash ($(awk -F'\t' '$1=="AGREED"{print $4; exit}' "$TMP/judged")): the harness"
+    echo "        hashes a constant, or nothing, so agreement on it proves nothing about the artifact"
+  fi
+  if [ "$empty" = $((NSEEDS - both)) ] && [ "$empty" -gt 0 ]; then
     echo "  (EVERY seed had no output on one side: the command is broken, not the seeds -- read the message above."
     if grep -qF 'direct printed no result line (status=...), rc=86' "$TMP/judged"; then
       echo "   The DIRECT side died with the sanitizer exit code and no report: is a sanitizer runtime"
@@ -125,7 +171,7 @@ one_mode() {   # runs the whole gate in the current environment; prints and retu
   # A lone timeout-shaped NO-OUTPUT on a busy host is usually contention, not the seed
   # (measured: one asan gate run reported no-output=1 while other campaigns shared the
   # host; two re-runs were clean).  Say so before anyone debugs it.
-  if [ "$empty" -gt 0 ] && [ "$empty" -lt 3 ] && [ "$empty" -lt "$NSEEDS" ] && grep -q '^NO-OUTPUT.*rc=124' "$TMP/judged"; then
+  if [ "$empty" -gt 0 ] && [ "$empty" -lt 3 ] && [ "$empty" -lt $((NSEEDS - both)) ] && grep -q '^NO-OUTPUT.*rc=124' "$TMP/judged"; then
     echo "  (rc=124 is the 30 s timeout: on a loaded host re-run the gate before debugging; a NO-OUTPUT that repeats is real.)"
   fi
 
@@ -149,6 +195,12 @@ one_mode() {   # runs the whole gate in the current environment; prints and retu
     local uniq; uniq=$(md5sum "$TMP"/*.map | awk '{print $1}' | sort -u | wc -l)
     echo "  maps=$maps unique=$uniq  tuples/input: min=$(wc -l < "$(ls -S "$TMP"/*.map | tail -1)") max=$(wc -l < "$(ls -S "$TMP"/*.map | head -1)")"
     echo "  distinct tuples overall: $(cat "$TMP"/*.map | cut -d: -f1 | sort -u | wc -l)"
+    local tmin tmax; tmin=$(wc -l < "$(ls -S "$TMP"/*.map | tail -1)"); tmax=$(wc -l < "$(ls -S "$TMP"/*.map | head -1)")
+    if [ $((uniq * 2)) -lt "$maps" ] || [ $((tmin * 10)) -gt $((tmax * 8)) ]; then
+      echo "  WARN: coverage barely discriminates (unique $uniq of $maps maps; min tuples $tmin vs max $tmax):"
+      echo "        likely measuring init, not the library -- unless the decoders live in an"
+      echo "        uninstrumented system .so; see SKILL.md step 5"
+    fi
     echo "  (unique close to maps is good. If a trivial input scores nearly as many"
     echo "   tuples as a real one, you are measuring init, not the library -- unless the"
     echo "   decoders live in an uninstrumented system .so; see SKILL.md step 5.)"
@@ -170,6 +222,12 @@ one_mode() {   # runs the whole gate in the current environment; prints and retu
   [ "$mism" = 0 ] && [ "$empty" = 0 ] && [ "$stub" = 0 ] && [ "${arms:-0}" -ge "$MIN_ARMS" ] && [ "$maps" -gt 0 ]
 }
 
+[[ " $FIELDS " == *" out_hash "* ]] || echo "WARN: FIELDS=\"$FIELDS\" lacks out_hash: comparing status only proves nothing about the artifact"
+# A mode variable left in the environment (MODE=file exported in an earlier block) would
+# turn the "default" run into that mode, silently gating it twice.
+for setting in $MODES; do s=${setting%%:*}; for kv in ${s//,/ }; do v=${kv%%=*}
+  if [ -n "${!v+x}" ]; then echo "WARN: $v=${!v} is set in the environment: unset for the default mode, which otherwise runs under it"; unset "$v"; fi
+done; done
 status=0
 if [ -z "$MODES" ]; then
   one_mode || status=1

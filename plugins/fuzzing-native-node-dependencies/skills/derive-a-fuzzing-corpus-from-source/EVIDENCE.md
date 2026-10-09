@@ -65,3 +65,56 @@ fails on a missing file; `errenum_template.c` skips the filler string and docume
 |---|---|---|---|---|
 | Opus | 243 | 272 (173 seeds, cover 21: the stop signal fired) | 3.7 min | a 352-edge native surface is the honest answer; the library's fixtures added nothing new |
 | Sonnet | 182 | 230 (222 seeds, cover 41) | 5.3 min | `error_inventory.sh` compared raw literals with spaces against `err=` tokens with underscores and reported a miss (now matches the token form too) and read one mode's `.results` (now several); hangs from the input-chosen cost field are the work-factor case the harness skill now bounds |
+
+## Review of the skill (2026-10-07): checks moved from prose into the scripts
+
+A read-through of SKILL.md, the references and every resource against the chain contract
+and the sibling skills. Nothing new was learned on a target; the changes fix what a
+careful read found and make existing rules falsifiable. Script behaviour was checked in
+the `sectainer` image on a small instrumented harness and fabricated inputs, so the tags
+are [measured, synthetic] at best, never a new target.
+
+| change | tag | what was checked |
+|---|---|---|
+| step 7 snippet branches on `MODES`: `sweep.sh` refused an empty `SWEEP` and `cover.sh` then pointed at a `maps_final_union` that was never written | [tool] | read of `sweep.sh`'s `${SWEEP:?}` test; the snippet broke for every harness without modes |
+| `sweep.sh` and `nondet.sh` drop the chain's per-mode options after a colon (`MODE=compress:min_arms=1`) | [measured, synthetic] | `MODE=y,ENC=z:min_arms=1` gave `maps_b_MODE_y_ENC_z` and the harness saw `mode=y enc=z`; before, `MODE` carried the suffix and the default entry point was measured under the mode's name. `minimise.sh`, `smoke.sh` and `campaign.sh` already stripped it |
+| `measure.sh` and `validate.sh` take the first line holding `status=` as the result line | [measured, synthetic] | a harness printing a library line first: the right line was saved. Same rule `gate.sh` adopted the day before |
+| `error_inventory.sh` matches a candidate as a whole `err=` value, as written or in token form | [measured, synthetic] | `malformed head` no longer counts `err=malformed_header` as reached; `malformed header` in the last field (before the `.results` tab) does; `HASHCMD` unchanged |
+| `cost.sh SLOW_MS` (default 1000) lists seeds whose per-exec work exceeds it | [tool] | a 1.3 s seed was listed; the rule it serves: afl-fuzz's exec timeout is far lower and `AFL_IGNORE_SEED_PROBLEMS` drops such seeds without a message (the manifest's `seeds_loaded` is where it showed) |
+| `extract_literals.py` extracts JavaScript template literals (interpolations dropped, nested templates on their own) | [measured, synthetic] | a sample with a multi-line template, `\x41\u{42}`, a nested template, backticks inside a comment and a regex, and adjacent quoted literals still joined. Node only: the Ruby copy has its own Ruby extractor and stays out of the pair list |
+| `nondet.sh` carried from the Ruby plugin: each seed run several times, result lines compared, `MOVE=` quarantines | [carried] | the Ruby plugin measured a library serialising entries in hash-seed order; no Node target has shown it yet. Added to the shared-script pair list |
+| step 7: `crashers.summary.tsv` is truncated per run, honours `TIMEOUT=`, and plain-harness crashers get a `plain rc=` row | [tool] | the `>>` duplicated every row on a re-run; the pass hard-coded 5 s; files in `crashers/` without a row |
+| step 7: the re-gate is two `gate.sh` commands (plain over `corpus-final/` in the default mode, asan in every mode over `corpus-min/`) | [tool] | the prose described it; the full re-gate it warned against had cost one run an hour |
+| `gen_template.mjs ONLY=` writes `<OUT>.manifest.<fam>.tsv` | [tool] | iterating one family overwrote the full manifest with that family's rows (same fix in the Ruby `gen_template.rb`) |
+| text: `NO_RESULTS=1` is for a discovery sweep, never the final sweep; hangs go to `hangs/`; description names the chain; 36 KB read-with-a-file-reader note | [tool] | step 1 contradicted step 7's use of per-mode `.results`; the seed policy said "may go in `hangs/`" where the README contract says they do |
+
+### Trim (2026-10-07, later): under the 30 KB terminal truncation
+
+| change | tag | what was checked |
+|---|---|---|
+| SKILL.md 36.0 -> 28.9 KB. Moved, each behind a pointer from the step it left: the multi-mode script details to the new `modes.md`; step 2's fixture-hunting prose to the new `fixtures.md` and the error-inventory routes and classes to the new `error-inventory.md`; step 3's explanations to `axes.md`; step 4's bug-pattern table to the new `bug-patterns.md`; step 5's generator explanation and step 7's re-gate rationale to `measured-examples.md` (the uninitialised-memory shape is the harness skill's `oracle-ceiling.md`); step 8's writer, transplant and external-reference explanations to the new `success-path.md` | **[tool]** | the axis table, the step 7 snippet, the deliverable table and the stop rules are unchanged; every reference file is pointed at from SKILL.md (7 files, 15 pointers, no dangling path); no em-dash outside the step headings |
+
+## Chain review (2026-10-08)
+
+| change | tag | what was checked |
+|---|---|---|
+| every command block sources `fuzz.env`; paths are `$RC/` and `$R/`; the step 7 gate commands pass nothing the scripts now default | [tool] | a fresh shell per tool call lost `H`, `HR`, `W` and `MODES`; the no-modes branch of the snippet then ran silently |
+| `sweep.sh` and `nondet.sh` default to `fuzz.env`'s `MODES`; with no modes `sweep.sh` measures the default and exits 0 | [measured, synthetic] | `MODE=2:min_arms=1` in the file gave default 12, mode 13, union 14 edges on a tiny harness |
+| `measure.sh` fails when no map was produced; `compare.sh` fails on a missing or empty map directory | [measured, synthetic] | an uninstrumented build: FAIL exit 1 (before: "edges 0 distinct"); a mistyped directory: exit 2 (before: "gap is empty: B subsumes A", a false stop signal) |
+| `measure.sh` always exited 1 | [measured, synthetic] | its last line was `[ "$ndup" -gt 20 ] && echo ...`; found when `sweep.sh` started checking the exit status |
+
+## Node evaluation round (2026-10-08)
+
+| what the runs hit | fix | tag |
+|---|---|---|
+| the step 7 ASAN crasher pass used a 5 s timeout; under four parallel evaluations symbolization took longer, so the pass recorded nothing and said nothing (32 crashers missed in one run until it re-ran with 90 s) | default 30 s, `exitcode=86` in its `ASAN_OPTIONS`, and a WARN when a run exits 86 or on a signal with no `SUMMARY:` captured | [measured] by that run |
+| `nondet.sh` quarantined 20 seeds whose varying output was a plain-harness over-read returning garbage, the bug's own reproducers, already in `crashers/` | a seed also in `crashers/` (by name or content) is reported as the bug and not moved; `MOVE=` prints the re-measure reminder | [measured] on that run's seeds |
+| `measure.sh`'s map-size guess differed from `out/<v>/map_size` by 8 and 13 in two runs, so the baseline was measured at the wrong size | read `<dirname HARNESS>/map_size` first, say which source was used | [measured]: the discrepancy reproduces when the harness is copied away from its `map_size` |
+| a name looked up in one table was called data by the axis table, but a table of function pointers (one converter per name) selects code | the constants row says so; the parallel-implementations row too | [tool] |
+| "reading alone scores level with or below the baseline" did not hold when the baseline is only the gate corpus | the rule assumes a sample-file baseline; noted | [tool] |
+
+## AFL dictionaries (2026-10-08)
+
+| change | tag | evidence |
+|---|---|---|
+| new `dict.sh`: merges the build dictionaries with author-supplied tokens (`TOKENS`, `TOKENS_FILE` with `\\xNN` escapes) and regex-harvested literals from sources afl-clang-fast never compiled (`strcmp`/`memcmp`/`case` arms, integer constants in both byte orders), AFL syntax with `\\xNN`, `\\"` and `\\\\` escapes, entries over 128 decoded bytes dropped (afl-fuzz aborts on them), refuses an empty result | **[carried]** | tested on the Ruby plugin (see its EVIDENCE.md): 25 entries from two build files, TOKENS, a TOKENS_FILE and three source files; escaping checked with `cat -v`; afl-fuzz loaded all 25 ("Loaded 25 extra tokens"); a missing path exits 2, an empty result exits 1. Not yet run on a Node target |

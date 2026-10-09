@@ -6,8 +6,11 @@
 //     [ADDON_MATCH=<regex> | ADDON_MAP='<regex>=<path>;...'] [ALLOC_CEIL=<bytes>] \
 //     node real_harness.mjs <input>
 // With ADDON, run node with the sanitizer runtime preloaded:
-//   LD_PRELOAD=$(resources/find_asan_rt.sh) ADDON=... node real_harness.mjs <input>
-import { readFileSync, existsSync } from 'node:fs';
+//   LD_PRELOAD=$($R/find_asan_rt.sh) ADDON=... node real_harness.mjs <input>
+// (fuzz.env's REAL and REAL_ASAN hold both command lines.)
+// By hand: `. ./fuzz.env && $REAL <file>` (REAL carries PKG=, which this file needs).
+import { readFileSync, existsSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);   // ESM has no `require`
@@ -117,33 +120,66 @@ const raw = readFileSync(process.argv[2]);
 const buf = Buffer.allocUnsafeSlow(raw.length);
 raw.copy(buf);
 
+// 2b. For a PATH entry point: write the bytes to a fresh temp file and return its path,
+//     so every arm takes the same buffer.  `ext` is for a package that sniffs the
+//     extension.  Removed at exit, so a gate over thousands of seeds leaves nothing behind.
+const tmpDirs = [];
+process.on('exit', () => { for (const d of tmpDirs) rmSync(d, { recursive: true, force: true }); });
+const asFile = (b, ext = '') => {
+  const d = mkdtempSync(path.join(os.tmpdir(), 'real-harness-'));
+  tmpDirs.push(d);
+  const p = path.join(d, 'input' + ext);
+  writeFileSync(p, b);
+  return p;
+};
+
 const emit = (f) => checkSwap(true) || process.stdout.write(
   `in_len=${raw.length} status=${f.status} err=${f.err ?? 0} out_len=${f.out_len ?? 0} ` +
   `out_hash=${f.out_hash ?? ZERO} lossy=${f.lossy ?? 0}\n`);
-// `err` is ONE TOKEN identical to what the direct harness prints: the library's
-// numeric code when the package exposes one (e.code / e.errno), else its error name
-// or message with spaces replaced by '_'.  Never a hash of a message that embeds the
-// input -- that makes err unique per seed and useless for the corpus skill.
+// `err` is ONE TOKEN identical to what the direct harness prints, one per error path and
+// never per input: the gate compares it and the corpus
+// skill's histograms and error inventory key on it.  Never a hash of a message that
+// embeds the input -- that makes err unique per seed and useless for the corpus skill.
+// Default: e.code when present (numeric or a string code), else a numeric e.errno, else
+// the message up to the first ": " (messages shaped "<text>: <argument>" carry the input
+// after it), else the whole message; whitespace becomes '_'.  Override it when the input
+// sits elsewhere in the message (" at line 3", a quoted fragment) or a stable field
+// exists, and print the same token from the direct harness.
 // node's own failures come through here too, and the direct harness prints the same
 // token: ERR_OUT_OF_RANGE (a Buffer above kMaxLength), ERR_MEMORY_ALLOCATION_FAILED (the
 // allocator refused a legal length -- the asan gate's max_allocation_size_mb path),
 // ERR_ASSERTION (a package-side assert).
-const errToken = (e) =>
-  typeof e?.code === 'number' ? e.code
-  : typeof e?.errno === 'number' ? e.errno
-  : String(e?.code ?? e?.message ?? e).replace(/\s+/g, '_').slice(0, 63);
+const errToken = (e) => {
+  if (typeof e?.code === 'number') return e.code;
+  if (typeof e?.code === 'string' && e.code) return e.code.replace(/\s+/g, '_').slice(0, 63);
+  if (typeof e?.errno === 'number') return e.errno;
+  const m = String(e?.message ?? e), i = m.indexOf(': ');
+  return (i > 0 ? m.slice(0, i) : m).replace(/\s+/g, '_').slice(0, 63);
+};
 
 // 3. THE CONSUMER CALLS, one arm per entry point, keyed by the harness's MODE value
 //    ('default' when MODE is unset).  This object is the chain's shared contract:
 //      * the direct harness selects the same entry point from the same MODE value;
 //      * the campaign skill records each mode's `entry` as this key (MODE=file -> file);
-//      * the triage skill's confirm.mjs ENTRIES is THIS object, pasted unchanged.
+//      * the triage skill's confirm.mjs ENTRIES is THIS object, pasted unchanged:
+//        confirm.mjs also calls each arm with the input buffer and defines the same
+//        asFile(b, ext), so a `file` arm needs no edit there.
 //    So write the arm once, here, where the gate proves it matches the native call, and
 //    name the mode after the entry point it reaches.  Call the package the way a consumer
 //    does, with NO options -- the gate compares your mirrored defaults against the real
 //    ones -- and no error listener a user would not add.
+//    `collected` is the partial-output buffer.  A one-shot arm returns its result and
+//    leaves `collected` empty.  A callback arm pushes each serialised event (a Buffer)
+//    onto `collected` as it arrives and returns Buffer.concat(collected); when the
+//    package throws mid-stream, the catch below still hashes the events delivered before
+//    the error (out_len/out_hash; 0 and all-zero when none were).  The direct harness
+//    must hash the same partial stream on error (harness_template.cc section 7), or
+//    every rejected seed mismatches.
+const collected = [];   // callback arms push Buffers here; see above
 const ENTRIES = {
   default: (b) => lib.doTheThing(b),                 // SYNC one-shot API: the common case
+  // events: (b) => { lib.parse(b, { onEvent: (t, s) => collected.push(Buffer.from(t), Buffer.from(s)) });
+  //                  return Buffer.concat(collected); },   // a callback arm
   // file:   (b) => lib.doTheThingFromFile(asFile(b)), // the path entry point (raw bytes, no JS string)
   // string: (b) => lib.doTheThing(b.toString('utf8')), // the JS-string entry point: lossy for invalid UTF-8
 };
@@ -169,8 +205,9 @@ try {
   //
   // CALLBACK-DRIVEN (SAX) API: register EVERY listener the package offers, serialise
   // each event exactly as the direct harness does (event tag, length-prefixed UTF-8
-  // strings, attribute pairs in order, null/true/false, a position trailer), and
-  // hash the concatenation.  The event stream IS the artifact.
+  // strings, attribute pairs in order, null/true/false, a position trailer), push it
+  // onto `collected`, and hash the concatenation.  The event stream IS the artifact, on
+  // the error path too.
 
   // Hash the DEEPEST artifact the API will give you, not a summary: a width and a
   // height can agree while every byte differs.
@@ -188,9 +225,12 @@ try {
   // A U+FFFD substitution changes the LENGTH too, so gate with SOFT_DROP="out_len out_hash".
   const lossy = typeof result === 'string' && result.includes('\uFFFD') ? 1 : 0;
 
+  // success: hash even an empty output; all-zero out_hash is the error path's "nothing collected"
   emit({ status: 0, out_len: out.length, out_hash: fnv1a(out), lossy });
   process.exit(0);
 } catch (e) {
-  emit({ status: 1, err: errToken(e) });
+  // the events a callback arm delivered before the error are part of the artifact
+  const part = Buffer.concat(collected);
+  emit({ status: 1, err: errToken(e), ...(part.length ? { out_len: part.length, out_hash: fnv1a(part) } : {}) });
   process.exit(1);
 }
