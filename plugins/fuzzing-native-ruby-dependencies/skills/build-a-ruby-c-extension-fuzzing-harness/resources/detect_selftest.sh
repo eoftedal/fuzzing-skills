@@ -7,7 +7,11 @@
 # and restores the source.  Configure with KEY=VALUE arguments or environment:
 #
 #   FAULT_SRC   library source file to patch
-#   FAULT_SED   sed expression that injects the fault; must introduce the word INJECTED
+#   FAULT_SED   sed expression that injects the fault; it MUST also insert the marker word
+#               INJECTED (a comment is enough: s|p\[n\] = 0;|p[n + 1] = 0; /* INJECTED */|),
+#               which is how the script proves the sed applied and shows where it landed
+#   MARKER      the marker word instead of INJECTED (default INJECTED), e.g. when the
+#               source already contains that word
 #   REBUILD     command that rebuilds the library/extension after patching.  It must
 #               re-export the sanitizer environment (AFL_USE_ASAN=1) and must not wipe
 #               the tree holding FAULT_SRC.  It is run with `eval`: expand any list
@@ -65,6 +69,7 @@ for kv in "$@"; do case $kv in *=*) export "$kv";; esac; done
 FAULT_SRC=${FAULT_SRC:?set FAULT_SRC}
 FAULT_SED=${FAULT_SED:?set FAULT_SED}
 REBUILD=${REBUILD:?set REBUILD}
+MARKER=${MARKER:-INJECTED}
 HARNESS=${HARNESS:?set HARNESS}
 ALLOC_CAP_MB=${ALLOC_CAP_MB:-1024}
 # the chain's allocation ceiling, so a seed refused here is refused the same way everywhere.
@@ -128,12 +133,25 @@ show clean "$crc" "$ckind"
 if [ "$crc" != 0 ] || [ -n "$ckind" ]; then
   fail "the seed already crashes or fails without the fault (rc=$crc, kind=${ckind:-none}); choose a different seed (SEED=...)."
 fi
+if grep -qF -- "$MARKER" "$FAULT_SRC"; then
+  echo "FAIL: $FAULT_SRC already contains the marker $MARKER before the fault (a leftover from an earlier run?" >&2
+  echo "      restore it, or pick another word with MARKER=)" >&2; exit 1
+fi
 sed -i "$FAULT_SED" "$FAULT_SRC"
-grep -q INJECTED "$FAULT_SRC" || { echo "FAIL: FAULT_SED did not apply (source changed upstream?)" >&2; exit 1; }
+if ! grep -qF -- "$MARKER" "$FAULT_SRC"; then
+  if cmp -s "$BK" "$FAULT_SRC"; then
+    echo "FAIL: FAULT_SED did not apply: the file is unchanged (the pattern matches nothing; source changed upstream?)" >&2
+  else
+    echo "FAIL: FAULT_SED changed the file but did not insert the marker $MARKER.  FAULT_SED must insert the marker" >&2
+    echo "      $MARKER (a comment is enough: .../* $MARKER */|); it is how this script finds the fault and restores it." >&2
+    MODIFIED=0; cp "$BK" "$FAULT_SRC"
+  fi
+  exit 1
+fi
 MODIFIED=1
 # Show where it landed: a pattern that matches earlier than you meant (the same line in
 # another function) is the usual cause of a false "not detecting".
-echo "fault at: $(grep -n INJECTED "$FAULT_SRC" | head -3 | cut -c1-120 | paste -sd';')"
+echo "fault at: $(grep -nF -- "$MARKER" "$FAULT_SRC" | head -3 | cut -c1-120 | paste -sd';')"
 cp "$FAULT_SRC" "$FAULT_SRC.injected"      # kept only if the rebuild fails; see restore()
 if ! eval "$REBUILD" > "$BK.build" 2>&1; then
   echo "FAIL: REBUILD failed with the fault applied." >&2

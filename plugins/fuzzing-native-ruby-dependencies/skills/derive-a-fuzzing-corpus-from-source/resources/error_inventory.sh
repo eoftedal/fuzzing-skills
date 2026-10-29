@@ -3,7 +3,7 @@
 # author wrote on purpose, and which of them your corpus never provokes.
 #
 #   ./error_inventory.sh SRC=<vendor dir> [RESULTS="maps_<base>/.results [maps_<base>_MODE_x/.results ...]"] \
-#                        [PREFIX=PNG] [HASHCMD='<cmd reading stdin>']
+#                        [PREFIX=PNG] [HASHCMD='<cmd reading stdin>'] [FIELD=err]
 #
 # PREFIX: the library's identifier prefix (PNG, ZIP, JPEG, ...) so that
 # `<PREFIX>_<something>Error<...>` enum members are collected as well as the generic
@@ -14,6 +14,10 @@
 # in the harness's token form (spaces -> '_'), since `err=` is printed that way.
 # It must equal a whole `err=` value, so `ERROR` does not count every err=*ERROR* token
 # as reached (with HASHCMD the hash is still looked for anywhere in the line).
+# FIELD (default err): the result-line key holding the library's error.  When the binding
+# maps every library error to one message, `err` is one value for every reject and says
+# nothing; give the direct harness an ungated `lib_err=` field (the library's own error
+# name, not compared by the gate) and pass FIELD=lib_err here and to validate.sh.
 #
 # HASHCMD: if the harness prints a HASH of the error text, give the same hash function here
 # and each entry is hashed before being looked for.  USE WITH CARE -- it only works when the
@@ -38,7 +42,7 @@
 # just status=0/1, add that field first (most C libraries have *_getErrorName()).
 set -uo pipefail
 for kv in "$@"; do case $kv in *=*) export "$kv";; esac; done
-: "${SRC:?set SRC}"
+: "${SRC:?set SRC}" "${FIELD:=err}"
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 {
   # enum members that look like error codes
@@ -94,9 +98,14 @@ echo "candidate error identifiers in $SRC: $(wc -l < "$T/all")"
 for r in ${RESULTS:-}; do [ -f "$r" ] || { echo "FAIL: RESULTS file $r does not exist" >&2; exit 2; }; done
 if [ -n "${RESULTS:-}" ]; then
   cat $RESULTS > "$T/results"
-  # every err= value, one per line: a candidate then matches a whole token, not a substring
+  # every $FIELD= value, one per line: a candidate then matches a whole token, not a substring
   # (the value can be the line's last field, followed by the .results tab, hence [[:space:]])
-  grep -oE '(^|[[:space:]])err=[^[:space:]]*' "$T/results" | sed 's/^[[:space:]]*err=//' | sort -u > "$T/errs"
+  grep -oE "(^|[[:space:]])$FIELD=[^[:space:]]*" "$T/results" | sed "s/^[[:space:]]*$FIELD=//" | sort -u > "$T/errs"
+  [ -s "$T/errs" ] || echo "WARNING: no $FIELD= value in RESULTS: wrong FIELD, or the harness does not print it" >&2
+  # one value over every rejected input (status not 0): the binding collapsed the library's errors
+  rej=$(grep -vE '(^|[[:space:]])status=0([[:space:]]|$)' "$T/results" | grep -oE "(^|[[:space:]])$FIELD=[^[:space:]]*" | sed 's/^[[:space:]]*//' | sort -u)
+  [ -n "$rej" ] && [ "$(wc -l <<<"$rej")" = 1 ] && echo "WARNING: every rejected input has the same $rej: the binding" \
+    "collapses the library's errors; add an ungated lib_err= field to the direct harness, FIELD=lib_err" >&2
   hit=0; miss=0
   : > "$T/missing"
   while IFS= read -r e; do

@@ -28,7 +28,10 @@
 #             decoding Node binding's next major version had two crashers that are rc=0 by
 #             default and rc=134 under MODE=2.
 #   DIRS      space-separated input directories (default: every crashes/ (or hangs/) under
-#             the workspace, plus ./crashers)
+#             the workspace, plus ./crashers).  A campaign's afl-fuzz -o directory is expanded
+#             to every instance's crashes/ (or hangs/): default/, or main/ and s<i>/ when it
+#             ran with secondaries.  Inputs are deduplicated by content across all of them
+#             (secondaries sync queues, so one bug is often saved by several instances).
 #   HANGS=1   collect hangs/ and screen for hangs (`timeout` exit 124) instead of crashes
 #   OUT       work directory (default ./triage)
 #   MAP_SIZE  AFL_MAP_SIZE (default: ask the binary)
@@ -126,13 +129,18 @@ amp_from() {  # <file>, reading R_OUT of the run just made -> "demanded ratio" o
 
 # ---- 1. collect --------------------------------------------------------------------------
 ts "== 1. collect ($WANT) =="
-if [ -n "${DIRS:-}" ]; then SRCS="$DIRS"; else
+if [ -n "${DIRS:-}" ]; then
+  # an -o directory (no id:* of its own, instance dirs below): every instance's $WANT/
+  SRCS=$(for d in $DIRS; do
+           if ! ls "$d" 2>/dev/null | grep -q '^id:' && ls -d "$d"/*/"$WANT" >/dev/null 2>&1; then
+             ls -d "$d"/*/"$WANT"; else echo "$d"; fi; done | xargs)
+else
   # NOT just ./out: real workspaces keep campaigns in campaign/, hunt/, bench/.
   SRCS=$(find . -path "./${OUT#./}" -prune -o -type d -name "$WANT" -print 2>/dev/null | sort)
   [ "$WANT" = crashes ] && [ -d ./crashers ] && SRCS="$SRCS ./crashers"
 fi
 [ -n "$SRCS" ] || { echo "FAIL: no $WANT directories found; pass DIRS=" >&2; exit 1; }
-declare -A seen; i=0
+declare -A seen; i=0; dup=0
 for d in $SRCS; do
   # Provenance = the BUILD VARIANT.  The path is anchored with a leading "/" so a relative
   # DIRS=campaign/asan/... matches like ./campaign/asan/... does.
@@ -151,16 +159,22 @@ for d in $SRCS; do
     [ -n "$stab" ] && awk -v s="${stab%%.*}" 'BEGIN{exit !(s+0 < 90)}' && \
       echo "  WARN: $d stability was $stab% (<90): reproduction is not deterministic. Set RETRY=5."
   fi
+  # the instance that saved it, when a campaign ran several (main, s1, ...): kept in the pool
+  # name so a reader can find the original file
+  inst=$(basename "$(dirname "$d")"); case $inst in main|s[0-9]*) inst="${inst}_";; *) inst="";; esac
+  declare -A vis=()
   for c in "$d"/id:* "$d"/*; do
     [ -f "$c" ] || continue
+    [ -n "${vis[$c]:-}" ] && continue; vis[$c]=1          # id:* first, then the rest: once each
     case "$(basename "$c")" in README*) continue;; esac   # AFL writes README.txt here
     h=$(md5sum "$c" | cut -d' ' -f1)
-    [ -n "${seen[$h]:-}" ] && continue; seen[$h]=1
-    cp "$c" "$OUT/pool/$(printf '%04d' $i)-${prov}-$(basename "$c" | tr -c 'A-Za-z0-9._' _ | cut -c1-20)"
+    [ -n "${seen[$h]:-}" ] && { dup=$((dup+1)); continue; }; seen[$h]=1
+    cp "$c" "$OUT/pool/$(printf '%04d' $i)-${prov}-${inst}$(basename "$c" | tr -c 'A-Za-z0-9._' _ | cut -c1-20)"
     i=$((i+1))
   done
 done
 echo "  $i unique $WANT files from:"; for d in $SRCS; do echo "    $d"; done
+[ "$dup" -gt 0 ] && echo "  ($dup more were byte-identical to one already pooled: same input saved twice, e.g. by two instances)"
 [ -n "$HARNESS_ENV" ] && echo "  harness mode: $HARNESS_ENV"
 [ "$i" -gt 0 ] || { echo "FAIL: pool is empty" >&2; exit 1; }
 

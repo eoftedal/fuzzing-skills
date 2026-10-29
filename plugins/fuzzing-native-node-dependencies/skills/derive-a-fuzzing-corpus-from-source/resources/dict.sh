@@ -1,46 +1,85 @@
 #!/bin/bash
 # Write an AFL++ dictionary (afl-fuzz -x) from the tokens mutation cannot invent: magic
 # strings, option and encoding names, framing separators.  campaign.sh passes the
-# workspace's dict.afl by default.
+# workspace's dict.afl by default, IN PLACE OF the build's out/<variant>/dict.afl, so this
+# file must carry the build constants too: FROM does that by default.
 #
-#   dict.sh [OUT=./dict.afl] [FROM="out/plain/dict.afl ..."] [TOKENS="tok1 tok2 ..."]
-#           [TOKENS_FILE=<one token per line>] [SRC="<source files or dirs>"] [MAXLEN=32]
+#   dict.sh [OUT=./dict.afl] [FROM="out/plain/dict.afl ..."|none] [TOKENS="tok1 tok2 ..."]
+#           [TOKENS_FILE=<one entry per line>] [SRC="<source files or dirs>"] [MAXLEN=32]
+#           [DROP="word ..."|none] [NAMED_MAX=64] [WORKSPACE=.]
 #
-#   FROM         AFL dictionaries to merge (the harness build writes out/<variant>/dict.afl
-#                from the compiled compares); names are kept, unnamed lines become from_<n>.
-#   TOKENS       raw tokens, split on whitespace.
-#   TOKENS_FILE  one raw token per line; \xNN, \n, \t, \r, \0 and \\ are decoded.
+#   FROM         AFL dictionaries to merge.  Default: every existing out/*/dict.afl under
+#                WORKSPACE (the harness builds write one per variant from the compiled
+#                compares; plain and asan differ a little, so both are taken), printed as
+#                it is taken.  FROM=none merges nothing.  Names are kept, unnamed lines
+#                become from_<n>.
+#   TOKENS       literal strings, split on whitespace: no escapes, so \x04 stays the four
+#                characters backslash, x, 0, 4 (a NOTE says so).  Binary tokens go in
+#                TOKENS_FILE.
+#   TOKENS_FILE  one entry per line: either AFL syntax (name="value" or "value", with the
+#                \xNN, \" and \\ escapes afl-fuzz takes) or a raw token, in which \xNN, \n,
+#                \t, \r, \0 and \\ are decoded.  Lines starting with # are comments (a #
+#                token is written "#").
 #   SRC          files or directories (recursed) the build-time pass did not see: a system
 #                library's sources, generated parsers, the JS or Ruby layer whose literals
 #                select native paths.  Regex extraction, so expect some noise:
 #                  string literals passed to strcmp/strncmp/strcasecmp/strncasecmp/memcmp/strstr,
 #                  `case "..."`/`case '...'` arms (and Ruby `when "..."`),
 #                  integer constants compared with ==/!= that are 2 to 8 bytes wide, emitted
-#                  in little- and big-endian order (width rounded up to 2, 4 or 8).
+#                  in little- and big-endian order (width rounded up to 2, 4 or 8),
+#                  NAMED hex constants of 2 bytes or more (C `#define X 0x...`, JS
+#                  `exports.X = 0x...` / `const|let|var X = 0x...`, Ruby `X = 0x...`), in both
+#                  byte orders, at most NAMED_MAX entries (default 64; the count is printed).
 #                Single-byte literals are skipped: havoc already tries every byte value.
 #   MAXLEN       SRC entries longer than this many bytes are skipped (default 32).  Every
 #                entry over 128 bytes is skipped: afl-fuzz -x aborts on it (MAX_DICT_FILE).
+#   DROP         entries never written.  Always dropped unless DROP=none: the word
+#                `default` and every value in MODES (argument, environment or fuzz.env;
+#                `MODE=encode:x=1` gives `encode` and `1`): they are the harness's own
+#                getenv/strcmp constants, which link_harness.sh's build dictionary carries,
+#                never input bytes.  DROP="a b" adds words; a NOTE lists what was dropped.
 #
+# KEY=VALUE defaults come from $WORKSPACE/fuzz.env (WORKSPACE default .); arguments win.
 # Entries are deduplicated by decoded bytes (first seen wins: FROM, TOKENS, TOKENS_FILE,
 # SRC) and written as name="bytes" with non-printables as \xNN and " and \ escaped.  A named
 # path that does not exist is a FAIL (exit 2), and so is an empty result (exit 1): a mistyped
 # path must not pass as an empty dictionary.
 set -uo pipefail
+for kv in "$@"; do case $kv in WORKSPACE=*) export "$kv";; esac; done   # find fuzz.env first
+WS=${WORKSPACE:-.}; [ -f "$WS/fuzz.env" ] && { set -a; . "$WS/fuzz.env"; set +a; }
 for kv in "$@"; do case $kv in *=*) export "$kv";; *) echo "FAIL: arguments are KEY=VALUE ($kv)" >&2; exit 2;; esac; done
-export OUT=${OUT:-./dict.afl} FROM=${FROM:-} TOKENS=${TOKENS:-} TOKENS_FILE=${TOKENS_FILE:-} SRC=${SRC:-} MAXLEN=${MAXLEN:-32}
+if [ -z "${FROM:-}" ]; then          # default: every build dictionary in the workspace
+  FROM=$(for f in "$WS"/out/*/dict.afl; do [ -f "$f" ] && printf '%s ' "${f#./}"; done); FROM=${FROM% }
+  if [ -n "$FROM" ]; then echo "FROM (default, every out/*/dict.afl): $FROM"
+  else echo "NOTE: no $WS/out/*/dict.afl found: the dictionary holds no build constants (FROM=none to silence)" >&2; fi
+elif [ "$FROM" = none ]; then FROM=""; fi
+export OUT=${OUT:-./dict.afl} FROM TOKENS=${TOKENS:-} TOKENS_FILE=${TOKENS_FILE:-} SRC=${SRC:-} MAXLEN=${MAXLEN:-32}
+export DROP=${DROP:-} MODES=${MODES:-} NAMED_MAX=${NAMED_MAX:-64}
 command -v python3 >/dev/null || { echo "FAIL: dict.sh needs python3" >&2; exit 2; }
-python3 - <<'PY'
+python3 -I - <<'PY'
 import os, re, sys
 
 OUT = os.environ["OUT"]; MAXLEN = int(os.environ["MAXLEN"]); AFL_MAX = 128
 def fail(msg, rc=2):
     print("FAIL: " + msg, file=sys.stderr); sys.exit(rc)
 
+# the harness's own environment constants: mode values and `default` (never input bytes)
+drop = set()
+if os.environ["DROP"].strip() != "none":
+    drop = {b"default"} | {w.encode() for w in os.environ["DROP"].split()}
+    for item in os.environ["MODES"].split():
+        for kv in item.split(':'):
+            if '=' in kv: drop.add(kv.split('=', 1)[1].encode())
+    drop.discard(b"")
+dropped = []
 entries = []                     # (name, bytes)
 seen = set()
 skip = {"dup": 0, "maxlen": 0, "afl_max": 0, "empty": 0}
 def add(name, b, cap):
     if not b: skip["empty"] += 1; return False
+    if b in drop:
+        if b not in dropped: dropped.append(b)
+        return False
     if len(b) > AFL_MAX: skip["afl_max"] += 1; return False
     if len(b) > cap: skip["maxlen"] += 1; return False
     if b in seen: skip["dup"] += 1; return False
@@ -94,9 +133,13 @@ for p in paths("FROM"):
 # ---- TOKENS / TOKENS_FILE ------------------------------------------------------------------
 k = 0; n = 0
 for t in os.environ["TOKENS"].split():
+    if re.search(r'\\(x[0-9A-Fa-f]{2}|[ntr0])', t):
+        print("NOTE: TOKENS %s is kept as literal text (TOKENS takes no escapes); a binary token"
+              " goes in TOKENS_FILE" % t, file=sys.stderr)
     k += 1; n += add("tok_%d" % k, t.encode(), AFL_MAX)
 if os.environ["TOKENS"].strip(): counts.append(("TOKENS", n))
 
+tok_afl = re.compile(r'^(?:([A-Za-z0-9_]+(?:@[0-9]+)?)\s*=\s*)?"(.*)"$')
 esc = re.compile(rb'\\(x[0-9A-Fa-f]{2}|[ntr0\\])')
 def tok_decode(m):
     g = m.group(1)
@@ -107,8 +150,11 @@ for p in paths("TOKENS_FILE"):
     with open(p, 'rb') as f:
         for line in f:
             line = line.rstrip(b'\r\n')
-            if not line: continue
-            k += 1; n += add("tok_%d" % k, esc.sub(tok_decode, line), AFL_MAX)
+            if not line or line.startswith(b'#'): continue
+            k += 1
+            m = tok_afl.match(line.decode('latin-1').strip())    # `ab"cd"` stays a raw token
+            if m: n += add(m.group(1) or "tok_%d" % k, afl_decode(m.group(2), p), AFL_MAX)
+            else: n += add("tok_%d" % k, esc.sub(tok_decode, line), AFL_MAX)
     counts.append(("TOKENS_FILE " + p, n))
 
 # ---- SRC: regex extraction -------------------------------------------------------------------
@@ -160,6 +206,11 @@ def call_args(text, start):   # literals in one call's argument list, parens bal
         depth += c == '('; depth -= c == ')'; i += 1
     return out
 
+HEX = r'(0[xX][0-9A-Fa-f]+)[uUlL]*\b'
+NAMED = re.compile(r'(?:^[ \t]*#[ \t]*define[ \t]+\w+[ \t]+\(?[ \t]*' + HEX +            # C
+                   r')|(?:\b(?:exports\.\w+|(?:const|let|var)[ \t]+\w+)[ \t]*=[ \t]*' + HEX +  # JS
+                   r')|(?:^[ \t]*[A-Z]\w*[ \t]*=[ \t]*' + HEX + r')', re.M)                   # Ruby
+
 def int_bytes(tok):
     v = int(tok, 16) if tok[:2] in ('0x', '0X') else int(tok)
     need = (len(tok) - 1) // 2 if tok[:2] in ('0x', '0X') else (v.bit_length() + 7) // 8
@@ -168,7 +219,8 @@ def int_bytes(tok):
     w = 2 if need <= 2 else 4 if need <= 4 else 8
     return [v.to_bytes(w, 'little'), v.to_bytes(w, 'big')]
 
-nfiles = 0; ns = 0; ni = 0
+nfiles = 0; ns = 0; ni = 0; nn = 0; nnamed = 0; ncapped = 0
+NAMED_MAX = int(os.environ["NAMED_MAX"])
 for p in src_files():
     try:
         text = open(p, encoding='utf-8', errors='replace').read()
@@ -181,18 +233,32 @@ for p in src_files():
         found.append(("s", lit_decode(m.group(1) if m.group(1) is not None else m.group(2))))
     for m in CMP.finditer(text):
         found += [("i", b) for b in int_bytes(m.group(1) or m.group(2))]
+    for m in NAMED.finditer(text):
+        nnamed += 1
+        found += [("n", b) for b in int_bytes(m.group(1) or m.group(2) or m.group(3))]
     for kind, b in found:
         if len(b) < 2: continue
+        if kind == "n" and nn >= NAMED_MAX:
+            if b not in seen: ncapped += 1
+            continue
         j += 1
         if add("src_%s_%d" % (tag, j), b, MAXLEN):
             if kind == "s": ns += 1
-            else: ni += 1
+            elif kind == "i": ni += 1
+            else: nn += 1
 if os.environ["SRC"].strip():
     counts.append(("SRC (%d files: %d literals, %d integer byte orders)" % (nfiles, ns, ni), ns + ni))
+    counts.append(("SRC named hex constants (%d seen; LE and BE)" % nnamed, nn))
+    if ncapped:
+        print("NOTE: %d more named-constant entries skipped at NAMED_MAX=%d" % (ncapped, NAMED_MAX),
+              file=sys.stderr)
 
 for what, n in counts: print("  %-52s %d new entries" % (what, n))
 print("  skipped: %d duplicates, %d over MAXLEN=%d (SRC), %d over %d bytes, %d empty"
       % (skip["dup"], skip["maxlen"], MAXLEN, skip["afl_max"], AFL_MAX, skip["empty"]))
+if dropped:
+    print("NOTE: dropped %s: harness environment constants (MODES values, `default`), not input"
+          " bytes; DROP=none keeps them" % " ".join(enc(b) for b in dropped))
 if not entries:
     fail("no entries: nothing written to %s (check FROM/TOKENS/TOKENS_FILE/SRC)" % OUT, 1)
 d = os.path.dirname(OUT)

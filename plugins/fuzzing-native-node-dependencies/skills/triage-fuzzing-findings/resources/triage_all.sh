@@ -31,7 +31,8 @@
 #             takes another encoding or input shape), passed to confirm.sh; see its header.
 #   CONFIRM   the confirm.mjs with your ENTRIES arms (default: $WORKSPACE/confirm.mjs when it
 #             exists, else the plugin's copy next to this script).  Passed to confirm.sh.
-#   ENTRIES ASAN_RT ADDON_MATCH ADDON_MAP PRISTINE_MAP   passed to confirm.sh.
+#   ENTRIES ASAN_RT ADDON_MATCH ADDON_MAP PRISTINE_MAP   passed to confirm.sh.  ADDON_MATCH
+#             defaults to fuzz.env's (a package that loads several addons).
 #   ADDON PRISTINE   override the auto-discovered addon paths.
 #   TIMEOUT RETRY HANG_S ALLOC_CAP_MB CAP_LADDER CAP_UP CELL_TIMEOUT PROGRESS_EVERY
 #             passed through.  TIMEOUT is in ms (screen.sh's unit).  In manifest mode, unless
@@ -46,12 +47,23 @@
 #   MINIMIZE_ALL=1 also minimize representatives that are CLEAN on every column and entry.
 #
 # $WORKSPACE/fuzz.env (the harness skill writes it) supplies defaults below the arguments:
-# PKG, ADDON (from ADDON_ASAN), ASAN_RT (from $R/find_asan_rt.sh), and MODES and ALLOC_CAP_MB,
+# PKG, ADDON (from ADDON_ASAN), ADDON_MATCH, ASAN_RT (from $R/find_asan_rt.sh), and MODES and ALLOC_CAP_MB,
 # which rank below the manifest too (it records what the campaigns actually ran with).
 #
 # Order: screen -> bucket the RAW reproducers -> confirm one representative per bucket on
 # its original bytes -> minimize the representatives -> confirm the minimized ones.  The
 # expensive step (minimization) runs once per bug, not once per crash.
+#
+# Also, with PKG, before any of that is reported (and on a run with no bucket at all):
+#   * the GOOD= liveness check of every ENTRIES arm (OUT/liveness.out), so a no-findings run
+#     still shows the pasted arms reach the package;
+#   * the crashers/ inputs that reproduce on no instrumented build are confirmed on the real
+#     stack (OUT/real-only/<group>/), under the mode their crashers.summary.tsv row or name
+#     records, through every ENTRIES arm when none is recorded.  They are real-stack-only:
+#     a runtime abort in the binding's bookkeeping, a crash in code the harness does not
+#     mirror.  REPORT.md lists them in their own section.
+# REPORT.md has one row per (minimized-input sha1, bucket key), the campaigns that found it in
+# one cell; the per-campaign rows are in OUT/report_rows.tsv.
 set -uo pipefail
 for kv in "$@"; do case $kv in WORKSPACE=*) export "$kv";; esac; done   # find fuzz.env first
 WS=${WORKSPACE:-.}; F_MODES=""; F_CAP=""
@@ -152,7 +164,10 @@ if [ -f "$MANIFEST" ] && [ -z "${NO_MANIFEST:-}" ]; then
   [ "$sel" = passed ] || say "  NOTE: self-test not 'passed' for every campaign ($sel): a clean result is weaker."
   # Collect one plan entry per (campaign row x kind) with crash/hang files; the actual
   # run_one calls happen below, where run_one is defined.  Each entry is
-  # "variant|kind|henv|name|alloc_cap|exec_timeout_ms|stability|dir".
+  # "variant|kind|henv|name|alloc_cap|exec_timeout_ms|stability|dirs", dirs being every
+  # instance's crashes/ (or hangs/) with files, space-separated: default/ for a single
+  # afl-fuzz, main/ and s<i>/ for a campaign run with SECONDARIES (screen.sh dedups the
+  # union by content, so one bug saved by several instances is one input).
   # stability is past the positional columns, so it is read by name.
   declare -A MSTAB
   while IFS=$'\t' read -r n st; do MSTAB[$n]=$st; done < <(paste <(col name) <(col stability))
@@ -163,10 +178,14 @@ if [ -f "$MANIFEST" ] && [ -z "${NO_MANIFEST:-}" ]; then
     henv=""; [ "$mode_env" != default ] && henv="$mode_env"
     for kind in crashes hangs; do
       [ "${SKIP_HANGS:-0}" = 1 ] && [ "$kind" = hangs ] && continue
-      d="$WS/$out_dir/default/$kind"
-      [ -d "$d" ] && ls "$d" 2>/dev/null | grep -q '^id:' || continue
-      MROWS+=("$variant|$kind|$henv|$name|${ac:-$ALLOC_CAP_MB}|$et|${MSTAB[$name]:-}|$d")
-      printf '  %-28s %-7s %s\n' "$name" "$kind" "$(ls "$d" | grep -c '^id:') file(s)"
+      d=""; nf=0; ni=""
+      for x in "$WS/$out_dir"/*/"$kind"; do
+        [ -d "$x" ] && ls "$x" 2>/dev/null | grep -q '^id:' || continue
+        d="$d $x"; nf=$(( nf + $(ls "$x" | grep -c '^id:') )); ni="$ni $(basename "$(dirname "$x")")"
+      done
+      [ -n "$d" ] || continue
+      MROWS+=("$variant|$kind|$henv|$name|${ac:-$ALLOC_CAP_MB}|$et|${MSTAB[$name]:-}|${d# }")
+      printf '  %-28s %-7s %s\n' "$name" "$kind" "$nf file(s) in$ni"
     done
   done < <(tr '\t' '\037' < "$MANIFEST")
   # A campaign that did not run to completion still has real crashes; only the ABSENCE of
@@ -178,7 +197,7 @@ if [ -f "$MANIFEST" ] && [ -z "${NO_MANIFEST:-}" ]; then
   # layout).  List them rather than lose them.
   # smoke/ is the harness skill's smoke run (its own campaigns and manifest), not a
   # campaign to triage: skip it rather than warn about it.
-  LISTED=$(printf '%s\n' "${MROWS[@]}" | awk -F'|' '{print $NF}' | sort -u)
+  LISTED=$(printf '%s\n' "${MROWS[@]}" | awk -F'|' '{print $NF}' | tr ' ' '\n' | sort -u)
   # (the corpus skill's own crashers/ and hangs/ seed directories are triaged below, not campaigns)
   UNLISTED=$(find "$WS" \( -path "$WS/${OUT#./}" -o -path "$WS/smoke" -o -path "$WS/hangs" -o -path "$WS/crashers" \) -prune -o -type d \( -name crashes -o -name hangs \) -print 2>/dev/null | sort | while read -r ud; do
       ls "$ud" 2>/dev/null | grep -q '^id:' || continue
@@ -205,7 +224,9 @@ no_findings_report() {
   local stl md=$(dirname "$MANIFEST") n df
   stl=$(grep -h -m1 '^PASS:\|^FAIL:' "$WS"/selftest*.txt 2>/dev/null | head -1)
   {
-    echo "# Triage findings: none"
+    if [ -n "$(cat "$RO"/*/verdicts.tsv 2>/dev/null | awk -F'\t' '$3 $4 $5 ~ /NATIVE|RUNTIME-ABORT|UNCAUGHT|HANG/')" ]; then
+      echo "# Triage findings: no bucket; real-stack-only findings below"
+    else echo "# Triage findings: none"; fi
     echo
     echo "No campaign in \`$MANIFEST\` saved a crash or a hang. That is a result only as strong"
     echo "as the facts below: a harness proven to detect an injected fault (self-test), run for"
@@ -223,8 +244,10 @@ no_findings_report() {
     echo "Self-test: ${stl:-NOT FOUND -- without a passing self-test this is not a negative result}"
     [ -n "$badst" ] && echo "Campaigns that did not run to completion: $badst"
     [ -n "$UNLISTED" ] && echo "Crash/hang directories NOT in the manifest (not triaged): $(echo "$UNLISTED" | xargs)"
-    [ -n "$CRASHERS$HANGSEEDS" ] && echo "Hand-saved inputs ($(echo ${CRASHERS:+crashers/} ${HANGSEEDS:+hangs/})) screened on every variant and mode: none reproduced$([ -s "$UNRES" ] && echo "; see \`$UNRES\`")."
+    [ -n "$CRASHERS$HANGSEEDS" ] && echo "Hand-saved inputs ($(echo ${CRASHERS:+crashers/} ${HANGSEEDS:+hangs/})) screened on every variant and mode: none reproduced on a harness$([ -s "$UNRES" ] && echo "; see \`$UNRES\`")."
     echo
+    real_only_section
+    liveness_section
     echo "## Scope"
     echo
     echo "* Variants: $(col variant | sort -u | xargs)"
@@ -238,8 +261,7 @@ no_findings_report() {
       df="$md/$n.dropped"; [ -s "$df" ] || continue
       awk -F'\t' -v n="$n" '{printf "  * %s did not fuzz `%s`: %s\n", n, $1, $2}' "$df"
     done
-    echo "* Instrumented: <state here what was instrumented and what the real side's sanitized column can and cannot see>"
-    echo "* Not covered: <the public API calls these modes correspond to, and the ones not fuzzed>"
+    scope_lines
   } > "$REPORT"
 }
 
@@ -404,7 +426,7 @@ if [ -n "${MANIFEST_DRIVEN:-}" ]; then
     if [ -z "$USER_RETRY" ] && [ -n "$stab" ] && awk -v s="$stab" 'BEGIN{exit !(s+0 < 90)}'; then
       crt=5; ts "  $name: stability ${stab}% < 90%: RETRY=5 for this campaign, from the manifest"
     fi
-    CAMP_HANG_MS="$chm" RETRY="$crt" ALLOC_CAP_MB="$ac" process "$v" "$kind" "$henv" "$name" "$d"
+    CAMP_HANG_MS="$chm" RETRY="$crt" ALLOC_CAP_MB="$ac" process "$v" "$kind" "$henv" "$name" $d   # unquoted: every instance's dir
   done
 else
 for k in "${!CAMPAIGNS[@]}"; do
@@ -430,6 +452,7 @@ if [ -n "$CRASHERS" ] && [ -z "${ONLY:-}" ]; then
   if [ -n "$rest" ]; then
     ts "  $(ls "$rest" | wc -l) crasher(s) reproduce in no configuration tried: $rest"
     printf '%s\t%s\t%s\n' "crashers" "$(ls "$rest" | wc -l)" "${rest#$OUT/}" >> "$UNRES"
+    REAL_ONLY_SRC=$rest          # confirmed on the real stack below (2c)
   fi
 fi
 if [ -n "$HANGSEEDS" ] && [ -z "${ONLY:-}" ]; then
@@ -444,10 +467,126 @@ if [ -n "$HANGSEEDS" ] && [ -z "${ONLY:-}" ]; then
   fi
 fi
 
+# ---- 2b/2c. what no bucket shows: the arms' liveness, and the real-stack-only crashers ----
+# Ahead of the no-findings exit, so a run with nothing to bucket still (b) proves the pasted
+# ENTRIES arms reach the package on GOOD=, and (c) confirms the crashers/ inputs no
+# instrumented build reproduces.  Measured: three hand-filed seeds that abort the real
+# stack (a runtime invariant check in the binding's memory accounting) landed in
+# unresolved.tsv and the report said "none"; and a no-findings run never ran an arm.
+arms_in() {  # <file> -> the keys of its top-level ENTRIES object (one indentation level)
+  [ -f "$1" ] || return 0
+  awk -v q="['\"]" 'on == 0 && /ENTRIES[[:space:]]*=[[:space:]]*\{/ { on = 1; next }
+       on && /^\}/ { exit }
+       on && /^[[:space:]]*\/\// { next }
+       on && $0 ~ "^[[:space:]]+" q "?[A-Za-z0-9_$-]+" q "?[[:space:]]*:" {
+         lead = $0; sub(/[^[:space:]].*/, "", lead); if (ind == "") ind = lead; if (lead != ind) next
+         k = $0; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]*:.*/, "", k); gsub(q, "", k); print k }' "$1"
+}
+disc() { find "$WS/out/$1" -name '*.node' -not -path '*obj.target*' 2>/dev/null | head -1; }
+A=${ADDON:-${ADDON_ASAN:-${EXT_ASAN:-$(disc asan)}}}; P=${PRISTINE:-$(disc pristine)}
+confirm_dir() {  # <dir> <buckets dir> <verdicts file> <output file> [KEY=VALUE overrides...]
+  bash "$HERE/confirm.sh" OUT="$1" BUCKETS="$2" VERDICTS="$3" PKG="$PKG" CELL_TIMEOUT="$CELL_TIMEOUT" CONFIRM="$CONFIRM" \
+      ${A:+ADDON="$A"} ${P:+PRISTINE="$P"} ${ASAN_RT:+ASAN_RT="$ASAN_RT"} \
+      ${GOOD:+GOOD="$GOOD"} ${ENTRIES:+ENTRIES="$ENTRIES"} ${ALLOC_CAP_MB:+ALLOC_CAP_MB="$ALLOC_CAP_MB"} \
+      ${ADDON_MATCH:+ADDON_MATCH="$ADDON_MATCH"} ${ADDON_MAP:+ADDON_MAP="$ADDON_MAP"} \
+      ${PRISTINE_MAP:+PRISTINE_MAP="$PRISTINE_MAP"} \
+      "${@:5}" 2> >(sed -u 's/^/    /' >&2) | tee "$4" | sed -u 's/^/    /'
+}
+entry_of() {  # <mode env> -> the confirm arm that mode maps to (manifest, else its value)
+  local e=""
+  [ -n "${MANIFEST_DRIVEN:-}" ] && e=$(paste <(col mode_env) <(col entry) | awk -F'\t' -v m="$1" '$1 == m && $2 != "" {print $2; exit}')
+  [ -n "$e" ] || { e=${1%%,*}; e=${e#*=}; }
+  printf '%s' "$e"
+}
+LIVE_OUT="$OUT/liveness.out"; RO="$OUT/real-only"; rm -rf "$RO"; rm -f "$LIVE_OUT"
+LENTRIES=$(printf '%s\n' ${ENTRIES:-default} $(arms_in "$CONFIRM") | awk 'NF && !s[$0]++' | xargs)
+if [ -n "${PKG:-}" ]; then
+  rule "2b. liveness: GOOD= through every ENTRIES arm ($LENTRIES)"
+  confirm_dir "$OUT" "$OUT/.no-buckets" /dev/null "$LIVE_OUT" LIVENESS_ONLY=1 ENTRIES="$LENTRIES"
+fi
+if [ -n "${REAL_ONLY_SRC:-}" ] && [ -n "${PKG:-}" ]; then
+  rule "2c. real-stack-only: $(ls "$REAL_ONLY_SRC" | wc -l) crashers/ input(s) reproduce on no harness; confirming them"
+  declare -A NRSHA
+  for f in "$REAL_ONLY_SRC"/*; do [ -f "$f" ] && NRSHA[$(sha1sum < "$f" | cut -c1-40)]=1; done
+  for f in "$CRASHERS"/*; do
+    [ -f "$f" ] || continue
+    [ -n "${NRSHA[$(sha1sum < "$f" | cut -c1-40)]:-}" ] || continue
+    n=$(basename "$f"); row=$(awk -F'\t' -v n="$n" '$1 == n' "$WS/crashers.summary.tsv" 2>/dev/null | head -1)
+    # the mode its summary row or its name records (smoke-<variant>@MODE=x-...); none: every arm
+    m=""; for x in ${MODES:-}; do grep -qF -- "$x" <<<"$n $row" && { m=$x; break; }; done
+    g=all-entries; [ -n "$m" ] && g="mode@$(tr -c 'A-Za-z0-9=' _ <<<"$m" | sed 's/_*$//')"
+    mkdir -p "$RO/$g/inputs"; cp "$f" "$RO/$g/inputs/"
+    [ -n "$m" ] && echo "HARNESS_ENV=$m" > "$RO/$g/config"
+  done
+  for g in "$RO"/*/; do
+    [ -d "$g" ] || continue
+    g=${g%/}; m=$(sed -n 's/^HARNESS_ENV=//p' "$g/config" 2>/dev/null)
+    if [ -n "$m" ]; then e=$(entry_of "$m"); else e=$LENTRIES; fi
+    ts "  $(basename "$g"): $(ls "$g/inputs" | wc -l) input(s), mode ${m:-none recorded}, entries: $e"
+    confirm_dir "$g" "$g/inputs" "$g/verdicts.tsv" "$g/confirm.out" ENTRIES="$e"
+  done
+fi
+# severity rank of a verdict cell, shared by the report and its dedup
+rank() { awk -v v="$1" 'BEGIN { r = 0
+  if (v ~ /NATIVE/) r = 7; else if (v ~ /RUNTIME-ABORT/) r = 6; else if (v ~ /UNCAUGHT/) r = 5
+  else if (v ~ /HANG/) r = 4; else if (v ~ /CAUGHT/) r = 3; else if (v ~ /ERROR|ADDON-|EXT-|SKIPPED/) r = 2
+  else if (v ~ /CLEAN/) r = 1; print r }'; }
+real_only_section() {
+  say "## Real-stack-only: crashers/ inputs no instrumented build reproduces"
+  say ""
+  if [ -z "${REAL_ONLY_SRC:-}" ]; then say "_none_"; say ""; return; fi
+  if [ -z "$(ls "$RO" 2>/dev/null)" ]; then
+    say "$(ls "$REAL_ONLY_SRC" | wc -l) input(s) in \`${REAL_ONLY_SRC#$OUT/}\`, NOT confirmed: no PKG given."; say ""; return
+  fi
+  say "They crash the real stack, not the direct harness: a runtime abort in the binding's"
+  say "bookkeeping, a crash in code the harness does not mirror, a JS-layer kill. Same ladder as the"
+  say "confirm tables; \`RUNTIME-ABORT\` is a denial of service, not a memory-safety finding."
+  say ""
+  say "| input | recorded mode | entry | install (plain) | sanitized build | pristine build | crashers.summary.tsv |"
+  say "|---|---|---|---|---|---|---|"
+  local g m n e a b p note
+  for g in "$RO"/*/; do
+    [ -d "$g" ] || continue
+    g=${g%/}; m=$(sed -n 's/^HARNESS_ENV=//p' "$g/config" 2>/dev/null)
+    while IFS=$'\t' read -r n e a b p _; do
+      note=$(awk -F'\t' -v n="$n" '$1 == n {print $2; exit}' "$WS/crashers.summary.tsv" 2>/dev/null)
+      say "| \`$n\` | ${m:-none (every arm)} | $e | $a | $b | $p | ${note//|/\\|} |"
+    done < "$g/verdicts.tsv"
+  done
+  say ""
+  say "Full tables: \`${RO#$WS/}/*/confirm.out\`."
+  say ""
+}
+liveness_section() {
+  say "## Liveness of the ENTRIES arms (GOOD= through each)"
+  say ""
+  if [ -s "$LIVE_OUT" ]; then
+    say '```'; grep -E '^(=====|# liveness|# WARN|# no GOOD)' "$LIVE_OUT"; say '```'
+  else say "_not run: no PKG given, so no arm was shown to reach the package._"; fi
+  say ""
+}
+# Scope, pre-filled from the manifest; the TODO lines are what only a reader of the harness knows.
+scope_lines() {
+  local n v m x d st dc e rh all fz miss
+  say "* Instrumented, per campaign (variant, mode, execs, edges, stability, dictionary):"
+  while IFS=$'\037' read -r n v m x d st dc; do
+    e=$(sed -n 's/^edges_found *: *//p' "$WS/$d/default/fuzzer_stats" "$WS/$d/main/fuzzer_stats" 2>/dev/null | head -1)
+    say "  * $n: $v, $m, ${x:-?} execs, ${e:-?} edges, ${st:-?} % stability, dict ${dc:--}"
+  done < <(paste -d $'\037' <(col name) <(col variant) <(col mode_env) <(col execs) <(col out_dir) <(col stability) <(col dict))
+  say "  * TODO: which library code carried coverage and sanitizers in the harness, and what the"
+  say "    real side's sanitized column can and cannot see (a library loaded uninstrumented)."
+  rh="$WS/real_harness.mjs"; all=$(arms_in "$rh" | sort -u); fz=$(col entry | sed 's/^$/default/' | sort -u)
+  miss=$(comm -23 <(printf '%s\n' $all) <(printf '%s\n' $fz) | xargs)
+  if [ ! -f "$rh" ]; then say "* Not covered: (no $rh to compare the manifest's entries with)"
+  elif [ -n "$miss" ]; then say "* Not covered: ENTRIES arms of $(basename "$rh") that no campaign fuzzed: $miss"
+  else say "* Not covered: every ENTRIES arm of $(basename "$rh") ($(echo $all)) has a campaign"; fi
+  say "  * TODO: the public calls that are in no ENTRIES arm at all, and the options not fuzzed."
+}
+
 if [ -n "${MANIFEST_DRIVEN:-}" ] && [ ${#MROWS[@]} -eq 0 ] && [ ! -s "$SUM" ]; then
   rule "no findings: writing $REPORT"
   no_findings_report
-  ts "  wrote $REPORT (no bucket; fill in its Scope lines)"
+  ts "  wrote $REPORT (no bucket; finish its Scope TODO lines)"
   exit 0
 fi
 
@@ -457,16 +596,6 @@ fi
 # on the npm install once minimized and crashes it only as the original.  The verdicts
 # RANK the buckets; they never remove one.  A node CLEAN means "not reachable through the
 # ENTRIES arms written so far", and those arms are the part that gets things wrong.
-disc() { find "$WS/out/$1" -name '*.node' -not -path '*obj.target*' 2>/dev/null | head -1; }
-A=${ADDON:-${ADDON_ASAN:-${EXT_ASAN:-$(disc asan)}}}; P=${PRISTINE:-$(disc pristine)}
-confirm_dir() {  # <dir> <buckets dir> <verdicts file> <output file>
-  bash "$HERE/confirm.sh" OUT="$1" BUCKETS="$2" VERDICTS="$3" PKG="$PKG" CELL_TIMEOUT="$CELL_TIMEOUT" CONFIRM="$CONFIRM" \
-      ${A:+ADDON="$A"} ${P:+PRISTINE="$P"} ${ASAN_RT:+ASAN_RT="$ASAN_RT"} \
-      ${GOOD:+GOOD="$GOOD"} ${ENTRIES:+ENTRIES="$ENTRIES"} ${ALLOC_CAP_MB:+ALLOC_CAP_MB="$ALLOC_CAP_MB"} \
-      ${ADDON_MATCH:+ADDON_MATCH="$ADDON_MATCH"} ${ADDON_MAP:+ADDON_MAP="$ADDON_MAP"} \
-      ${PRISTINE_MAP:+PRISTINE_MAP="$PRISTINE_MAP"} \
-      2> >(sed -u 's/^/    /' >&2) | tee "$4" | sed -u 's/^/    /'
-}
 if [ -n "${PKG:-}" ]; then
   for d in "$OUT"/*/; do
     d=${d%/}; [ -n "$(ls "$d/buckets" 2>/dev/null)" ] || continue
@@ -526,7 +655,36 @@ copied_code() {  # <bucket key> -> 0 when its file is one of the harness's own s
   local f; f=$(sed -n 's/^[^ ]* @ \([^ :]*\):.*/\1/p' <<<"$1")
   [ -n "$f" ] && grep -qE "$HARNESS_RE" <<<"$f"
 }
-NDRIFT=0; NCOPIED=0
+NDRIFT=0; NCOPIED=0; ROWS="$OUT/report_rows.tsv"
+# ---- hang buckets the real stack contradicts ---------------------------------------------
+# A hang bucket is AFL's verdict at its exec timeout (auto-calibrated: tens of ms) on an
+# instrumented, often sanitized, harness.  The confirm cells can say otherwise, two ways:
+#   * every cell answers (worst CAUGHT) within the cell timeout: a SLOW input, not a hang
+#     (measured: decoder inputs that AFL saved as hangs at 20 ms under ASAN, over 1 s on the
+#     sanitized harness, were CAUGHT through the npm install in 0.5-1.2 s, start-up included);
+#   * the original bytes crash the real stack (NATIVE-CRASH): a crash AFL filed under hangs/
+#     because the process died after the timeout threshold.  Re-keyed as a crash here: the
+#     representative is bucketed again WITHOUT HANGS, which gives its sanitizer key.
+is_hang_run() { [ "$(sed -n 's/^HANGS=//p' "$1/config" 2>/dev/null)" = 1 ]; }
+cfg_of() { sed -n "s/^$2=//p" "$1/config" 2>/dev/null | head -1; }
+install_secs() {  # <verdicts file> <name> -> the slowest install cell's seconds over entries
+  awk -F'\t' -v n="$2" '$1 == n && $6 != "" { if ($6 + 0 >= m) m = $6 + 0; f = 1 } END { if (f) printf "%.1f", m }' "$1" 2>/dev/null
+}
+NREKEY=0; rm -rf "$OUT"/*/rekey                     # a previous run's re-key inputs are stale
+if [ -s "$SUM" ] && [ -n "${PKG:-}" ]; then
+  while IFS=$'\t' read -r from on henv sz b key o; do
+    is_hang_run "$o" || continue
+    [ "$(rank "$(awk -F'\t' -v n="$(basename "$b")" '$1 == n { for (i = 3; i <= 5; i++) if ($i ~ /NATIVE/) { print $i; exit } }' "$o/verdicts.tsv" 2>/dev/null)")" = 7 ] || continue
+    mkdir -p "$o/rekey/in"; cp "$OUT/$b" "$o/rekey/in/" && NREKEY=$((NREKEY+1))   # $b is relative to OUT
+  done < "$SUM"
+  for o in "$OUT"/*/; do
+    o=${o%/}; [ -d "$o/rekey/in" ] || continue
+    rule "4. re-key $(basename "$o"): $(ls "$o/rekey/in" | wc -l) hang representative(s) that crash the real stack"
+    bash "$HERE/bucket.sh" FORK="$(cfg_of "$o" FORK)" LABEL_FORK="$(cfg_of "$o" LABEL_FORK)" OUT="$o/rekey" \
+        INPUTS="$o/rekey/in" HANGS=0 HARNESS_ENV="$(cfg_of "$o" HARNESS_ENV)" CELL_TIMEOUT="$CELL_TIMEOUT" \
+        ${ALLOC_CAP_MB:+ALLOC_CAP_MB="$ALLOC_CAP_MB"} 2>&1 | tee "$o/rekey/bucket.out" | sed -u 's/^/    /'
+  done
+fi
 if [ -s "$SUM" ]; then
   while IFS=$'\t' read -r from on henv sz b key o; do
     n=$(basename "$b")
@@ -538,31 +696,61 @@ rule "4. $REPORT"
 {
   say "# Triage findings"
   say ""
-  say "Workspace \`$WS\`. One row per BUCKET (exact sanitizer key); merge rows that differ"
-  say "only in line number inside one function before reporting -- bucket.out prints that"
-  say "merged grouping, and a grouping on the caller below the crashing function."
+  say "Workspace \`$WS\`. One row per (minimized input, exact sanitizer key): the campaigns that"
+  say "found the same bytes and key share a row (per-campaign rows: \`$ROWS\`). Merge rows"
+  say "that differ only in line number inside one function before reporting -- bucket.out"
+  say "prints that merged grouping, and a grouping on the caller below the crashing function."
   say "Severity is yours to judge (skill step 4); this file has the facts."
   say ""
-  say "| from campaign | reproduced on | harness mode | bucket key | original | minimized | minimized key | worst verdict (original / minimized) | memory amplification | note |"
-  say "|---|---|---|---|---|---|---|---|---|---|"
-  worst() {  # <verdicts file> <name> -> most severe cell over all entries and columns
-    awk -F'\t' -v n="$2" 'function r(v){ if(v~/NATIVE/)return 6; if(v~/UNCAUGHT/)return 5; if(v~/HANG/)return 4;
-        if(v~/CAUGHT/)return 3; if(v~/ERROR|ADDON-|SKIPPED/)return 2; if(v~/CLEAN/)return 1; return 0 }
+  say "| campaigns (reproduced on, harness mode) | bucket key | original | minimized | minimized key | worst verdict (original / minimized) | memory amplification | note |"
+  say "|---|---|---|---|---|---|---|---|"
+  worst() {  # <verdicts file> <name> -> most severe cell over all entries and columns (rank's order)
+    awk -F'\t' -v n="$2" 'function r(v){ if(v~/NATIVE/)return 7; if(v~/RUNTIME-ABORT/)return 6; if(v~/UNCAUGHT/)return 5; if(v~/HANG/)return 4;
+        if(v~/CAUGHT/)return 3; if(v~/ERROR|ADDON-|EXT-|SKIPPED/)return 2; if(v~/CLEAN/)return 1; return 0 }
       $1==n{for(i=3;i<=5;i++) if(r($i)>best){best=r($i); w=$i}} END{print (w==""?"-":w)}' "$1" 2>/dev/null
   }
   if [ -s "$SUM" ]; then
+    printf 'sha1\tbucket_key\tcampaign\treproduced_on\tmode\toriginal\tminimized\tminimized_key\tverdict\tamplification\tnote\trank\n' > "$ROWS"
     sort -t$'\t' -k1,1 -k2,2 -k3,3 "$SUM" | while IFS=$'\t' read -r from on henv sz b key o; do
       n=$(basename "$b"); pn=${n#??????-}
-      msz="-"; [ -f "$o/min/$n" ] && msz="$(wc -c <"$o/min/$n") B"
+      # every cell gets a value: an empty one reads as a lost result
       vo=$(worst "$o/verdicts.tsv" "$n"); vm=$(worst "$o/verdicts.min.tsv" "$n")
+      { [ -n "$vo" ] && [ "$vo" != - ]; } || { vo="(not confirmed: no PKG)"; [ -n "${PKG:-}" ] && vo="(not confirmed: no verdict)"; }
+      if [ -f "$o/min/$n" ]; then
+        msz="$(wc -c <"$o/min/$n") B"; mk=$(min_key_cell "$key" "$o/min/$n.key")
+        { [ -n "$vm" ] && [ "$vm" != - ]; } || vm="(not confirmed)"
+      else
+        why="not minimized"; [ -n "${PKG:-}" ] && clean_everywhere "$o/verdicts.tsv" "$n" && why="not minimized: CLEAN on every column and entry"
+        msz="($why)"; mk="(not minimized)"; vm="(not minimized)"
+      fi
       amp=$(cat "$o/amplification.min.tsv" "$o/amplification.tsv" 2>/dev/null \
             | awk -F'\t' -v n="$pn" '$1==n{printf "%s B in, %s B demanded, %sx at %s MB", $2, $3, $4, $5; exit}')
-      mk=$(min_key_cell "$key" "$o/min/$n.key")
       note="-"; copied_code "$key" && note="copied code: see the copy's source comment for the package line"
-      say "| $from | $on | $henv | $key | \`${b#$OUT/}\` $sz B | $msz | $mk | $vo / $vm | ${amp:--} | $note |"
+      if is_hang_run "$o"; then
+        ck=$(awk -F'\t' -v n="$n" '$1 == n {print $2; exit}' "$o/rekey/keys.tsv" 2>/dev/null)
+        if [ -f "$o/rekey/in/$n" ]; then
+          note="re-keyed as a crash: AFL saved it under hangs/ (it died after the exec timeout) and the real stack crashes on it ($vo); hang key was: $key"
+          case $ck in ""|NO-*) key="crash on the real stack, filed as a hang by AFL (harness: ${ck:-no report})";;
+                      *) key="$ck (filed as a hang by AFL)";; esac
+        elif [ "$(rank "$vo")" = 3 ] && [ "$(rank "$vm")" -le 3 ]; then
+          t=$(install_secs "$o/verdicts.tsv" "$n")
+          note="slow, not a hang: the harness exceeded $(cfg_of "$o" TIMEOUT) ms + $(cfg_of "$o" EXEC_PAD_S) s in the screen; AFL's exec timeout under ASAN flags inputs that are merely slow"
+          key="SLOW (not a hang: real stack answers in ${t:-?} s): $key"
+        fi
+      fi
+      rep_in="$o/min/$n"; [ -f "$rep_in" ] || rep_in="$OUT/$b"   # the bytes a reader runs ($b is relative to OUT)
+      rk=$(rank "$vo"); rm_=$(rank "$vm"); [ "$rm_" -gt "$rk" ] && rk=$rm_
+      printf '%s\t' "$(sha1sum < "$rep_in" | cut -c1-40)" "$key" "$from" "$on" "$henv" "\`${b#$OUT/}\` $sz B" "$msz" "$mk" \
+             "$vo / $vm" "${amp:--}" "$note" >> "$ROWS"; printf '%s\n' "$rk" >> "$ROWS"
     done
+    # one row per (minimized sha1, key); the most severe member's cells; every campaign listed
+    awk -F'\t' 'NR > 1 { g = $1 SUBSEP $2; if (!(g in best)) { ord[++no] = g; br[g] = -1 }
+        c = $3 " (" $4 ($5 == "-" ? "" : ", " $5) ")"; if (index(cs[g], c) == 0) cs[g] = cs[g] (cs[g] == "" ? "" : "; ") c
+        if ($12 + 0 > br[g]) { best[g] = $0; br[g] = $12 + 0 } }
+      END { for (i = 1; i <= no; i++) { g = ord[i]; split(best[g], f, "\t")
+              printf "| %s | %s | %s | %s | %s | %s | %s | %s |\n", cs[g], f[2], f[6], f[7], f[8], f[9], f[10], f[11] } }' "$ROWS"
   else
-    say "| — | — | — | nothing survived screening | — | — | — | — | — | — |"
+    say "| — | nothing survived screening | — | — | — | — | — | — |"
   fi
   say ""
   say "## Did not reproduce in any configuration tried"
@@ -571,12 +759,15 @@ rule "4. $REPORT"
   # up is superseded by that later run's own nonrepro/.
   if [ -s "$UNRES" ]; then
     while IFS=$'\t' read -r what n dir; do
-      say "* $what: $n input(s) in \`$dir\` -- tried: variants $(echo $VARIANTS), default mode${MODES:+, $MODES}"
+      say "* $what: $n input(s) in \`$dir\` -- tried: variants $(echo $VARIANTS), default mode${MODES:+, $MODES}$([ "$what" = crashers ] && echo "; confirmed on the real stack: see Real-stack-only")"
     done < "$UNRES"
   else
     say "_none_"
   fi
   say ""
+  real_only_section
+  liveness_section
+  if [ -n "${MANIFEST_DRIVEN:-}" ]; then say "## Scope"; say ""; scope_lines; say ""; fi
   say "## Confirm tables"
   say ""
   for f in "$OUT"/*/confirm.out "$OUT"/*/confirm.min.out; do
@@ -591,6 +782,9 @@ rule "4. $REPORT"
   say "  'merged on caller' grouping collapses several functions into one, judge whether that is the bug."
   [ "$NDRIFT" -gt 0 ] && say "* $NDRIFT row(s) marked DRIFT: the minimized bytes reach a different bug; report the original bytes for them."
   [ "$NCOPIED" -gt 0 ] && say "* $NCOPIED row(s) keyed in the harness's copied code: map each harness line to the package line through the copy's source comment."
+  nslow=$(grep -c $'\tSLOW (not a hang' "$ROWS" 2>/dev/null); nslow=${nslow:-0}
+  [ "$nslow" -gt 0 ] && say "* $nslow hang row(s) marked SLOW: the real stack answered within the cell timeout. Not a denial of service unless the time itself is the finding (say the figure)."
+  [ "$NREKEY" -gt 0 ] && say "* $NREKEY hang representative(s) re-keyed as crashes (the real stack crashes on them): judge them with the crashes; the note keeps the hang key."
   [ -n "$NEED_PRISTINE" ] && say "* No pristine build: $PRISTINE_TODO."
   say "* Severity per row, and the npm entry point a reader should use (a harness mode"
   say "  usually corresponds to one)."
@@ -598,6 +792,10 @@ rule "4. $REPORT"
   say "* For a hang: say whether the BARE HARNESS hangs (native code loops; no consumer-side"
   say "  mitigation for a sync call) or only the node stack does, and the budget you allowed."
   say "* For a \`NO-REPORT signal-only\` bucket: check for stack exhaustion; record \`ulimit -s\`."
+  say "* For a \`hang in harness code\` bucket: the loop is in the dispatch the harness mirrors; the"
+  say "  real stack decides (HANG there is a denial of service in the package's own layer)."
+  say "* A \`RUNTIME-ABORT\` cell: the runtime aborted on the binding's broken bookkeeping; a denial"
+  say "  of service, not a memory-safety bug. Quote the runtime's message."
   say "* For an \`out-of-memory\` bucket: quote the amplification and the ceiling."
   say "* Hang buckets are keyed by stack sampling and are approximate: a loop inside an"
   say "  interpreter's recursive walk can land in a coarser bucket on another run."
@@ -606,7 +804,7 @@ rule "4. $REPORT"
   say "  Name the configurations tried before calling it an artifact."
   say "* If nothing was confirmed, cite the harness skill's detection self-test."
 } > "$REPORT"
-ts "  wrote $REPORT ($(wc -l < "$SUM") bucket row(s))"
+ts "  wrote $REPORT ($(wc -l < "$SUM") bucket row(s), $(awk -F'\t' 'NR > 1 {print $1 "\t" $2}' "$ROWS" 2>/dev/null | sort -u | wc -l) after dedup)"
 say ""
 say "Buckets by campaign:"
 [ -s "$SUM" ] && awk -F'\t' '{printf "  %-16s on %-7s %-8s %5s B  %s\n", $1, $2, $3, $4, $6}' "$SUM" || say "  (none)"

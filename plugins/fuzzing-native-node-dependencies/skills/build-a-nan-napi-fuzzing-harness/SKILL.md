@@ -27,7 +27,7 @@ writes `out/` into the package.
 ```sh
 cd $W && . ./fuzz.env     # first line of every block, once step 1 has written fuzz.env
 # 1  <this skill's resources directory>/init_workspace.sh W=/abs/fuzz PKG_NAME=<pkg> PKG=/abs/fuzz/oracle/node_modules/<pkg>
-#    snapshot the prebuilt and make an independent oracle install ($W/oracle)
+#    an independent oracle install ($W/oracle), then $R/check_symbols.sh
 # 2  (cd <package dir> && $R/build_addon.sh VARIANT=plain OUT=$W/out)   # FROM THE PACKAGE DIRECTORY
 #    $R/find_boundary.sh $(find out/plain/Release/obj.target -name '*.o')   -> the function to call
 #    decide the modes: $R/init_workspace.sh W=$W MODES="MODE=file"
@@ -65,20 +65,24 @@ as the absolute path. `init_workspace.sh` ends by running `preflight.sh` (toolch
 now, not mid-campaign. Keys learned later (`MODES`, `ADDON_ASAN`, `REAL_ASAN`, `REAL`)
 are added by re-running it with only those keys, at the step that names them.
 
-Every build step overwrites `build/Release`, so next:
+Then the independent install the gate compares against:
 
 ```sh
 cd $W && . ./fuzz.env
 mkdir -p out oracle
-[ -d node_modules/$PKG_NAME/build/Release ] && cp -a node_modules/$PKG_NAME/build/Release out/prebuilt
 (cd oracle && npm init -y >/dev/null && npm install $PKG_NAME@<version>)   # the REAL stack, at $PKG
 ls oracle/node_modules/$PKG_NAME/build/Release/*.node    # or the prebuild it fetched
 $R/init_workspace.sh W=$W PKG=$PKG     # again, so it reads PKG_VERSION from the install
+$R/check_symbols.sh                    # [DEPENDENCY-]INTERPOSED: references/interposition.md
 ```
 
-Pin `@<version>` when a version is the target: `PKG_VERSION` is read back from whatever
-got installed. The `ls` is the check: an oracle without a built addon is the first thing
-that breaks (`references/build-traps.md`, "The oracle install").
+Pin `@<version>`: `PKG_VERSION` is read back from whatever got installed. The `ls` is
+the check (npm 11's `allowScripts` warning is only a warning). A package that loads a prebuilt instead of building: snapshot it
+(`references/build-traps.md`, "The oracle install").
+
+**`INTERPOSED`**: the installed addon binds to node's own copy of a library it vendors,
+so the vendored code is dead in the real stack. Build the symbolic oracle in
+`references/interposition.md` before step 2.
 
 **Build from the published tarball**, `npm pack $PKG_NAME@$PKG_VERSION` unpacked (`tar
 xzf` gives `package/`): it is what the oracle compiled, and a clone can lack sources a
@@ -87,56 +91,39 @@ versions in the write-up. Either tree takes only the dependency-only install, `n
 install --no-save --omit=dev --ignore-scripts` (`references/build-traps.md`, "Building
 from a clone"), never a plain `npm install`.
 
-**Is a direct harness the right tool here?** Decide it now, not at the end. If every
-call costs milliseconds *at the smallest input the API accepts* (a renderer, a
-compressor at its default level), or everything interesting is inside an uninstrumented
-system library, a direct harness buys less than it costs to keep faithful: say so and
-stop. Two things that look like that and are not: an input-chosen cost (slow only when
-the attacker says so: bound it, step 4), and a slow entry point beside a cheap parser
-of the same bytes (harness the parser as a mode). The speed-up over the interpreter is
-otherwise a given, not a result: do not measure or report it.
+**Is a direct harness the right tool here?** Decide now. If every call costs
+milliseconds *at the smallest input the API accepts* (a renderer, a compressor at its
+default level), or everything interesting is inside an uninstrumented system library,
+say so and stop. Not that case: an input-chosen cost (bound it, step 4), or a slow entry
+point beside a cheap parser of the same bytes (harness the parser as a mode). Do not
+measure or report the speed-up over the interpreter.
 
 **No `binding.gyp` at HEAD** (a zig, cargo or meson build): harness that build (for zig,
-`references/zig-build.md`). **A lockfile pinning an old `nan`** your node cannot compile:
-retry with `--no-package-lock` first. Both in `references/build-traps.md`.
+`references/zig-build.md`). **A lockfile pinning an old `nan`**: retry with
+`--no-package-lock`. **A binding over system libraries** (image codecs): build the oracle
+from source, `npm_config_build_from_source=true npm install`. All three in
+`references/build-traps.md`.
 
-Then look in `build/Release` again, because an `install` script of `prebuild-install ||
-node-gyp rebuild` may already have fetched a CI binary. Snapshot whatever appeared.
-`md5sum` the snapshot against the oracle's addon: if they are the same file, that is one
-piece of evidence, not two.
-
-**Oracle for a binding over system libraries** (image codecs, a 2D renderer): install it
-`--build-from-source`; the prebuilt bundles another back end (`references/build-traps.md`).
-
-Then answer five questions. Each is one command.
+Then answer six questions. Each is one command.
 
 1. **Which ABI, and is the glue hand-written or generated?** Find the glue by what it
-   includes, not by directory (`references/build-traps.md`, "Finding the glue").
-   ```sh
-   cd $W && . ./fuzz.env && cd <package dir>
-   GLUE=$(grep -rl --include='*.c' --include='*.cc' --include='*.cpp' --include='*.cxx' --include='*.h' --include='*.hpp' \
-          --exclude-dir=node_modules --exclude-dir=deps --exclude-dir=vendor --exclude-dir=build \
-          -e 'nan.h' -e 'napi.h' -e 'node_api.h' .)
-   if [ -z "$GLUE" ]; then echo "no glue found: read binding.gyp's sources"; else
-   SRCDIR=$(dirname $(echo "$GLUE" | head -1)); echo "$GLUE"
-   grep -l 'nan\.h' $GLUE >/dev/null && echo NAN; grep -l 'napi\.h' $GLUE >/dev/null && echo node-addon-api
-   grep -l 'node_api\.h' $GLUE | grep -q '\.c$' && echo 'N-API (C)'
-   grep -lim1 "swig\|automatically generated\|pybind11\|DO NOT EDIT\|napi-rs" $GLUE; fi
-   ```
-   The glue TUs are every `.cc` or `.c` in `$SRCDIR` (write its path out in later blocks,
-   the shell does not keep it), not only the hits. Generated glue (SWIG,
-   pybind11, napi-rs) has no binding-free function and nothing to link: the risk is the state its init block installs
-   (step 4, layer 3). Hand-written glue *may* have a boundary; step 2 settles it.
-   Questions 2 and 3 read `build/`, which an `npm pack` tree lacks until the first
-   `build_addon.sh` (step 2): answer them then, or question 2 on the oracle's addon.
+   includes, not by directory: run the block in `references/build-traps.md`, "Finding the
+   glue" (it prints the glue files, `$SRCDIR`, `NAN` / `node-addon-api` / `N-API (C)` and a
+   generator's mark). Generated glue (SWIG, pybind11, napi-rs) has no binding-free
+   function and nothing to link: the risk is the state its init block installs (step 4,
+   layer 3). Hand-written glue *may* have a boundary; step 2 settles it.
+   Questions 2 and 3 read `build/`: answer them after the first `build_addon.sh` (step 2),
+   or question 2 on the oracle's addon. A pack tree's own `build/` is the publisher's
+   (stale binaries); `build_addon.sh` deletes it.
 2. **Is the library compiled into the addon, or a separate shared object?**
    ```sh
    cd $W && . ./fuzz.env && cd <package dir>
    ldd build/Release/*.node | grep -vE "libc|libstdc|libgcc|libm|linux-vdso|ld-linux"
    ```
-   Empty: compiled in, link its objects (step 3a). One project-built `.so`: step 3b. Many
-   system libraries with some parsing in-tree: instrument the addon, accept the system
-   libraries as uninstrumented, and **state that scope** (step 5 reads differently then).
+   Empty: compiled in, link its objects (step 3a). A project-built or system `.so`: step
+   3b decides what to instrument (the addon's own parsing, plus an archive of the one
+   library the bytes go straight into); the rest stay uninstrumented, and you **state
+   that scope** (step 5 reads differently then).
 3. **Which optional features did the build detect?** A missing `-dev` package does not
    fail the build; it turns a decoder into dead code.
    ```sh
@@ -144,17 +131,21 @@ Then answer five questions. Each is one command.
    find build -name '*.target.mk' | xargs grep -ohE 'HAVE_[A-Z0-9_]+|WITH_[A-Z0-9_]+' | sort -u
    ```
    A lone `HAVE_*_CONFIG_H` means reading the vendored config header (`references/build-traps.md`).
-4. **Which binary does the package actually load?** Ask the loader, not the directory
-   (`require('bindings')({bindings:'<name>',path:true})`,
-   `require('node-gyp-build').path('<pkg dir>')`, or a plain
-   `require('./build/Release/<name>.node')` in `lib/*.js`, which loads exactly that file; the
-   real harness's `dlopen` hook covers all three), and run `file` on the result: a
+4. **Which binary does the package actually load?** Ask the loader (`bindings`,
+   `node-gyp-build`, a plain `require` in `lib/*.js`, a copy such as
+   `build/bindings/<name>.node`), not the directory, and run `file` on the result: a
    prebuild can be the wrong architecture. A prebuilt that loads is an asset: gate
-   against it later. Details in `references/build-traps.md`.
+   against it later. The commands: `references/build-traps.md`.
 5. **Does the addon build on this node?** If not (removed V8 API, `#error "C++20 or
    later required."`), install the node version the package supports. Never patch the
    package: then the real stack is no longer the published package. Check whether a
    peer range is what pinned the version before concluding you are stuck.
+6. **How many addons?** `grep target_name binding.gyp`. With several, name the
+   boundary's target (`TARGET=` from step 3 on) and record
+   `$R/init_workspace.sh W=$W ADDON_MATCH='<name>\.node$'`, so the sanitized swap and
+   triage pick one. A second addon the JS needs is compiled into the harness
+   (`references/build-traps.md`, "Several addons in one package"). A `postbuild` target
+   whose `.node` no `lib/*.js` requires is not an addon: no `ADDON_MATCH`.
 
 ---
 
@@ -165,7 +156,8 @@ The deepest function the binding calls that touches no binding API itself.
 **Look for an AsyncWorker first.** In node-addon-api and NAN packages the real work is
 usually in `SomeWorker::Execute()` (or the callback given to `napi_create_async_work` /
 `uv_queue_work`), which by construction may not touch the runtime. When it exists it is
-the boundary, run on a libuv thread whose stack size matters for triage.
+the boundary, run on a libuv thread whose stack size matters for triage, if the JS passes
+the async flag: a wrapper that never does runs it on the main thread.
 
 ```sh
 cd $W && . ./fuzz.env
@@ -174,11 +166,8 @@ $R/find_boundary.sh $(find out/plain/Release/obj.target -name '*.o')   # rank EV
 nm -uC <candidate.o> | grep -E 'Napi::|napi_|v8::|node::'          # which functions own the refs?
 ```
 
-The ranking needs objects: after a prebuilt fetch there are none, so run
-`build_addon.sh VARIANT=plain` (step 3) first. A library a gyp action builds with its own
-build system is not under `obj.target` but in `out/plain/lib/`, so rank its members too
-(`mkdir t && cd t && ar x ../out/plain/lib/lib<dep>.a && $R/find_boundary.sh *.o`), or the
-ranking shows only addon objects. Library objects at 0 and addon objects at 20-60 is the
+The ranking needs objects (after a prebuilt fetch, `build_addon.sh VARIANT=plain` first);
+rank an archive in `out/plain/lib/` too (`references/boundary-shapes.md`). Library objects at 0 and addon objects at 20-60 is the
 whole picture; the lowest count is where to start reading, not the answer: the criterion
 is *a function on your input path whose own body is binding-free*.
 
@@ -189,7 +178,9 @@ harness them behind an **environment variable**, never an input byte: a corpus
 file stays byte-for-byte what the real API consumes, so any seed or crash replays
 unchanged on the real stack. A mode is for a handful of entry points; a free-form
 argument with a large value space that selects code (an encoding-name pair choosing one
-of a hundred converters, a flags string) is input, framed into the file (step 4).
+of a hundred converters, a flags string) is input, framed into the file (step 4), when
+the mode is about it; otherwise the arm uses the defaults and the write-up lists those
+options as not covered.
 **Decide the modes now**, before the first gate: a mode
 added later rebuilds the harness and reruns gate, smoke and self-test. Keep a mode only
 if it reaches library code the default does not (a different decoder, the compressor
@@ -208,8 +199,10 @@ For a generated binding, skip the ranking: `grep -n '<libraryEntryPoint>(' <glue
 
 **No single binding-free function?** Expect one of three shapes, each with its recipe in
 `references/boundary-shapes.md`: the work is a method of an `ObjectWrap` subclass (copy
-its body), every addon function emits into the runtime (mirror the library's API and the
-handler registration), or the dispatch is in JavaScript (drive the C API as `lib/*.js` does).
+its body; by script when it fans out to many helpers), every addon function emits into the runtime (mirror the library's API and the
+handler registration), or the dispatch is in JavaScript (library objects at 0, every glue
+function short: drive the C API as `lib/*.js` does, after probing the oracle for a deferred
+`_flush` error and a state that loops forever).
 
 ---
 
@@ -220,25 +213,23 @@ Two variants now, one at a time, each snapshotted into `out/<variant>/`: `plain`
 instrumentation), is the control for "did my instrumentation invent this bug?": build
 it once a smoke or campaign has saved a crash, before triage (triage skill, step 2).
 
-Every afl-clang-fast variant gets `-include undef_fuzzmode.h` (the scripts pass it),
-because the wrapper defines `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION` and libraries
-compile checks **out** under it; `references/build-traps.md` has the cases and the grep.
-Each also writes `out/<variant>/dict.afl`, the constants the instrumented code compares
-input against (magic bytes, tokens, field values); the corpus skill merges it into the
-campaign's dictionary.
+Every afl-clang-fast variant gets `-include undef_fuzzmode.h` (the scripts pass it):
+the wrapper defines `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION` and libraries compile
+checks **out** under it (`references/build-traps.md`). Each also writes
+`out/<variant>/dict.afl`, the constants the instrumented code compares input against,
+which the corpus skill merges into the campaign's dictionary.
 
 ### 3a. Library compiled into the addon (the common case)
 
 ```sh
 cd $W && . ./fuzz.env && cd <package dir>
 for v in plain asan; do
-  $R/build_addon.sh VARIANT=$v OUT=$W/out [TARGET=<gyp target_name>] [NODE_GYP=...]
+  $R/build_addon.sh VARIANT=$v OUT=$W/out [TARGET=<gyp target_name>] [NODE_GYP=...] [EXTRA_LDFLAGS=-Wl,-Bsymbolic]
 done
 ```
 
 It checks the runtime, coverage, ASAN and that node loads the result, then snapshots
-`build/Release`, vendored archives and the makefile into `out/<variant>/`; pass `TARGET=`
-if it picks the wrong gyp target. The checks: `references/build-traps.md`.
+the build into `out/<variant>/` (`references/build-traps.md`).
 
 Then record the sanitized addon and the sanitized real-side command, which the asan
 gate, `smoke.sh` and triage use:
@@ -255,17 +246,23 @@ compile** (`ADDON_CXX=g++`, linked addon objects then carry no coverage): `refer
 
 ### 3b. Library is a separate shared object, or the whole package is built by zig
 
-**First choice, when the library's build system allows it: an instrumented static
-archive** of the version the oracle loads, built out of tree per variant into
-`out/<v>/lib/` and linked like a vendored one (`LIB=$W/out/$v/lib/lib<dep>.a`), since the
-AFL runtime cannot live in a `.so`; export `AFL_LLVM_DICT2FILE=$W/out/<v>/dict2file.raw`
-into that build after `build_addon.sh`; `link_harness.sh` merges it. The recipe is in `references/build-traps.md`.
+Build the addon as in 3a: its own parsing (format sniffing, a BMP or EXIF reader) is
+often the boundary, and where the bugs usually are. Then rebuild **one** library, the
+one the bytes go straight into, as an instrumented static archive (the AFL runtime
+cannot live in a `.so`) of the version the oracle loads, with the distro's ABI options:
 
+```sh
+cd $W && . ./fuzz.env
+for v in plain asan; do $R/build_lib.sh VARIANT=$v SRC=$W/src-lib [BUILD=cmake] [CMAKE_ARGS=...]; done
+# step 4 links it: LIB=$W/out/$v/lib/lib<x>.a ARCHIVE_LIBS=<x>
+```
+
+Which library, the source, the ABI trap, the build flags, the shared-only route
+(`$R/covstub.c`), zig (`references/zig-build.md`) and `afl_shim.h`:
+`references/build-traps.md`, step 3b.
 The real side still loads the uninstrumented system `.so`, so its sanitized column cannot
-see an overflow inside the library: the write-up and the triage report say so
-(`references/oracle-ceiling.md`, section 4). A library that builds only shared: instrument the `.so` with
-plain clang `-fsanitize-coverage=trace-pc-guard` and `$R/covstub.c`. Both routes, a zig
-build (`references/zig-build.md`) and the `afl_shim.h` rule are in `references/build-traps.md`.
+see an overflow inside the library: say so in the write-up and the triage report
+(`references/oracle-ceiling.md`, section 4).
 
 ---
 
@@ -307,28 +304,24 @@ drivers (the template's tail) and replace sections 5 to 8 wholesale, `#error` li
    function: post-processing that fills in API-visible fields is common and is never
    offered as a boundary candidate.
 
-Three more things to check (`references/four-layers.md`, "How the bytes are delivered"
-and "Make the library actually do the work"):
-
-* **How the bytes are delivered:** choose the corpus encoding so file bytes map to the API
-  value losslessly; several arguments, an option string that selects code among them, go
-  in one file (NUL or newline separated), split identically on both arms, the framing
-  documented at the top of `harness.cc`.
-* **NUL termination:** note whether the input is a raw `Buffer` or a NUL-terminated,
-  transcoded JS string.
-* **Make the library actually do the work:** an open is not a decode; reset only what is
-  safe to reset.
+Also (`references/four-layers.md`): **how the bytes are delivered**: file bytes map to
+the API value losslessly; several arguments, or an option string that selects code, go
+in one file, split identically on both arms, the framing documented at the top of
+`harness.cc`; a raw `Buffer` or a NUL-terminated, transcoded JS string. And **make the
+library do the work**: an open is not a decode; reset only what is safe to reset.
 
 **The `err` field is one token, identical on both sides**, because the corpus skill's
 histograms steer by it. The real template's default takes `e.code`, else the message up
 to the first `": "`, since a `<what>: <input>` message would make `err` unique per seed;
-a message that embeds the input elsewhere gets a `code` in the arm, mirrored in `harness.cc`.
+a message that embeds the input elsewhere gets a `code` in the arm, mirrored in `harness.cc`
+(a trailing position: the `errToken` suffix hook; embedded digit runs: `N`). A binding that maps every
+library error to one message: add the template's ungated `lib_err=` field (not in
+`FIELDS`) and tell the corpus skill `validate.sh FIELD=lib_err` (`references/four-layers.md`, "The `err` token").
 
-**Attacker-declared sizes and work get no cap by default.** Mirror node's own tokens
-(`ERR_OUT_OF_RANGE`, `ERR_MEMORY_ALLOCATION_FAILED`) and the package's own bound, and let
-the fuzzer's memory limit bound the run. The opt-in `ALLOC_CEIL=` / `WORK_CEIL=` apply
-identically on both arms, only at the attacker-declared field; an unbounded
-input-controlled work factor is itself a finding (`references/four-layers.md`, layer 2).
+**Attacker-declared sizes and work get no cap by default**: mirror node's tokens
+(`ERR_OUT_OF_RANGE`, `ERR_MEMORY_ALLOCATION_FAILED`) and the package's own bound. Opt-in
+`ALLOC_CEIL=` / `WORK_CEIL=` apply on both arms at the declared field; an unbounded
+input-controlled work factor is a finding (`references/four-layers.md`, layer 2).
 
 Then link:
 
@@ -361,21 +354,20 @@ compare the deepest artifact the API exposes, not a status code.
 
 ## Step 5 — Gate it
 
-Write `$W/real_harness.mjs` from `$R/real_harness_template.mjs`. It loads the
-`oracle/` install, swaps in a sanitized addon with `ADDON=` (refusing with
+Write `$W/real_harness.mjs` from `$R/real_harness_template.mjs`. It loads `$PKG`, swaps in a sanitized addon with `ADDON=` (refusing with
 `ADDON-NOT-SWAPPED` when no load was redirected), and prints the same line. Its consumer
 calls live in an `ENTRIES` object **keyed by the harness's `MODE` value** (`default` when
-unset): one arm per entry point, no options, no error listener a user would not add, each
+unset): one arm per entry point, no options (unless the mode frames them, step 2), no error listener a user would not add, each
 named after the entry point it reaches (`MODE=file` → the `file` arm). That object is the
-chain's contract: the campaign skill records each mode's `entry` as this key, and the
-triage skill's `confirm.mjs` uses the same object unchanged, so the calls are written once,
-here, where the gate proves they reach the native code. Its catch branch hashes what the
+chain's contract: the campaign records each mode's `entry` as this key and triage's
+`confirm.mjs` uses the object unchanged, so the calls are written once, here. Its catch branch hashes what the
 arm's callbacks put in the `collected` buffer before the error, so the direct harness
 hashes the same partial stream on a reject. The swap mechanics are in
 `references/oracle-ceiling.md`, section 0. Then record `REAL`, write the gate corpus,
 and gate (by hand, after sourcing `fuzz.env`: `$REAL <file>`). The gate corpus is
 15 to 40 seeds: one valid sample per entry point and per dispatch branch, written by
-hand in the framing, plus truncations and flips of them for the reject arm:
+hand in the framing, plus truncations and flips of them for the reject arm (`mkgate.sh`
+writes seven per sample: start from a few):
 
 ```sh
 cd $W && . ./fuzz.env
@@ -395,21 +387,22 @@ The gate's five checks:
 1. **Every seed reaches the library.** Exit 0 licenses nothing.
 2. **Byte-exact agreement on the deepest artifact the API gives you** (the serialized document, every pixel, the hashed event stream): it proves the *option* mirroring, not just the parse.
 3. **Both arms populated, plus one seed per branch of the mirrored dispatch**: truncate and bit-flip seeds for rejects; `MIN_ARMS=1` only for a target that cannot reject.
-4. **Coverage discriminates**: a trivial input scoring nearly as many tuples as a real one means you are measuring init, unless the decoders are in an uninstrumented system `.so` (check `nm -D <lib.so> | grep -c sancov` is 0 first): there rejects out-score successes.
+4. **Coverage discriminates**: a trivial input scoring nearly as many tuples as a real one means you are measuring init, unless the decoders are in an uninstrumented system `.so` (check `nm -D <lib.so> | grep -c sancov` is 0 first): there rejects out-score successes. A tiny decoder whose rejects all die at one point also trips the WARN: harmless when the gate passes.
 5. **The stubs stayed unreachable**: the gate reads the marker from stderr per seed.
 
 `references/oracle-ceiling.md` ("Comparison strength") has the dispatch branches check 3
 needs a seed for.
 
 **On a mismatch, read `references/oracle-ceiling.md` before touching the harness.** The
-order there: a read of out-of-bounds or **uninitialised** memory in the target (ASAN
+order there: symbol interposition (`references/interposition.md`), a read of out-of-bounds or **uninitialised** memory in the target (ASAN
 sees only the first), then the oracle's own lossy
 transformations (`lossy=1` and the soft field), and only then your mirroring. A target
 bug of the first kind is a finding: have the real side mark exactly those inputs
 `lossy=1` so the gate stays honest, and write it down. A seed that crashes both sides is
-`CRASHES-BOTH`, also a finding: move it to `crashers/` with a `crashers.summary.tsv` row
-and out of `corpus/`; the gate skips seeds in `crashers/` as `known-crasher`, so the asan
-re-gate over `corpus-min` needs no exclusions. Re-run the gate after the corpus
+`CRASHES-BOTH`, also a finding; one that kills only the real side is `CRASHES-REAL-ONLY`,
+a bug above the boundary or in the binding's bookkeeping. The gate files them as
+`crashers/gate-both-<orig>` / `gate-real-<orig>` with a summary row for triage, counts
+them apart and does not fail (`references/oracle-ceiling.md`, section 5). Re-run the gate after the corpus
 skill has produced a real corpus; a gate corpus is too small to find the oracle's ceiling.
 
 Gate the `asan` variant too, with the sanitized addon swapped in and the sanitizer
@@ -439,16 +432,15 @@ cd $W && . ./fuzz.env
 $R/smoke.sh SMOKE_S=30 > smoke.log 2>&1 &     # then read smoke.log when it exits
 ```
 
-Run it, and the self-test below, detached: the real-stack replay makes a 30-second
-smoke take minutes (`references/smoke.md`).
-
+Run it, and the self-test below, detached: the real-stack replay can make it take minutes.
 It replays every seed and fuzzes each variant briefly per mode (`MODES` from `fuzz.env`),
-then replays one crash per site on the real stack (`HOSTSAN`, default `REAL_ASAN`;
-without it every crash is `UNVERIFIED`). Exit 1 on `HARNESS-FRAME` (the innermost
-project frame is the harness's own code) or `DIRECT-ONLY` (crashes the harness, not the
-real stack, on input the API can express); exit 2 when the smoke itself did not happen.
+then replays one crash per site on the real stack (`HOSTSAN`, default `REAL_ASAN`).
+Exit 1 on `HARNESS-FRAME` (the innermost project frame is the harness's own code) or
+`DIRECT-ONLY` (crashes the harness, not the real stack); exit 2 when the smoke itself
+did not happen.
 One representative per `REAL` or `PERSISTENT-ONLY` site lands in `crashers/` with a
-summary row, for triage: copy nothing by hand. The other classes and low stability are
+summary row, for triage: copy nothing by hand. It reports `hangs=N` and files one hang
+per variant and mode that still runs on replay into `hangs/`, which triage screens. The other classes and low stability are
 in `references/smoke.md`. **A `PASS` means the harness is not obviously wrong, not that
 it is right**: the gate and the self-test do that.
 
@@ -462,10 +454,14 @@ First write `rebuild.sh` once in the workspace: the `REBUILD` the script runs tw
 #!/bin/sh
 cd "$(dirname "$0")" && . ./fuzz.env
 exec $R/rebuild_asan.sh PKGDIR=<package dir> OUT=$W/out MK=$W/out/asan/<target>.target.mk SRCDIR=<package dir> HARNESS=$W/harness.cc \
-    LIB="$(find $W/out/asan/Release/obj.target/<target>/vendor -name '*.o' | tr '\n' ' ')" [NODE_GYP=...]
+    LIB="$(find $W/out/asan/Release/obj.target/<target>/<lib dir> -name '*.o' | tr '\n' ' ')" \
+    [TARGET=...] [ADDON_OBJS=...] [EXTRA_FLAGS=...] [EXTRA_LDFLAGS=...] [NODE_GYP=...]
 ```
 
-`PKGDIR=` is the package source directory; `fuzz.env`'s `PKG` is the oracle, and `rebuild_asan.sh` refuses one under `oracle/` or `node_modules/`. Never send the build output to `/dev/null`: `detect_selftest.sh` shows it when a rebuild fails. Then:
+`LIB=` and the bracketed arguments are the ones the asan link took (for a 3b archive,
+it and `ARCHIVE_LIBS=`): `references/selftest-rebuild.md`.
+
+`PKGDIR=` is the package source (`rebuild_asan.sh` refuses one under `oracle/` or `node_modules/`). Never send the build output to `/dev/null`: `detect_selftest.sh` shows it on failure. Then:
 
 ```sh
 cd $W && . ./fuzz.env && chmod +x rebuild.sh
@@ -475,15 +471,16 @@ $R/detect_selftest.sh FAULT_SRC=<lib>/src/foo.c \
     [SEED=corpus/<one that takes the faulted path>] > selftest.txt 2>&1
 ```
 
-The fault must land **past an allocation boundary**, anchored to its function
+`FAULT_SED` must write the word `INJECTED` (the marker the script checks; `MARKER=`
+changes it). The fault must land **past an allocation boundary**, anchored to its function
 (`/^Func/,/^}/`). The seed must take the **dispatch branch** the fault sits on: pass
 `SEED=` rather than trusting the script's pick (a pattern that selects another engine
 misses it), and export the `MODE=` that reaches it.
 `references/selftest-rebuild.md` has why.
 
 The restore relinks the asan harness, so re-run the asan gate after the self-test. When
-a gyp action re-extracts the library source during configure, the library is a 3b
-archive, or a zig build, `references/selftest-rebuild.md` has the `rebuild.sh` body to use instead.
+a gyp action re-extracts the library source during configure, or a zig build,
+`references/selftest-rebuild.md` has the `rebuild.sh` body to use instead.
 
 **Keep `selftest.txt`** with its `PASS:` line: the campaign skill refuses to run
 without it (no finds against a harness that detects nothing is not a result) and flags a

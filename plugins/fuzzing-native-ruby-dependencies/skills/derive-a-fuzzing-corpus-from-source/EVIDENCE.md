@@ -111,3 +111,29 @@ grouping and `DRIFT`).
 | change | tag | evidence |
 |---|---|---|
 | new `dict.sh`: merges the build dictionaries with author-supplied tokens (`TOKENS`, `TOKENS_FILE` with `\\xNN` escapes) and regex-harvested literals from sources afl-clang-fast never compiled (`strcmp`/`memcmp`/`case` arms, integer constants in both byte orders), AFL syntax with `\\xNN`, `\\"` and `\\\\` escapes, entries over 128 decoded bytes dropped (afl-fuzz aborts on them), refuses an empty result | **[measured]** on a fabricated extension in the `sectainer-ruby` container, not on a published gem | 25 entries from two build files, TOKENS, a TOKENS_FILE and three source files; escaping checked with `cat -v`; afl-fuzz loaded all 25 ("Loaded 25 extra tokens"); a missing path exits 2, an empty result exits 1 |
+
+## Round 3 fixes mirrored from the Node plugin (2026-10-09)
+
+The shared scripts changed identically in both plugins (`check_shared.sh`: 0 drift). The
+rows, with what was observed, are in the Node plugin's corpus EVIDENCE.md under "Round 3
+fixes (2026-10-09)"; they were run in the `sectainer-ruby` container on a Node workspace,
+so on this plugin they are **[carried]**:
+
+| change | tag |
+|---|---|
+| `dict.sh`: `FROM` defaults to every `out/*/dict.afl` (printed), `FROM=none` opts out; `TOKENS` literal with a NOTE on escapes; `TOKENS_FILE` takes AFL-syntax lines; `MODES` values and `default` dropped (`DROP=`); `SRC=` also harvests named hex constants (C `#define`, Ruby `X = 0x...`, JS `exports.X =`) in both byte orders, capped by `NAMED_MAX`; runs `python3 -I` | **[carried]** (the Ruby copy of `dict.sh` ran once in the container with the default `FROM` and `SRC=`, 28 entries, `afl-fuzz` loaded 28; the Ruby constant pattern only on a synthetic `.rb`) |
+| `error_inventory.sh FIELD=` and the collapsed-`err` warning; `references/error-inventory.md` section on `lib_err=` | **[carried]** |
+| `errenum_template.c` loops from `MIN_CODE` (-64) | **[carried]** (the Ruby copy compiled with `-Wall -Werror` and printed negative codes) |
+| `gen_template.rb`: unsigned clamps warn once on a negative value (Ruby has no int32 sign flip, but a negative from a subtraction is the same bug) | **[measured, synthetic]**: `ruby -c` ok; `u32(-5)`, `u32(-6)`, `u16(-1)` printed one warning for `u32` and one for `u16` |
+| step 7: save the union block as a script; file known hangs and real-only crashes by hand as `hand-*` with a summary row; the block keeps `smoke-`, `gate-`, `hand-` rows; step 2/borrowing.md: no fixtures means the writer family | **[carried]** |
+| the lossy-string and `AFL_SKIP_CRASHES` notes moved from SKILL.md to `references/measured-examples.md` to stay under 30,000 bytes | [tool] |
+
+## Round 4 fixes mirrored from the Node plugin (2026-10-09)
+
+Measured on a Node workspace in the `sectainer-ruby` container (rows in the Node plugin's
+corpus EVIDENCE.md, "Round 4 fixes (2026-10-09)"); identical script in both plugins.
+
+| change | tag |
+|---|---|
+| step 7's seed policy is `resources/union_crashers.sh`: keeps every `crashers.summary.tsv` row whose file still exists in `crashers/` or `hangs/` (any name, not only `smoke-`/`gate-`/`hand-`), drops rows for missing files, replaces rows it rewrites; hand-filed inputs may take any name. The Ruby block's `ASAN_TIMEOUT` is now the script's `TIMEOUT` (default 30), and its WARN also fires on an `ERROR: AddressSanitizer` line with no `SUMMARY:` | **[carried]** |
+| SKILL.md size after the move | [tool]: `wc -c` 28,922 |

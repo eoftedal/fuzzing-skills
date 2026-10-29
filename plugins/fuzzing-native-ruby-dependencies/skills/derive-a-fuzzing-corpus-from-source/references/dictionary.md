@@ -25,7 +25,11 @@ lines starting with `#` are comments.
 build writes `out/<variant>/dict.afl`: the constant operands of string and memory compares
 (`strcmp`, `memcmp` and relatives) and of integer compares and `switch` cases, in every
 file afl-clang-fast compiled (the extension's library code, vendored archives built by
-mini_portile, which inherit the variable, and `harness.cc`).
+mini_portile, which inherit the variable, and `harness.cc`). The plain and asan files
+differ by a few entries, so `dict.sh` merges every `out/*/dict.afl` by default and prints
+which it took; `FROM=` names others, `FROM=none` none. Without the merge `$W/dict.afl`
+would hold only your tokens, and since the campaign prefers it to the build file, the
+build constants would silently drop out of every campaign.
 
 It does not see:
 
@@ -48,16 +52,25 @@ It does not see:
 ## What to put in TOKENS
 
 * the framing separators documented at the top of `harness.cc`;
-* every `MODE` value and every option value the harness frames into the input (an option
-  string, an encoding name), including one the code rejects;
+* every option value the harness frames into the input (an option string, an encoding
+  name), including one the code rejects. **Not mode names**: the harness reads `MODE`
+  from the environment, so a mode value is never an input byte. The build dictionary
+  holds the harness's own `getenv`/`strcmp` constants (`default` and the `MODES` values),
+  and `dict.sh` drops them with a NOTE (`DROP="a b"` adds words, `DROP=none` keeps all);
 * the names in any lookup table whose entries select code (converters, handlers,
   sub-parsers); names that one loop looks up as data are worth less (SKILL.md step 4,
   constants axis);
 * a grammar's keywords and operators, including the multi-byte ones (`<![CDATA[`, `-->`,
   `::`, `**=`) and the case variants the lexer accepts.
 
-`TOKENS_FILE=` takes a longer list, and a token with spaces or control bytes; `dict.sh`'s
-header gives both forms' syntax. `SRC=` harvests string literals by regex, capped at
+`TOKENS` is split on whitespace and taken **literally**: `\x04` there is four characters,
+and `dict.sh` prints a NOTE when it sees one. `TOKENS_FILE=` takes a longer list, and a
+token with spaces or control bytes: one entry per line, in AFL syntax (`"\x04\x22M\x18"`)
+or raw with `\xNN` escapes; `#` lines are comments. `SRC=` also harvests **named hex
+constants** no compare spells out (C `#define X 0x...`, Ruby `X = 0x...`, JS
+`exports.X = 0x...`), each of two bytes or more in both byte orders, at most
+`NAMED_MAX=64`. A **bit-packed format** (an entropy-coded stream, bit-field headers)
+gains little from byte tokens: they line up with a field only by chance. `SRC=` harvests string literals by regex, capped at
 `MAXLEN=` (32) bytes; keep it to the files that hold the tokens. afl-fuzz uses at most
 `MAX_DET_EXTRAS` (256 in AFL++'s `config.h`) entries in its deterministic stage and the
 rest only at random, so a dictionary of thousands of harvested strings dilutes the ones
@@ -93,6 +106,6 @@ in front of any document and reach a converter no seed named.
 
 `campaign.sh` passes `afl-fuzz -x` with `$W/dict.afl` by default, else the variant's
 `out/<variant>/dict.afl`; `DICT=none` disables it, and the manifest's `dict` column records
-which file each campaign used. The harness skill's smoke run picks the same default.
+which file each campaign used, relative to the workspace (`dict.afl` is `$W/dict.afl`). The harness skill's smoke run picks the same default.
 Whether a dictionary raises coverage on your target is not measured in this plugin: a
 short campaign with `DICT=none` beside one with it settles it.

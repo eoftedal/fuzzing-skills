@@ -27,11 +27,13 @@ cd $W && . ./fuzz.env           # $W written out as the absolute workspace path:
 $SKILLS/triage-fuzzing-findings/resources/triage_all.sh \
     GOOD=corpus/<a gate seed with status=0> \
     ASAN_RT=$($R/find_asan_rt.sh)
+# a package that loads several addons: fuzz.env's ADDON_MATCH (the regex of the one you
+# built, e.g. ADDON_MATCH='<name>\.node$') is the default; pass it here only to override
 ```
 
 `fuzz.env` (written by the harness skill) supplies `PKG` (the `oracle/` install: a fresh,
 pinned `npm install` of the published package, no second install), the ASAN addon,
-`MODES` and `ALLOC_CAP_MB`; an explicit `KEY=VALUE` wins. `ASAN_RT` is the runtime the
+`ADDON_MATCH`, `MODES` and `ALLOC_CAP_MB`; an explicit `KEY=VALUE` wins. `ASAN_RT` is the runtime the
 sanitized confirm columns preload; pass it as above unless `triage_all.sh`'s header lists it
 among the `fuzz.env` defaults. With `campaigns/manifest.tsv` in the workspace (written by the
 campaign skill) that is the whole command; see "Manifest mode" in Step 2. Without one, also
@@ -116,6 +118,12 @@ cd $W && $R/link_harness.sh VARIANT=pristine MK=out/pristine/<target>.target.mk 
     LIB="$(find out/pristine/Release/obj.target/<dep> -name '*.o')"
 ```
 
+When the library came in as the harness skill's **static archive** (step 3b), `obj.target`
+holds no pristine library: build it first with `$R/build_lib.sh VARIANT=pristine` and the
+same SRC/BUILD/arguments as the other variants (`out/<v>/lib-build/build_lib.args` holds
+them), into `out/pristine/lib/`, then run `build_addon.sh VARIANT=pristine` and
+`link_harness.sh VARIANT=pristine ... LIB=$W/out/pristine/lib/lib<dep>.a`.
+
 The driver finds `out/pristine/` by itself and fills the `npm-js+pristine-addon` column,
 the only one that earns "reproduces without the coverage instrumentation" (Step 4).
 Without it that column reads `(no PRISTINE)`, and `triage_all.sh` says so.
@@ -128,7 +136,7 @@ workspace with nothing but `GOOD` (and `ASAN_RT`). `NO_MANIFEST=1` forces discov
 
 | from the manifest | how |
 |---|---|
-| campaign list, `variant`, `out_dir` | one run per campaign with `crashes/` or `hangs/` files, on that campaign's own build |
+| campaign list, `variant`, `out_dir` | one run per campaign with `crashes/` or `hangs/` files, on that campaign's own build; every instance's directory (`default/`, or `main/` and `s<i>/` with `SECONDARIES`), deduplicated by content |
 | `mode_env` | the harness mode for that campaign (`default` = none); the non-default values also become `MODES` for `crashers/` |
 | `entry` | every distinct value becomes `ENTRIES` for confirm, unless you pass `ENTRIES` |
 | `alloc_cap_mb` | the screening ceiling per campaign (the largest becomes the default `ALLOC_CAP_MB`) |
@@ -142,6 +150,19 @@ harness skill's `smoke/` tree is skipped in that check. The workspace's `crasher
 crashes) are triaged too, even when no campaign saved a crash: against every variant, then
 under each recorded non-default mode. A non-`completed` campaign's crashes are real; the absence of more
 is not evidence.
+
+**What no bucket shows is confirmed anyway**, before the report, and also on a run with
+nothing to bucket:
+
+* **Liveness**: `GOOD=` (or `GOOD_<entry>=`) through every arm in `confirm.mjs`'s ENTRIES,
+  printed and copied into REPORT.md, so a no-findings run still proves the pasted arms reach
+  the package.
+* **Real-stack-only crashers**: a `crashers/` input that reproduces on no instrumented build
+  crashes only the real stack (a runtime abort in the binding's bookkeeping, a JS-layer kill,
+  code the harness does not mirror). Each is confirmed under the mode its
+  `crashers.summary.tsv` row or name records, through every arm when none is recorded,
+  into `triage/real-only/` and REPORT.md's "Real-stack-only" section. Not minimized: no
+  harness crashes on it.
 
 Applied per campaign, with a timestamped line each: `exec_timeout_ms` sets its hang screen
 (2 × it in ms, plus 1 s start-up; `HANG_MULT`/`HANG_PAD_S`), and `stability` < 90 % sets
@@ -279,12 +300,21 @@ package file and line named in the copy's source comment, not the `harness.cc` l
 | bucket | meaning | action |
 |---|---|---|
 | `NO-REPORT signal-only sigN` | crashed, no sanitizer frame | usually **stack exhaustion** — a real DoS needing no sanitizer. Not noise. |
+| `hang in harness code (<frame>)` | the hang's stacks hold only harness frames | the loop is in the JS (or Ruby) dispatch the harness **mirrors**, not in the library. The real stack decides: `HANG` there is a denial of service in the package's own layer; CLEAN there is a mirroring error to send back to the harness skill |
 | `hang in <function>` | the bare harness never returned | **DoS in the native code itself.** Keyed by interrupting the sanitized harness with SIGABRT at several points and taking the innermost frame common to every stack that never recurs. Approximate: a loop inside an interpreter's recursive walk (its evaluate/expand passes) can land in a coarser bucket on another run |
 | `out-of-memory` | declared-size allocation | resource exhaustion; read the **install** column |
 | `NO-CRASH (rc=N)` | did not reproduce here | wrong build or mode, or a persistent-mode artifact |
 
 Counts are distribution, not severity. An out-of-bounds **write** outranks a 1-byte read
 regardless of count, which is why the access is in the key.
+
+**A hang bucket is AFL's verdict at its exec timeout**, auto-calibrated to tens of ms on an
+instrumented, often sanitized build: it also files inputs that are merely slow under ASAN,
+and crashes that died after the threshold. REPORT.md tells them apart from the confirm
+cells. A hang row whose every cell answers (worst `CAUGHT`) within the cell timeout reads
+`SLOW (not a hang: real stack answers in <t> s)`; a hang representative whose original
+bytes are `NATIVE-CRASH` on the real stack is re-keyed as a crash (its sanitizer key, from
+`bucket.sh` without `HANGS`), the hang key kept in the note. Judge each as labelled.
 
 ---
 
@@ -302,13 +332,18 @@ Verdict ladder, most severe first:
 
 1. **NATIVE-CRASH** — a signal or sanitizer report. No JS handler catches a signal: not
    `try/catch`, not `uncaughtException`, not a domain.
-2. **UNCAUGHT** — surfaced only through the process handlers. A call-site `try/catch` does
-   **not** stop it. DoS unless the consumer installed a global handler.
-3. **HANG** — no answer within `TIMEOUT_MS`. Algorithmic DoS.
-4. **CAUGHT** — threw, rejected, or reached the consumer's own callback. A
+2. **RUNTIME-ABORT** — a signal with the runtime's own invariant message (`Check failed:`,
+   `Fatal error`) and no sanitizer report: the binding broke V8's bookkeeping and V8
+   aborted. Uncatchable, so a DoS, but not a memory-safety finding.
+3. **UNCAUGHT** — surfaced only through the process handlers. A call-site `try/catch` does
+   **not** stop it. DoS unless the consumer installed a global handler. `after=return`: the
+   call returned (often partial output) and **then** threw on a later tick, which kills the
+   process all the same. A CLEAN is therefore held `SETTLE_MS` (default 50) before it prints.
+4. **HANG** — no answer within `TIMEOUT_MS`. Algorithmic DoS.
+5. **CAUGHT** — threw, rejected, or reached the consumer's own callback. A
    `try/catch`/`.catch()` is enough.
-5. **CLEAN** — no error, with `evidence=` of what the call produced.
-6. **SKIPPED** — the JS layer wanted more than `ALLOC_CEIL`, which `confirm.sh` sets to the
+6. **CLEAN** — no error, with `evidence=` of what the call produced.
+7. **SKIPPED** — the JS layer wanted more than `ALLOC_CEIL`, which `confirm.sh` sets to the
    bucket's own sanitizer ceiling (`cap.tsv`, else `ALLOC_CAP_MB`); proves nothing either way.
    Deliberately not CAUGHT: absorbing our own ceiling into "a careful consumer is safe"
    would be a false acquittal.
@@ -350,7 +385,9 @@ sensitivity, resource exhaustion, and the artifact patterns to recognise:
 
 ## Step 4 — Judge and write the report
 
-`triage/REPORT.md` has one row per bucket with the facts and a "still to do by hand" list.
+`triage/REPORT.md` has one row per bug with the facts and a "still to do by hand" list: rows
+with the same minimized bytes and bucket key are merged, the campaigns that found them listed
+in one cell (per-campaign rows: `triage/report_rows.tsv`).
 The bucket table shows the minimized input's own sanitizer key beside the original's, and
 **`DRIFT`** when they differ: afl-tmin reduced the input onto another bug. `minimize.sh`
 keys drift on the first non-interceptor frame (a key of `__asan_memcpy` would hide it) and
@@ -373,6 +410,8 @@ Severity:
 | npm install natively crashes | **critical** |
 | only a sanitized build crashes | **memory-safety bug** |
 | hangs the bare harness, or `HANG` through node | **denial of service** |
+| `RUNTIME-ABORT` (V8 aborts on the binding's bookkeeping) | **denial of service**, any consumer; quote the runtime's message, do not call it memory corruption |
+| `UNCAUGHT`, including `after=return` | **denial of service** unless the consumer installs a global handler |
 | the input sets the work factor (a cost or rounds field, an iteration count) and the package does not bound it | **denial of service, time amplification**: quote the field, and the time at its minimum and at the largest value accepted; a hang bucket whose inputs differ only in that field is this, not a loop bug |
 | the package catches it | **low** |
 | CLEAN on every entry point | **not a finding** — say so and why, do not drop it silently |
@@ -405,8 +444,10 @@ read the code for.
 **If nothing is confirmed** — including no crash files at all — cite the harness skill's
 detection self-test and the campaign's execs and stability. Without it, "nothing found" is
 indistinguishable from "the harness detects nothing", and is not a result. The no-findings
-`REPORT.md` has a Scope section whose "Instrumented:" line you fill in: which library code
-carried coverage and sanitizers in the harness. For a library the package loads as a
+`REPORT.md` has a Scope section pre-filled from the manifest (per campaign: variant, mode,
+execs, edges, stability, dictionary; and the `real_harness.mjs` arms no campaign fuzzed);
+finish its two TODO lines: which library code carried coverage and sanitizers in the
+harness, and the public calls no arm covers. For a library the package loads as a
 system `.so` (the harness linking an instrumented static archive of it), write that the
 sanitized confirm column ran the sanitized addon against the uninstrumented system library,
 so it cannot see an overflow inside the library; only the direct harness could

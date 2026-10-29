@@ -2,3 +2,4 @@ build-a-ruby-c-extension-fuzzing-harness/resources/gate.sh	321eadd83c0be28f7a1c2
 build-a-ruby-c-extension-fuzzing-harness/resources/smoke.sh	7945823aab28b245033ff30fd7e0454b789790aa
 triage-fuzzing-findings/resources/screen.sh	6eba0dab32753947d46698460ad0f3c95d74185c
 triage-fuzzing-findings/resources/bucket.sh	ca99ab911a18a1b7aa606f7de76ccb1bdbccfe8f
+triage-fuzzing-findings/resources/triage_all.sh	dd8667190a32559655564c1336502aa14ad4d94e

@@ -13,6 +13,7 @@
  *   cc -o errenum errenum_template.c <lib>/src/errors.c -I<lib include>      # or the pristine .o files
  *   ./errenum | sort > errs.all
  *   cut -f2 maps_final/.results | grep -oE 'err=[^ ]*' | sort -u | sed 's/err=//' > errs.hit
+ *   (lib_err= instead of err= when the binding collapses every error into one message)
  *   comm -23 <(cut -d' ' -f2 errs.all | sort) errs.hit       # never reached, by name
  *
  * The token form (spaces -> '_') matches what the harness template prints for `err`.
@@ -29,13 +30,15 @@
  * (rename this file .cc); every result is COPIED below before the temporary dies.   */
 #define ERROR_STRING(code)  LIBRARY_ErrorString(code)     /* <-- fill in */
 #define MAX_CODE            128                           /* <-- past the last enum member: read the enum, some run past 100 */
+#define MIN_CODE            (-64)                         /* <-- codes can be NEGATIVE (some decoders number errors below 0): set
+                                                             below the lowest member, or 0 when the enum starts there */
 int main(void) {
   /* Most such functions return a filler ("unknown error", "unspecified error code") for
    * codes that are not enum members, and it is non-empty, so skip whatever the function
    * says about a code that is certainly out of range. */
   char filler[256] = "", s[256];
   snprintf(filler, sizeof filler, "%s", ERROR_STRING(MAX_CODE) ? ERROR_STRING(MAX_CODE) : "");
-  for (int c = 0; c < MAX_CODE; c++) {
+  for (int c = MIN_CODE; c < MAX_CODE; c++) {      /* from MIN_CODE: error codes are often negative */
     if (!ERROR_STRING(c)) continue;
     snprintf(s, sizeof s, "%s", ERROR_STRING(c));
     if (!*s) continue;

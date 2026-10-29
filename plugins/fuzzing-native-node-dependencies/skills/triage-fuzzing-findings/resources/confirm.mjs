@@ -9,7 +9,8 @@
 //     [ENTRY=<name>] node confirm.mjs <crash file>
 //
 // Verdict (printed as `verdict=...`, and the process exit code):
-//   CLEAN    (0)  the call returned / the Promise resolved with no error at all.  Printed
+//   CLEAN    (0)  the call returned / the Promise resolved with no error at all, and nothing
+//                 threw in the SETTLE_MS after it (see "A CLEAN waits" below).  Printed
 //                 with `evidence=` -- see "Do not believe a bare CLEAN" below.
 //   CAUGHT  (10)  it threw synchronously, or rejected a Promise -- a `try{}catch` or a
 //                 `.catch()` at the call site stops it.  A careful consumer is safe.
@@ -17,6 +18,9 @@
 //                 'unhandledRejection' (an EventEmitter 'error' with no listener, a throw
 //                 from an async callback the package did not tie to its Promise).  It
 //                 escapes an ordinary try/catch; only a global process handler stops it.
+//                 `after=return` when the call had already returned or resolved: a
+//                 synchronous call that hands back (partial) output and then throws from a
+//                 stream 'error' handler on a later tick kills the process all the same.
 //   HANG    (25)  it neither returned nor errored within TIMEOUT_MS.  An algorithmic DoS
 //                 no try/catch can stop.  NOT a clean run.
 //   SKIPPED (30)  the input asked the JS layer to allocate more than ALLOC_CEIL, so this
@@ -129,7 +133,7 @@ const asFile = (b, ext = '') => {
   writeFileSync(p, b); return p;
 };
 
-let done = false;
+let done = false, returned = false;
 const finish = (v, code, extra = '') => {
   if (done) return; done = true;
   const swap = !ADDON && !ADDON_MAP.length ? 'absent'
@@ -144,10 +148,25 @@ const finish = (v, code, extra = '') => {
 };
 // These fire only when nothing at the call site caught it.  They rank as UNCAUGHT, below
 // a native crash and above a clean catch.
+const late = () => (returned ? ' after=return' : '');
 process.on('uncaughtException',  (e) => tok(e) === 'alloc-ceiling'
   ? finish('SKIPPED', 30, ' note=alloc-ceiling')
-  : finish('UNCAUGHT', 20, ` via=uncaughtException err=${tok(e)}`));
-process.on('unhandledRejection', (e) => finish('UNCAUGHT', 20, ` via=unhandledRejection err=${tok(e)}`));
+  : finish('UNCAUGHT', 20, ` via=uncaughtException err=${tok(e)}${late()}`));
+process.on('unhandledRejection', (e) => finish('UNCAUGHT', 20, ` via=unhandledRejection err=${tok(e)}${late()}`));
+
+// A CLEAN waits.  A call can return, or resolve, and THEN throw: a synchronous decode that
+// drives a stream returns the partial output, and the stream's 'error' (re-emitted from its
+// flush on a later tick, or thrown from a handler the package attached) reaches the process
+// as an uncaught exception after the call site is gone.  No try/catch helps, and it kills
+// the process.  Finishing CLEAN at once (process.exit) hid exactly that: measured on two
+// compression bindings, truncated or corrupt inputs read CLEAN and kill the process.  So a
+// CLEAN is held for two setImmediate turns plus SETTLE_MS (default 50), during which the
+// handlers above turn a late throw into UNCAUGHT.  Every other verdict is immediate.
+const SETTLE_MS = Number(process.env.SETTLE_MS ?? 50);
+const clean = (extra) => {
+  if (done) return; returned = true;
+  setImmediate(() => setImmediate(() => setTimeout(() => finish('CLEAN', 0, extra), SETTLE_MS)));
+};
 
 // Do not believe a bare CLEAN: a mis-wired consumer call returns successfully while
 // decoding nothing, and then every crash in the table reads CLEAN and gets dropped.
@@ -195,7 +214,7 @@ setTimeout(() => finish('HANG', 25, ` note=no-answer-in-${process.env.TIMEOUT_MS
 // the same unpooled Buffer, and asFile(b, ext) is the same helper.  errback and okback exist
 // only here; use them in an arm that answers through callbacks.
 const errback = (e) => finish('CAUGHT', 10, ` via=callback err=${tok(e)}`);
-const okback  = (r) => finish('CLEAN', 0, ` evidence=${describe(r)}`);
+const okback  = (r) => clean(` evidence=${describe(r)}`);
 const ENTRIES = {
   default: (b) => lib.doTheThing(b),
   // Uncomment / adapt the arms the package actually has, and confirm each:
@@ -218,10 +237,10 @@ if (!call) { process.stdout.write(`verdict=ERROR no-such-entry=${entry}\n`); pro
 try {
   const result = call(buf);
   if (result && typeof result.then === 'function') {
-    result.then((r) => finish('CLEAN', 0, ` evidence=${describe(r)}`),
+    result.then((r) => clean(` evidence=${describe(r)}`),
                 (e) => finish('CAUGHT', 10, ` err=${tok(e)}`));
   } else if (result !== undefined) {
-    finish('CLEAN', 0, ` evidence=${describe(result)}`);
+    clean(` evidence=${describe(result)}`);
   }
   // result === undefined: an emitter/callback arm answers through its own handlers or the
   // HANG timeout.  Do NOT call finish('CLEAN') here -- that is the mis-wired-call trap.

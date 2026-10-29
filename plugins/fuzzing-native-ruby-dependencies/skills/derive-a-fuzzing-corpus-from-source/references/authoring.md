@@ -8,7 +8,9 @@ generated family dies early or the success path stays uncovered.
 `$RC/gen_template.rb` names files `<family>-<nnn>-<name>` so `validate.sh PREFIX=`
 can slice a family, writes the manifest *outside* the corpus directory, clamps every
 written integer to its field width, and separates the declared value from the actual
-layout. What you add is the two rules below.
+layout. An unsigned clamp given a negative value warns once on stderr (`u32: negative
+value clamped`): that is a sign bug in the generator, not a boundary you chose, and a
+silent clamp to 0 would turn a whole family into one unintended value. What you add is the two rules below.
 
 ## Defaults that parse to completion, proved by a byte diff
 

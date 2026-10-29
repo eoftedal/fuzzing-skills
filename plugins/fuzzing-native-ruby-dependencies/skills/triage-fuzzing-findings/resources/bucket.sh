@@ -173,8 +173,15 @@ lib_frames() {
     | grep -vE $'\t/usr/|sanitizer|compiler-rt' \
     | awk -F'\t' '{n=$2; sub(/.*\//,"",n); sub(/(:[0-9]+)+$/,"",n); if (n ~ /^harness/ || $1 ~ /^main$/) next; print $1 " @ " n}'
 }
+# The harness's OWN frames of one sample (harness*.c/cc, not main), innermost first: a hang
+# whose samples have only these loops in code the harness mirrors (a state machine copied
+# from the package's JS or Ruby dispatch), not in the library.
+harness_frames() {
+  sed -n 's/^ *#[0-9]* 0x[0-9a-f]* in \(.*\) \(\/[^ ]*\):[0-9]*\(:[0-9]*\)\{0,1\}$/\1\t\2/p' \
+    | awk -F'\t' '{n=$2; sub(/.*\//,"",n); sub(/(:[0-9]+)+$/,"",n); if (n ~ /^harness/ && $1 !~ /^main$/) print $1 " @ " n}'
+}
 hang_key() {  # <file> -> a bucket key for a hang
-  local f=$1 t smp=() frames k common out j=0 d
+  local f=$1 t smp=() hsmp=() frames k common out j=0 d
   d=$(mktemp -d)
   # Samples are independent processes, so run them IN PARALLEL: 12 samples cost the wall
   # time of the longest one (~4 s), not 12 runs end to end.
@@ -187,8 +194,22 @@ hang_key() {  # <file> -> a bucket key for a hang
   for out in "$d"/s*; do
     frames=$(lib_frames < "$out")
     [ -n "$frames" ] && smp+=("$frames")
+    frames=$(harness_frames < "$out")
+    [ -n "$frames" ] && hsmp+=("$frames")
   done
   rm -rf "$d"
+  if [ "${#smp[@]}" = 0 ] && [ "${#hsmp[@]}" -gt 0 ]; then
+    # Stacks, but only harness frames: the loop is in the dispatch the harness mirrors (it
+    # was keyed "no stack", which read as if the sanitized build had answered).  Key on the
+    # innermost harness frame every sample shares; the real stack decides what it means.
+    local top=""
+    while read -r k; do
+      common=1
+      for frames in "${hsmp[@]}"; do sed 's/(.*) @ / @ /' <<<"$frames" | grep -qxF "$k" || { common=0; break; }; done
+      [ "$common" = 1 ] && { top=$k; break; }
+    done < <(sed 's/(.*) @ / @ /' <<<"${hsmp[0]}")
+    echo "hang in harness code (${top:-$(sed 's/(.*) @ / @ /' <<<"${hsmp[0]}" | head -1)})"; return
+  fi
   if [ "${#smp[@]}" = 0 ]; then echo "NO-REPORT hang (no stack: the sanitized build answered or gave none)"; return; fi
   # Key on the innermost frame that is (a) on the stack in EVERY sample and (b) never
   # recurs in ANY sample.  Why both: a loop that keeps re-walking a tree (an interpreter's

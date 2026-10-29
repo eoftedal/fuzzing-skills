@@ -5,7 +5,7 @@
 #
 #   resources/init_workspace.sh W=/abs/fuzz PKG_NAME=<pkg> PKG=/abs/oracle/... \
 #       [MODES="MODE=file"] [ADDON_ASAN=/abs/...|EXT_ASAN=/abs/...] [REAL="..."] [REAL_ASAN="..."] \
-#       [FIELDS=...] [SOFT_FIELD=...] [SOFT_DROP=...] [ALLOC_CAP_MB=...]
+#       [FIELDS=...] [SOFT_FIELD=...] [SOFT_DROP=...] [ALLOC_CAP_MB=...] [ADDON_MATCH='<name>\.node$']
 #
 # Re-run it with only the keys to change (W= and, say, MODES="MODE=file MODE=string"): keys
 # given on this run replace, every other key in an existing fuzz.env is kept.  W is required
@@ -16,6 +16,12 @@
 # REAL and REAL_ASAN, when never given, default to the workspace's real-stack harness, but
 # only once that file exists (REAL_ASAN also once the sanitized build's path is known): a
 # run before step 5 writes neither, the next run after the file appears does.
+# ADDON_MATCH (Node): the regex naming the one addon to swap when the package loads several
+# (build_addon.sh prints it); the real harness, gate.sh, smoke.sh and triage read it from here,
+# and the default REAL_ASAN carries it.
+# Once PKG exists (Node): check_symbols.sh runs on the addon the package actually loads
+# (which file that is, and whether node interposes the library it vendors), and an npm
+# tarball under W that ships its own build/ is named.  Neither changes the exit status.
 # Prints the resulting file, then runs preflight.sh; its exit status is this script's.
 set -uo pipefail
 # internal names are lower case: fuzz.env keys are upper case and must not clobber them
@@ -23,7 +29,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 # the plugin from this script's own path, as preflight.sh does
 case $here in *nan-napi*) rtbin=node; rh=real_harness.mjs; swap=ADDON ;;
               *)          rtbin=ruby; rh=real_harness.rb;  swap=EXT ;; esac
-keys="SKILLS R RC W PKG_NAME PKG PKG_VERSION ADDON_ASAN EXT_ASAN MODES FIELDS SOFT_FIELD SOFT_DROP ALLOC_CAP_MB REAL REAL_ASAN"
+keys="SKILLS R RC W PKG_NAME PKG PKG_VERSION ADDON_ASAN EXT_ASAN ADDON_MATCH MODES FIELDS SOFT_FIELD SOFT_DROP ALLOC_CAP_MB REAL REAL_ASAN"
 known() { case " $keys $extra " in *" $1 "*) return 0;; esac; return 1; }
 
 # arguments into A_<key>, the old file into O_<key>; the caller's environment plays no part
@@ -111,7 +117,8 @@ elif [ -z "${REAL:-}" ]; then echo "init_workspace.sh: NOTE: no $W/$rh yet, so n
 san=${ADDON_ASAN:-${EXT_ASAN:-}}
 if [ -z "${REAL_ASAN:-}" ] && [ -n "$san" ] && [ -f "$W/$rh" ]; then
   if asanrt=$("$here/find_asan_rt.sh" 2>/dev/null); then
-    REAL_ASAN="env LD_PRELOAD=$asanrt PKG=$PKG $swap=$san $rtbin $W/$rh"
+    am=""; [ "$swap" = ADDON ] && [ -n "${ADDON_MATCH:-}" ] && am="ADDON_MATCH=$ADDON_MATCH "
+    REAL_ASAN="env LD_PRELOAD=$asanrt PKG=$PKG $am$swap=$san $rtbin $W/$rh"
   else echo "init_workspace.sh: WARN: no ASAN runtime found (find_asan_rt.sh); REAL_ASAN left unset" >&2; fi
 fi
 
@@ -127,9 +134,24 @@ tmpf=$(mktemp "$W/.fuzz.env.XXXXXX") || exit 2
   for k in $keys $extra; do
     [ -n "${!k+x}" ] || continue
     # an empty sanitized path is the same as none
-    case $k in ADDON_ASAN|EXT_ASAN|REAL_ASAN) [ -n "${!k}" ] || continue;; esac
+    case $k in ADDON_ASAN|EXT_ASAN|REAL_ASAN|ADDON_MATCH) [ -n "${!k}" ] || continue;; esac
     printf '%s=%s\n' "$k" "$(q "${!k}")"
   done
 } > "$tmpf" && mv "$tmpf" "$envf" || { rm -f "$tmpf"; exit 2; }
 echo "== $envf"; cat "$envf"; echo
+if [ "$rtbin" = node ]; then
+  # an npm tarball that ships build/ (a publisher's build/Release, makefiles from another
+  # machine): ldd/readelf on the unpacked tree's build/ reads THEIR binary until the first build
+  for t in "$W"/*.tgz "$W"/*/*.tgz; do
+    [ -f "$t" ] || continue
+    nb=$(tar tzf "$t" 2>/dev/null | grep -c '^package/build/')
+    [ "$nb" -gt 0 ] && echo "init_workspace.sh: NOTE: $t ships a build/ directory ($nb entries: $(tar tzf "$t" 2>/dev/null | grep '^package/build/' | grep -m3 -E '\.node$|\.mk$|Makefile$' | sed 's#^package/##' | paste -sd' ')):" \
+      && echo "        anything read from the unpacked tree's build/ before build_addon.sh is the publisher's build, not this machine's; build_addon.sh deletes it before configure"
+  done
+  # which addon the package loads, and whether node interposes the library it vendors
+  if [ -d "$PKG" ] && [ -f "$here/check_symbols.sh" ]; then
+    echo "== check_symbols.sh (the addon require(PKG) loads, and symbol interposition by node)"
+    bash "$here/check_symbols.sh" WORKSPACE="$W"; echo
+  fi
+fi
 exec bash "$here/preflight.sh"

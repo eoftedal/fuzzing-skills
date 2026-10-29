@@ -4,6 +4,12 @@ Read this when `gate.sh` reports MISMATCH on some seeds and not others. Work thr
 causes in this order; the first two are cheap to check and the third is the one you
 actually want to find. When every seed fails or produces no output, start at section 0.
 
+Before section 1, rule out **symbol interposition** (`interposition.md`): if
+`check_symbols.sh` prints `INTERPOSED`, the installed package runs the runtime's copy of
+the library, not the vendored one the harness links, and every diagnosis below would be
+about the wrong code. Its tell is a few valid seeds with the same `out_len` (or within a
+byte or two) and a different `out_hash`, which neither ASAN nor MSan explains.
+
 ## 0. Every seed fails: the command, not the seeds
 
 The real side (`real_harness_template.mjs`) swaps in a sanitized addon with `ADDON=`
@@ -142,10 +148,36 @@ it is still the distribution's uninstrumented `.so`. So:
 * agreement on a seed the library accepts still proves the mirroring, since both run the
   same library version, provided the archive was built from the version the `.so` is;
 * the triage confirm table's sanitized column measures the addon only.
+* gate check 4 (coverage discriminates) WARNs when most decoders are system `.so` files:
+  the instrumented edges are the addon's and the one archived library's, so seeds of
+  the other formats score alike. Expected; it is harmless when checks 1 to 3 pass. Say in
+  the write-up which decoders the coverage saw.
 
 State it in the write-up ("the sanitized real side runs the sanitized addon against the
 uninstrumented system library; it cannot see an overflow inside the library") and in the
 triage report's Scope section, on its "Instrumented:" line.
+
+## 5. Seeds that crash a side: `CRASHES-BOTH` and `CRASHES-REAL-ONLY`
+
+A seed that crashes both sides is `CRASHES-BOTH`, a finding in the library or in copied
+package code. The gate files it itself: a copy at `crashers/gate-both-<orig>` with its
+`crashers.summary.tsv` row (the corpus skill's `union_crashers.sh` keeps every row whose
+file still exists), counted apart, not a failure; the original stays in the gate corpus.
+Move nothing by hand. The gate skips seeds in `crashers/` as `known-crasher`,
+so the asan re-gate over `corpus-min` needs no exclusions. Expect them on the asan gate
+when the addon's own parsing has a bug its truncations reach: one run filed nine, every
+truncation of one valid sample.
+
+A seed that kills the real side while the direct harness returns normally is
+`CRASHES-REAL-ONLY`. The gate copies it to `crashers/gate-real-<orig>` with a summary
+row, counts it separately, and does **not** fail on it. It is a bug above the boundary or
+in the binding's own bookkeeping, which the harness does not mirror and should not: a
+runtime check failure (`Check failed: ...` from V8's external-memory accounting fed by a
+custom allocator), an abort in post-processing. Triage screens `crashers/`; since the
+direct harness does not crash on it, it is the confirm step against the installed
+package (triage skill) that classifies it. Read the
+first line of the real side's stderr before calling it a finding: an `ADDON=` path or a
+missing preload breaks every seed, not one.
 
 ## The harness reports facts; the gate judges
 
@@ -159,6 +191,12 @@ Compare the **deepest artifact** the API will give you: the serialized document,
 decoded pixel, or for a callback-driven library the **event stream** (tag, names,
 attribute pairs, text bytes) hashed on both sides. A width and a height can agree while
 every byte differs, and an event *count* can agree while the contents differ.
+
+**The gate corpus size.** `mkgate.sh` multiplies: each sample gives itself, `TRUNC`
+truncations and `FLIPS` corruptions (7 files at the defaults), so 20 samples write
+about 150 files, well past the 15 to 40 SKILL.md asks for. More seeds cost only gate
+time, but a gate that takes minutes gets skipped later: start from five or six samples
+(one per format and entry point), or lower `TRUNC=` / `FLIPS=` to 1 or 2.
 
 The gate corpus needs more than both status arms: **one seed per branch of the mirrored
 dispatch** (an unsized frame for a streaming fallback, a declared size over the ceiling,

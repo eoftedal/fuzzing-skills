@@ -34,6 +34,14 @@
 #      smoke-<variant>[@<mode>]-<original name>, with a row "<name>\tsmoke <class> <site>"
 #      (plus how many crashes shared the site) appended to $WS/crashers.summary.tsv.  A file
 #      whose content is already there is skipped
+#   H  every HANG the smoke run saved, counted per (variant, mode) and printed in the
+#      summary and on the PASS line (hangs=N).  The smallest per (variant, mode) is replayed
+#      on that variant's fork harness for HANG_S seconds (default 5): one that still runs
+#      then is copied into $WS/hangs/ (the corpus skill's seed-policy directory, which
+#      triage_all.sh screens) as smoke-<variant>[@<mode>]-<original name>; one that finishes
+#      is only slow under AFL's millisecond timeout, and is listed, not handed on.  A hang
+#      is not the harness's fault by itself (a mirrored dispatch loop that never ends is the
+#      package's), so it never fails the smoke test: it is a finding to look at
 #   D  one verdict and an exit status
 #
 # Classes, per crash (grouped by site in the report):
@@ -90,6 +98,7 @@
 #              (default 90)
 #   CAMPAIGNER path to run-a-fuzzing-campaign's campaign.sh
 #   ALLOC_CAP_MB   memory ceiling (default 1024), as everywhere else
+#   HANG_S     seconds a saved hang must still run on replay to be handed to hangs/ (default 5)
 set -uo pipefail
 for kv in "$@"; do case $kv in WORKSPACE=*) WORKSPACE=${kv#*=};; esac; done
 WS=${WORKSPACE:-.}; [ -f "$WS/fuzz.env" ] && { set -a; . "$WS/fuzz.env"; set +a; }
@@ -327,6 +336,35 @@ for k in "${!SITE[@]}"; do sh=${SHR[$k]:-0}
 [ "$shared" -gt 0 ] && echo "  ($shared crash(es) took their site representative's class \"(same site)\"; per-file rows in smoke/classified.tsv)"
 [ "$total" = 0 ] && echo "  (the smoke run saved no crashes)"
 
+# ---- H. hangs the smoke run saved: counted per (variant, mode), one handed to hangs/ -----
+ts "== H. the saved hangs =="
+HANG_S=${HANG_S:-5}; hang_total=0; hang_handed=0; hang_slow=0; hang_dupes=0
+while IFS=$US read -r name variant driver harness mode_env entry out_dir rest; do
+  [ "$name" = name ] && continue
+  fork=$(hfork "$variant"); menv=""; [ "$mode_env" != default ] && menv=$mode_env
+  n=0; hrep=""
+  for h in "$WS/$out_dir"/default/hangs/id:*; do
+    [ -f "$h" ] || continue; n=$((n+1))
+    if [ -z "$hrep" ] || [ "$(wc -c < "$h")" -lt "$(wc -c < "$hrep")" ]; then hrep=$h; fi
+  done
+  [ "$n" = 0 ] && continue
+  hang_total=$((hang_total + n)); where="$variant${menv:+ [$menv]}"
+  env ${menv//,/ } ASAN_OPTIONS="$ASAN_RUN" timeout "$HANG_S" "$fork" "$hrep" >/dev/null 2>&1; hrc=$?
+  if [ "$hrc" != 124 ]; then hang_slow=$((hang_slow+1))
+    printf '  hangs %3d  %s: the smallest (%s, %s B) finished in under %ss on replay (rc=%s): slow under AFL'"'"'s timeout, not handed on\n' "$n" "$where" "$(basename "$hrep")" "$(wc -c < "$hrep")" "$HANG_S" "$hrc"
+    continue; fi
+  mkdir -p "$WS/hangs"; dup=""
+  for x in "$WS/hangs"/*; do [ -f "$x" ] && cmp -s "$hrep" "$x" && { dup=$(basename "$x"); break; }; done
+  if [ -n "$dup" ]; then hang_dupes=$((hang_dupes+1))
+    printf '  hangs %3d  %s: the smallest (%s B) still runs after %ss; already in hangs/ as %s\n' "$n" "$where" "$(wc -c < "$hrep")" "$HANG_S" "$dup"
+  else
+    hn="smoke-$variant${menv:+@${menv//[\/ ]/_}}-$(basename "$hrep")"
+    cp "$hrep" "$WS/hangs/$hn" && hang_handed=$((hang_handed+1))
+    printf '  hangs %3d  %s: the smallest (%s B) still runs after %ss -> hangs/%s\n' "$n" "$where" "$(wc -c < "$hrep")" "$HANG_S" "$hn"
+  fi
+done < <(rows)
+[ "$hang_total" = 0 ] && echo "  (the smoke run saved no hangs)"
+
 # ---- D. verdict --------------------------------------------------------------------------
 echo; ts "== D. verdict =="
 fail=0
@@ -356,11 +394,15 @@ if [ $((handed + dupes)) -gt 0 ]; then
   echo "        name how many crashes shared each site)$dn.  The others stay in smoke/ (listed in smoke/classified.tsv)."
   echo "        triage_all.sh screens crashers/, so they reach triage with the corpus skill's crashers."
 fi
+if [ "$hang_total" -gt 0 ]; then
+  echo "  NOTE: $hang_total hang(s) saved (section H): $hang_handed handed to $WS/hangs/ (smoke-*) for triage$([ "$hang_dupes" -gt 0 ] && echo ", $hang_dupes already there")$([ "$hang_slow" -gt 0 ] && echo ", $hang_slow group(s) only slow on replay")."
+  echo "        Not a harness failure by itself; a hang the harness mirrors from the package's own dispatch is the package's."
+fi
 [ "$warns" -gt 0 ] && echo "  WARN: $warns speed/stability/completion warning(s) above."
 if [ "$broken" -gt 0 ] || [ -n "$unsmoked" ]; then
   echo "  FAIL: ${broken} smoke campaign(s) aborted or failed${unsmoked:+; variant(s) with no completed/walled run:$unsmoked}."
   echo "        Those builds were not smoked; read $WS/smoke/*.log, fix, and re-run."
   exit 2
 fi
-if [ "$fail" = 0 ]; then echo "  PASS: nothing crashed on the harness's account in ${SMOKE_S}s per variant. This shows the harness is not"; echo "        obviously wrong; it does not show the harness is right (the gate and the self-test do that)."; fi
+if [ "$fail" = 0 ]; then echo "  PASS: nothing crashed on the harness's account in ${SMOKE_S}s per variant (hangs=$hang_total). This shows the harness is not"; echo "        obviously wrong; it does not show the harness is right (the gate and the self-test do that)."; fi
 exit $fail

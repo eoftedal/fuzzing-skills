@@ -27,6 +27,10 @@
 #   NATIVE-CRASH(...)  ruby died on a signal, printed a `[BUG]` report (its own SIGSEGV/
 #                      SIGBUS handler, which aborts) or a sanitizer report: NO Ruby rescue
 #                      can catch this.
+#   RUNTIME-ABORT(sigN)  died on a signal with a runtime invariant message (`Check failed:`,
+#                      `Fatal error`) and no sanitizer report: the runtime aborted on the
+#                      extension's broken bookkeeping.  Uncatchable, a denial of service, not
+#                      a memory-safety finding.  (Measured on Node; carried here.)
 #   UNCAUGHT           an Exception that is not a StandardError (NoMemoryError,
 #                      SystemStackError), a dead gem thread, or fatal: a plain
 #                      `rescue => e` does NOT stop it.
@@ -44,8 +48,8 @@
 #                      extension (or one EXT replaced two extensions).  Not a verdict.
 #
 # Configure with KEY=VALUE arguments, then $WORKSPACE/fuzz.env (WORKSPACE default .), then
-# environment.  From fuzz.env: PKG, PKG_VERSION, ALLOC_CAP_MB, EXT (from EXT_ASAN), and
-# ASAN_RT (from $R/find_asan_rt.sh) when EXT is set.
+# environment.  From fuzz.env: PKG, PKG_VERSION, ALLOC_CAP_MB, EXT (from EXT_ASAN),
+# EXT_MATCH (from ADDON_MATCH), and ASAN_RT (from $R/find_asan_rt.sh) when EXT is set.
 #   PKG       REQUIRED.  oracle/gems/<gem>-<ver> of a FRESH
 #             `gem install --install-dir oracle --platform ruby <gem> -v <version>`, pinned
 #             to the version you harnessed -- a newer release may have fixed the bug, which
@@ -54,7 +58,8 @@
 #   TIMEOUT_MS  confirm.rb's own HANG watchdog (default 10000); keep it below CELL_TIMEOUT.
 #   EXT       the ASAN extension for the second column (out/asan/<name>.so); omit to skip
 #             it (hard crashes still show in column 1).
-#   EXT_MATCH regex limiting which loaded extension EXT replaces.
+#   EXT_MATCH regex limiting which loaded extension EXT replaces (default: fuzz.env's
+#             ADDON_MATCH; an explicit argument wins).
 #   EXT_MAP   `regex=path;regex=path` when the gem loads SEVERAL extensions.  Without it,
 #             one EXT is swapped in for all of them and the cell reads EXT-AMBIGUOUS.
 #             Applies to the ASAN column only; use PRISTINE_MAP for the pristine column,
@@ -82,12 +87,18 @@
 #   CELL_TIMEOUT  seconds per cell (default 30).  A C loop that never releases the GVL
 #             starves confirm.rb's own watchdog; this is what stops it.
 #   OUT       triage work dir (default ./triage); BUCKETS defaults to OUT/buckets.
-#   VERDICTS  machine-readable output (default OUT/verdicts.tsv): name, entry, 3 columns.
+#   VERDICTS  machine-readable output (default OUT/verdicts.tsv): name, entry, 3 columns,
+#             and the install cell's wall-clock seconds (triage_all.sh tells a slow input from
+#             a hang with it: a hang bucket the install answers in 0.3 s is slow, not a hang).
+#   LIVENESS_ONLY=1  run only the GOOD= liveness check of every ENTRIES arm, no table (what
+#             triage_all.sh runs when there is nothing to confirm, so a no-findings run still
+#             shows the pasted arms work).
 set -uo pipefail
 for kv in "$@"; do case $kv in WORKSPACE=*) export "$kv";; esac; done   # find fuzz.env first
 WS=${WORKSPACE:-.}; [ -f "$WS/fuzz.env" ] && { set -a; . "$WS/fuzz.env"; set +a; }
 for kv in "$@"; do case $kv in *=*) export "$kv";; esac; done
 EXT=${EXT:-${EXT_ASAN:-${ADDON_ASAN:-}}}
+EXT_MATCH=${EXT_MATCH:-${ADDON_MATCH:-}}
 # the sanitized columns need the runtime preloaded; find it the way the harness skill does
 if [ -n "$EXT" ] && [ -z "${ASAN_RT:-}" ] && [ -n "${R:-}" ] && [ -f "$R/find_asan_rt.sh" ]; then
   rt=$(bash "$R/find_asan_rt.sh" 2>/dev/null) && [ -n "$rt" ] && ASAN_RT=$rt
@@ -169,6 +180,9 @@ run() {  # <crash file> <env assignments...>  -> prints one cell, sets LAST_OUT
   # abort(), which under ASAN adds a bare "AddressSanitizer:DEADLYSIGNAL" with no report):
   # name the signal Ruby reported, not the SIGABRT it ended with.
   if   grep -q 'Sanitizer: ' <<<"$out"; then echo "NATIVE-CRASH($(sed -n 's/.*Sanitizer: \([A-Za-z-]*\( of memory\)\{0,1\}\).*/\1/p' <<<"$out" | head -1 | tr ' ' '-'))"
+  # A runtime's own invariant abort with no sanitizer report (Node's `Check failed:` /
+  # `# Fatal error`): the extension broke the runtime's bookkeeping.  A DoS, not memory safety.
+  elif [ "$rc" -ge 128 ] && [ "$rc" != 137 ] && grep -qE 'Check failed:|Fatal error' <<<"$out"; then echo "RUNTIME-ABORT(sig$((rc-128)))"
   elif grep -q '\[BUG\]' <<<"$out"; then echo "NATIVE-CRASH(bug-$(sed -n 's/.*\[BUG\] \([A-Za-z ]*[A-Za-z]\).*/\1/p' <<<"$out" | head -1 | sed 's/ at$//' | tr ' ' '-' | cut -c1-24))"
   elif grep -q 'Sanitizer:DEADLYSIGNAL' <<<"$out"; then echo "NATIVE-CRASH(deadlysignal)"
   elif [ "$rc" = 124 ] || [ "$rc" = 137 ]; then echo "HANG(cell-timeout)"
@@ -198,13 +212,14 @@ cell() {  # <minimized file> <original file> <env...>
     local vo; vo=$(run "$orig" "$@")
     # SKIPPED and ERROR are reported too: "the minimized input is clean and the original
     # proved nothing" is not the same claim as a plain CLEAN.
-    case "$vo" in NATIVE-CRASH*|UNCAUGHT|HANG*|CAUGHT|SKIPPED|ERROR*) echo "CLEAN->${vo}(orig)";;
+    case "$vo" in NATIVE-CRASH*|RUNTIME-ABORT*|UNCAUGHT|HANG*|CAUGHT|SKIPPED|ERROR*) echo "CLEAN->${vo}(orig)";;
                   *) echo "$v";; esac
   else echo "$v"; fi
 }
 
-[ -n "$(ls "$BUCKETS" 2>/dev/null)" ] || { echo "no representatives in $BUCKETS; run bucket.sh first" >&2; exit 1; }
-# Machine-readable verdicts, one line per bucket x entry: name, entry, install, asan, pristine.
+[ -n "$(ls "$BUCKETS" 2>/dev/null)" ] || [ "${LIVENESS_ONLY:-0}" = 1 ] || { echo "no representatives in $BUCKETS; run bucket.sh first" >&2; exit 1; }
+# Machine-readable verdicts, one line per bucket x entry: name, entry, install, asan, pristine,
+# install seconds.
 # The driver reads this to decide which representatives are worth minimizing.
 VERDICTS=${VERDICTS:-$OUT/verdicts.tsv}; : > "$VERDICTS"
 
@@ -243,6 +258,7 @@ for E in $ENTRIES; do
   else
     echo "# no GOOD= (or GOOD_${E//[^A-Za-z0-9_]/_}=) given: the CLEAN cells below are unverified. Pass a corpus seed."
   fi
+  [ "${LIVENESS_ONLY:-0}" = 1 ] && continue
   cells=0
   printf '%-34s %-24s %-24s %-24s\n' CRASH 'gem-install(plain)' 'gem+asan-ext' 'gem+pristine-ext'
   for c in "$BUCKETS"/*; do
@@ -253,7 +269,8 @@ for E in $ENTRIES; do
     cap=$(capof "$pname"); cap=${cap:-$ALLOC_CAP_MB}
     SANENV=(ASAN_OPTIONS="$ASAN_BASE:allocator_may_return_null=1:max_allocation_size_mb=$cap"
             ALLOC_CEIL=$(( cap * 1048576 )) ${ASAN_RT:+LD_PRELOAD="$ASAN_RT"})
-    a=$(cell "$c" "$orig" ENTRY="$E" PKG="$PKG")
+    t0=$(date +%s%N); a=$(cell "$c" "$orig" ENTRY="$E" PKG="$PKG")
+    as=$(LC_ALL=C awk -v d="$(( $(date +%s%N) - t0 ))" 'BEGIN { printf "%.2f", d / 1e9 }')
     if [ -n "${EXT:-}" ]; then
       b=$(cell "$c" "$orig" ENTRY="$E" PKG="$PKG" EXT="$EXT" \
                ${EXT_MATCH:+EXT_MATCH="$EXT_MATCH"} ${EXT_MAP:+EXT_MAP="$EXT_MAP"} "${SANENV[@]}")
@@ -263,14 +280,17 @@ for E in $ENTRIES; do
                ${EXT_MATCH:+EXT_MATCH="$EXT_MATCH"} ${PRISTINE_MAP:+EXT_MAP="$PRISTINE_MAP"} "${SANENV[@]}")
     else p="(no PRISTINE)"; fi
     printf '%-34s %-24s %-24s %-24s\n' "$(basename "$c" | cut -c1-34)" "$a" "$b" "$p"
-    printf '%s\t%s\t%s\t%s\t%s\n' "$(basename "$c")" "$E" "$a" "$b" "$p" >> "$VERDICTS"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(basename "$c")" "$E" "$a" "$b" "$p" "$as" >> "$VERDICTS"
     cells=$((cells+1)); ts "# cell $cells/$nb done ($E)" >&2
   done
 done
+[ "${LIVENESS_ONLY:-0}" = 1 ] && exit 0
 echo
 echo "severity: install NATIVE-CRASH = critical (any user, uncatchable);"
 echo "          asan-only NATIVE-CRASH = real memory bug, release build hides the symptom;"
 echo "          reproduces on PRISTINE too = not an artifact of the coverage instrumentation;"
+echo "          RUNTIME-ABORT = the runtime aborted on the extension's broken bookkeeping:"
+echo "                          a DoS (uncatchable), not a memory-safety bug;"
 echo "          HANG = algorithmic DoS, uncatchable by rescue;"
 echo "          UNCAUGHT = escapes \`rescue => e\`; a user must rescue Exception (or the class) explicitly;"
 echo "          CAUGHT = defensible (\`rescue => e\` is enough);"

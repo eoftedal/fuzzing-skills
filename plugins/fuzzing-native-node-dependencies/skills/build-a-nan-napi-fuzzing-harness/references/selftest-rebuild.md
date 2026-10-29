@@ -1,17 +1,47 @@
 # The detection self-test: placing the fault, and REBUILD when `rebuild_asan.sh` does not fit
 
-Read this when step 6 of SKILL.md sends you here: the self-test passed on nothing or
+Read this when step 6 of SKILL.md sends you here: writing `rebuild.sh` for a package that
+needs more than the sketch there, the self-test passed on nothing or
 failed in a way you do not understand, the package's gyp action re-extracts the library
-source during configure, or the package is a zig build. Each recipe below is the body
+source during configure, the library is a step-3b archive, or the package is a zig build. Each recipe below is the body
 of `rebuild.sh` (after its `cd "$(dirname "$0")" && . ./fuzz.env` line), passed as
 `REBUILD=./rebuild.sh`. If you still pass `REBUILD` as a string, it runs under `eval`
 twice, so expand any `$(find ...)` before building it and single-quote the result, or a
 literal `$(find ...)` reaches `eval` and the relink fails with an empty log.
 
+## The default `rebuild.sh`, argument by argument
+
+```sh
+#!/bin/sh
+cd "$(dirname "$0")" && . ./fuzz.env
+exec $R/rebuild_asan.sh PKGDIR=<package dir> OUT=$W/out MK=$W/out/asan/<target>.target.mk \
+    SRCDIR=<package dir> HARNESS=$W/harness.cc [TARGET=<target>] \
+    LIB="$(find $W/out/asan/Release/obj.target/<target>/<lib dir> -name '*.o' | tr '\n' ' ')" \
+    [ADDON_OBJS="..."] [EXTRA_FLAGS="-I..."] [EXTRA_LDFLAGS=-Wl,-Bsymbolic] [NODE_GYP=...]
+```
+
+`rebuild_asan.sh` passes every argument to both `build_addon.sh` and `link_harness.sh`,
+so give it exactly what you gave them for the asan variant:
+
+* `LIB=` is wherever the vendored objects landed, the same `find` you gave
+  `link_harness.sh`: `obj.target/<target>/<lib dir>`, where `<lib dir>` is the vendored
+  subtree's own name (`vendor/<dep>`, `deps/<dep>`, the library's name at the top level),
+  or `obj.target/<dep>/` for a separate gyp target. Not always `vendor`.
+* `TARGET=` when the package has several gyp targets (`build-traps.md`, "Several addons
+  in one package").
+* `ADDON_OBJS=` when the link uses an addon object (a custom allocator's TU).
+* `EXTRA_FLAGS=` when the harness includes a second addon's headers or sources.
+* `EXTRA_LDFLAGS=-Wl,-Bsymbolic` when the addon is built symbolic (`interposition.md`);
+  without it the restore step leaves a non-symbolic asan addon behind.
+
 ## Placing the fault and choosing the seed
 
 Without the self-test, "no crashes found" is indistinguishable from "detects nothing".
 
+* `FAULT_SED` must **introduce the word `INJECTED`** (a `/* INJECTED */` comment on the
+  faulted line): `detect_selftest.sh` greps for it to prove the edit applied, and fails
+  with `FAULT_SED did not apply` when it is missing, even if the code changed. Set
+  `MARKER=` to look for another word.
 * The fault must land **past an allocation boundary**: a 1-byte over-*read* into a larger
   buffer fires nothing.
 * The seed must **reach** it. The script picks the largest non-empty seed that reports
@@ -54,11 +84,20 @@ smoke vouched for, so re-run the asan gate on that harness afterwards.
 
 ## A static archive of a system library (step 3b, first choice)
 
-The same shape as above, with the tree you already have: `FAULT_SRC=` points into
-`$W/src-lib`, and `rebuild.sh` re-exports `AFL_USE_ASAN=1`, runs `make -C $W/build-asan`,
-copies the archive to `out/asan/lib/` and relinks with `link_harness.sh VARIANT=asan ...
-LIB=$W/out/asan/lib/lib<dep>.a`. Leave its output on the terminal: `detect_selftest.sh`
-shows a failed rebuild's output, and a `>/dev/null` in `rebuild.sh` leaves it nothing to show.
+The default `rebuild.sh` covers it once the archive was built with `build_lib.sh`, which
+records its arguments: `rebuild_asan.sh` re-runs the asan `build_lib.sh` with them (out of
+tree, `AFL_USE_ASAN=1` exported, the archive and headers copied back into
+`out/asan/lib/`), then relinks with `link_harness.sh VARIANT=asan`. Give `rebuild.sh` the
+asan link's own arguments, `LIB=$W/out/asan/lib/lib<x>.a ARCHIVE_LIBS=<x>` and any
+`ADDON_OBJS=` / `EXTRA_LIBS=` among them, and point `FAULT_SRC=` into the `SRC=` tree
+(`$W/src-lib/...`). Leave its output on the terminal: `detect_selftest.sh` shows a failed
+rebuild's output, and a `>/dev/null` in `rebuild.sh` leaves it nothing to show.
+
+A library that allocates from its own pools hides a small overrun inside the pool: place
+the fault past the end of a large allocation the library requests on its own (a per-row
+or per-block buffer sized from the header), not one carved from a pool. Case: on the
+JPEG library the fault that fired grew a clear of a block buffer by one block, past the
+large allocation holding it.
 
 ## A zig build
 

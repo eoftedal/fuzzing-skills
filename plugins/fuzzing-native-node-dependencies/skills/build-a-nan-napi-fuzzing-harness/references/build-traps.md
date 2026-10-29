@@ -13,8 +13,9 @@ It removes `build/`, runs `node-gyp configure` with the compiler exported, overr
 breaks its link). After the build it checks that the AFL runtime is in the `.node`, that
 the **library** objects and archives carry coverage symbols, that ASAN symbols are present
 when they should be, and that **node can load the result**. Only then does it copy
-`build/Release` (objects included), vendored archives built outside it (`out/<v>/lib/`)
-and the makefile into `out/<variant>/`. When `binding.gyp` has several targets it prints
+`build/Release` (objects included), vendored archives built outside it (`out/<v>/lib/`,
+which a re-run keeps, so a `build_lib.sh` archive survives) and the makefile into
+`out/<variant>/`. When `binding.gyp` has several targets it prints
 the ones it found and skips postbuild ones; pass `TARGET=` if it guesses wrong. Each check
 below is a trap that cost hours by hand.
 
@@ -34,6 +35,20 @@ after the install: `ls oracle/node_modules/<pkg>/build/Release/*.node`, or the f
 `prebuilds/` the loader resolves ("Which binary does the package actually load?", below).
 If it is missing, allow the package's install script (npm's `allowScripts` setting) or
 run `npm rebuild <pkg>` in `oracle/`, and check again.
+
+**When the package loads a prebuilt instead of building** (an `install` script of
+`prebuild-install || node-gyp rebuild`, or `node-gyp-build` finding a file under
+`prebuilds/`), the oracle's addon is a CI binary, not your compile: snapshot it from the
+oracle (`mkdir -p out/prebuilt && cp -a <the file the loader resolves> out/prebuilt/`)
+and gate against it later as a second independent build. An oracle with
+`build/Release/obj.target` was compiled from source: there is no prebuilt to snapshot.
+`md5sum` the snapshot against your own build's addon: the same file is one piece of
+evidence, not two.
+
+**The `npm pack` tree may already hold a `build/`**: a publisher's browser bundle, stale
+binaries and `*.target.mk` from the publisher's machine. `build_addon.sh` deletes `build/`
+before configuring, so read nothing from it before step 2: `ldd build/Release/*.node` on
+that tree would describe someone else's binary for another platform.
 
 ## Building from a clone
 
@@ -66,6 +81,21 @@ Whichever one runs picks headers from the `node` on `PATH`.
 
 ## Finding the glue (step 1, question 1)
 
+```sh
+cd $W && . ./fuzz.env && cd <package dir>
+GLUE=$(grep -rl --include='*.c' --include='*.cc' --include='*.cpp' --include='*.cxx' --include='*.h' --include='*.hpp' \
+       --exclude-dir=node_modules --exclude-dir=deps --exclude-dir=vendor --exclude-dir=build \
+       -e 'nan.h' -e 'napi.h' -e 'node_api.h' .)
+if [ -z "$GLUE" ]; then echo "no glue found: read binding.gyp's sources"; else
+SRCDIR=$(dirname $(echo "$GLUE" | head -1)); echo "$GLUE"
+grep -l 'nan\.h' $GLUE >/dev/null && echo NAN; grep -l 'napi\.h' $GLUE >/dev/null && echo node-addon-api
+grep -l 'node_api\.h' $GLUE | grep -q '\.c$' && echo 'N-API (C)'
+grep -lim1 "swig\|automatically generated\|pybind11\|DO NOT EDIT\|napi-rs" $GLUE; fi
+```
+
+The glue TUs are every `.cc` or `.c` in `$SRCDIR` (write its path out in later blocks, the
+shell does not keep it), not only the hits.
+
 Find the glue by what it includes, not by directory: it lives in `src/`, `lib/`, or at the
 package root (one `<pkg>.cc` beside `package.json`), and `lib/` often holds only
 JavaScript. Headers are in the grep because a binding often includes `napi.h` from one
@@ -83,13 +113,39 @@ header does not do so itself. When the grep finds nothing at all, read the `sour
 
 ## The oracle for a binding over system libraries
 
-For a binding over system libraries (image codecs, a 2D renderer), install the oracle with
-`npm install <pkg> --build-from-source`. The npm prebuilt bundles its own copies of those
-libraries, which is a different back end from the one your harness links, and it will
-disagree on pixels for the scoped-out decoders. npm may print `npm warn install-scripts
-... not yet covered by allowScripts` and still run the script; confirm what got built with
-`file` on the addon the loader resolves ("Which binary does the package actually load?",
-below).
+For a binding over system libraries (image codecs, a 2D renderer), build the oracle from
+source against the same system libraries the harness links:
+
+```sh
+cd $W && . ./fuzz.env
+(cd oracle && npm init -y >/dev/null && npm_config_build_from_source=true npm install $PKG_NAME@<version>)
+ls oracle/node_modules/$PKG_NAME/build/Release/obj.target    # present: it was compiled here
+```
+
+Use the environment form: npm 11 answers the `--build-from-source` flag with `npm warn
+Unknown cli config "--build-from-source". This will stop working in the next major
+version of npm.` (it still builds today). A prebuilt may bundle its own copies of those
+libraries, a different back end from the one your harness links, which disagrees on
+pixels for the decoders it does not share (not re-measured on the latest evaluation,
+which built from source). npm may print `npm warn install-scripts ... not yet covered by
+allowScripts` and still run the script; confirm what got built with `file` on the addon
+the loader resolves ("Which binary does the package actually load?", below).
+
+**A second `.node` that is not an addon.** Such a package's `binding.gyp` may declare a
+`postbuild`-style target (`<pkg>-postbuild`) that emits a small `.node` file of its own
+into `build/Release/`. It is a build step, not an addon: check what `lib/*.js` requires
+(`grep -rn "require(.*\.node" <pkg dir>/lib/`); when the JS loads only the main `.node`,
+the default `ADDON_MATCH` swaps exactly one file, so record none. `build_addon.sh` skips
+postbuild targets by name and builds the main one.
+
+**Its dependencies can bind to node's copies.** `check_symbols.sh` compares the addon's
+own exports with node's, and also prints `DEPENDENCY-INTERPOSED` (a WARN, not a failure)
+for a shared library the addon loads whose exports node also provides (a compression
+library node bundles, which an image library the addon loads calls). In the real stack
+those calls bind to node's copy, since the executable comes first in symbol lookup; in
+the harness, to the system copy. Note it in the write-up; if the gate disagrees on inputs
+that reach that library, it is the first suspect (`interposition.md`, "A dependency of
+the addon").
 
 ## The make line, and five ways it goes wrong
 
@@ -230,58 +286,120 @@ these two options.
 
 ## The library is a separate shared object (step 3b)
 
-### First choice: an instrumented static archive
+### Addon, archive, or both: which code to instrument
 
-When the library's build system can produce a static archive, build one with the variant
-compiler and link it into the harness like a vendored library. It needs no interposition
-at load time, and the harness carries the AFL runtime as in step 3a. The recipe:
+`ldd build/Release/*.node` (step 1, question 2) lists the shared libraries the addon
+loads. `build_addon.sh` instruments the addon's own objects whatever you decide; the
+question is which library, if any, to rebuild as an instrumented archive.
+
+* **The addon's own code is the boundary** when the addon parses the bytes itself before
+  or instead of a library: an image loader's own format sniffing, an EXIF orientation
+  reader, a BMP parser, a GIF loader that walks the decoded records. That code is in the
+  addon's objects, already instrumented; link the pure-C++ ones via `ADDON_OBJS` (or copy
+  the method, `boundary-shapes.md`).
+* **One library is the boundary** when the bytes go straight into its decoder: rebuild
+  that one as an instrumented static archive (below).
+* **Usually both.** An addon over several system libraries does some parsing itself and
+  hands the rest to the libraries. Instrument the addon and archive one library. On an
+  image-drawing binding over six system libraries every confirmed bug was in the addon's
+  own code, none in the archived library: the addon's own code is the common result,
+  so never skip it to spend the time on archives.
+
+**Which library to archive**, when the addon links several: the one the boundary calls
+directly (its functions appear in `nm -u` of the boundary's object), that parses
+attacker bytes (a decoder, not a renderer or a text shaper fed by the decoder's output),
+largest decoder first, and one whose build system produces a static library. A second
+archive is the same recipe again, if its source is reachable. The others stay system
+`.so`, uninstrumented: their edges are invisible to AFL, gate check 4 WARNs that coverage
+barely discriminates, and the write-up and the triage report's Scope section say which
+decoders were instrumented and which were not.
+
+### First choice: an instrumented static archive, with `build_lib.sh`
 
 ```sh
-cd $W && . ./fuzz.env && cp -a <library source> $W/src-lib   # -a: make does not rerun autotools
+cd $W && . ./fuzz.env
 for v in plain asan; do
-  mkdir -p $W/build-$v $W/out/$v/lib && cd $W/build-$v
-  [ $v = asan ] && export AFL_USE_ASAN=1 || unset AFL_USE_ASAN
-  export AFL_LLVM_DICT2FILE=$W/out/$v/dict2file.raw    # the library's compared constants
-  CC=afl-clang-fast CFLAGS="-g -O1 -include $R/undef_fuzzmode.h" \
-      $W/src-lib/configure --disable-shared --enable-static && make -j
-  cp $(find . -name 'lib<dep>.a') $W/out/$v/lib/
-done            # step 4: link_harness.sh VARIANT=$v ... LIB=$W/out/$v/lib/lib<dep>.a
-# no merge step: link_harness.sh rebuilds out/$v/dict.afl from dict2file.raw plus the harness's own constants
+  $R/build_lib.sh VARIANT=$v SRC=$W/src-lib [BUILD=autotools|cmake|meson|make] \
+      [CONFIGURE_ARGS="..."] [CMAKE_ARGS="..."] [TARGET=<static target>] [ARCHIVES=...] [INC=...]
+done
+# step 4, per variant: link_harness.sh VARIANT=$v ... LIB=$W/out/$v/lib/lib<x>.a ARCHIVE_LIBS=<x>
 ```
 
-Clause by clause:
+It builds out of tree with the variant compiler (`AFL_USE_ASAN=1` for asan,
+`-include undef_fuzzmode.h` against the fuzzing-mode macro, "The compiler wrapper defines
+a macro", above), static only, and puts the archive in `out/<v>/lib/` and the library's
+installed headers in `out/<v>/lib/include/`, where the corpus skill's instrumentation
+check looks too. It writes the library's compared constants to
+`out/<v>/dict2file-lib.raw`, which `link_harness.sh` merges into `out/<v>/dict.afl`, and
+records its arguments so `rebuild_asan.sh` can redo the asan archive for the self-test.
+The script's header has the exact meaning of `TARGET=`, `ARCHIVES=` and `INC=`.
 
-* **The source of the version the oracle loads** (the distribution's source package, or
-  the upstream tag matching the system `.so`), so the harness runs the same library code
-  the real stack does.
-* **`cp -a` the source** into the workspace: plain `cp` resets timestamps, and make then
-  sees `configure.ac` newer than `configure` and tries to rerun autotools, which fails
-  when your automake is not the release's.
-* **Out of tree** (`configure` run from `build-<variant>/`), so the plain and asan builds
-  never share objects (the "clear the objects" trap above, avoided by construction).
-* **`--disable-shared --enable-static`**, so the build leaves no `.so` that a later `-l`
-  could pick instead. For cmake, `-DBUILD_SHARED_LIBS=OFF`; for meson,
-  `--default-library=static`.
-* **`-include $R/undef_fuzzmode.h`** in `CFLAGS`, because afl-clang-fast defines
-  `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION` and the library may compile checks out
-  under it ("The compiler wrapper defines a macro", above).
-* **`AFL_USE_ASAN=1`** in the environment for the asan variant, as `build_addon.sh`
-  does for the addon: the wrapper adds the sanitizer itself. A self-test `REBUILD` of
-  this archive must re-export it (`detect_selftest.sh`'s header).
-* **`AFL_LLVM_DICT2FILE`** in the environment of the library's build, as an ABSOLUTE path
-  (afl-cc aborts on a relative one), pointing at `$W/out/<v>/dict2file.raw`: `build_addon.sh`
-  and `link_harness.sh` set it only for what they compile, so without it `out/<v>/dict.afl`
-  lacks the library's own magic bytes and tokens. Build the library AFTER `build_addon.sh`,
-  which starts that raw file afresh; the pass appends one line per compared constant per
-  function, and `link_harness.sh` deduplicates the raw file together with the harness's
-  constants into `dict.afl`. The corpus skill's `dict.sh` merges that into the campaign's
-  dictionary.
-* The archive goes to `out/<variant>/lib/`, where the corpus skill's instrumentation
-  check looks for it, and `link_harness.sh LIB=out/<variant>/lib/lib<dep>.a` links it;
-  add the library's own dependencies with `EXTRA_LIBS=` (`pkg-config --static --libs`).
+**Order.** Before or after `build_addon.sh`, either works: `build_addon.sh` keeps
+`out/<v>/lib/` across re-runs, and the library's dictionary file is its own. (An earlier
+version wiped the directory on every re-run, and one run lost its archive that way.)
 
-Check: `nm out/<variant>/lib/lib<dep>.a | grep -c sancov` is non-zero, and for asan,
-`nm ... | grep -c __asan_report` is too.
+**The source.** The version the oracle loads: the distribution's source package when
+you can get it (it carries the distro's patches), else the upstream release of the same
+version from the project's own release page. A download mirror may 404 (one run gave up
+a second library that way); a `git clone --depth 1 --branch <release tag>` of the
+project's repository is the fallback. Unpack it into `$W/src-lib` (one directory per
+library when there are several). Building from an upstream tag skips the distro patches:
+say so.
+
+**The build system.** `BUILD=` is detected from the tree; pass it when the tree has
+several. Static-only options differ per project:
+
+* autotools: `--disable-shared --enable-static` (the script's default). `cp -a` a source
+  you copy, or make sees `configure.ac` newer than `configure` and reruns autotools.
+* CMake: many projects have their own switches rather than `BUILD_SHARED_LIBS`
+  (`ENABLE_SHARED=OFF` / `ENABLE_STATIC=ON`, say): read `option(` in `CMakeLists.txt`
+  and pass them in `CMAKE_ARGS`. An older release whose `cmake_minimum_required` is below
+  3.5 is refused by current CMake (`Compatibility with CMake < 3.5 has been removed`):
+  add `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`.
+* meson: `--default-library=static`.
+* plain make: `TARGET=` names the static target.
+
+**The ABI trap.** The distribution may build the library with a non-default ABI option,
+and the upstream default then has a different struct layout. Case: the system JPEG
+library was built for a newer ABI level than the upstream default; the harness would
+have passed the addon's structs to an archive that lays them out differently. Read the
+version macro in the installed config header before configuring, and pass the option
+that reproduces it:
+
+```sh
+grep -rnE '#define [A-Z_]*(VERSION|ABI)[A-Z_]* ' /usr/include/$(gcc -dumpmachine)/*config*.h /usr/include/<lib>*.h 2>/dev/null
+grep -rnE '#define [A-Z_]*(VERSION|ABI)[A-Z_]* ' $W/out/plain/lib/include/ | head    # after the build: must match
+```
+
+**Compile the harness against the archive's headers**, not the system ones, or the
+struct layouts can differ silently even when the ABI options match (a generated config
+header is per build). `link_harness.sh ARCHIVE_LIBS=<x>` puts `out/<v>/lib/include/`
+first on the include path.
+
+**Drop the system library from the link.** `LIBS_FROM_MK=1` lifts the addon's `-l<x>`
+for the very library you archived, and any hard-coded `-L` path `binding.gyp` carries
+(one package names a macOS package-manager directory). Left in, the link can pick the
+`.so`. `ARCHIVE_LIBS=<x>` (several, space-separated) drops the matching `-l<x>` from the
+lifted and the `EXTRA_LIBS` flags; the library's own dependencies go in `EXTRA_LIBS=`
+(`pkg-config --static --libs <x>`).
+
+**Verify**, per variant (`link_harness.sh` fails on the first itself):
+
+```sh
+cd $W && . ./fuzz.env
+ldd out/$v/harness | grep -c 'lib<x>\.so'                 # must be 0
+nm out/$v/harness | grep -E ' T <an entry function the addon calls>$'   # defined in the binary
+nm out/$v/lib/lib<x>.a | grep -c sancov                   # non-zero; for asan, __asan_report too
+```
+
+**The self-test and the pristine variant.** `rebuild.sh` stays the default
+`rebuild_asan.sh` line with the asan link's arguments (`LIB=` the archive,
+`ARCHIVE_LIBS=`): it redoes the asan archive from the arguments `build_lib.sh` recorded,
+then relinks with `link_harness.sh VARIANT=asan`, so `FAULT_SRC=` points into
+`$W/src-lib` (`selftest-rebuild.md`). For triage's control, build the archive once more
+with `build_lib.sh VARIANT=pristine` (plain clang with ASAN, no AFL) and link the
+pristine harness against it; triage's pristine commands otherwise look for library
+objects under `obj.target`, where there are none.
 
 **The consequence to state.** The real side still loads the package as a user has it:
 the addon over the **uninstrumented system `.so`**. Its sanitized column (`REAL_ASAN`)
@@ -346,6 +464,40 @@ Three distinct things go wrong here, all seen on one target:
   file`. `file` on the resolved path catches it; it is a bug in the package.
 * **`build/Release` wins over `prebuilds/`.** Useful when you want your build loaded,
   and the reason a stale local build can silently shadow a correct prebuilt.
+
+**The package may load a copy.** A gyp `copy` or `action_after_build` target can place
+the addon at `build/bindings/<name>.node` (or similar) and `index.js` requires that path,
+not `build/Release/<name>.node`. Read `index.js` (or `main` in `package.json`) for the
+`require`; `md5sum` the two files. The real harness's `dlopen` hook swaps whichever path
+is loaded, so nothing else changes.
+
+## Several addons in one package
+
+`binding.gyp` can declare several real targets (a codec and a hash used by the JS frame
+layer, say). `build_addon.sh` builds one, printing `targets in binding.gyp: a b ->
+building <target>`, and the rest are not built in `out/`. Then:
+
+* **Name the boundary target** and pass `TARGET=<it>` to every `build_addon.sh` and in
+  `rebuild.sh`, even when the automatic pick was right, so a reordered `binding.gyp`
+  cannot change it.
+* **Make the swap unambiguous.** `require(PKG)` loads every addon, and the real harness's
+  default match (`/\.node$/`) then refuses with `AMBIGUOUS-SWAP`. Record the match once,
+  in `fuzz.env`, where the real-side commands and triage read it:
+  ```sh
+  cd $W && . ./fuzz.env
+  $R/init_workspace.sh W=$W ADDON_MATCH='<name>\.node$'
+  ```
+  Single-quote it on the command line; `init_workspace.sh` escapes it, so the file reads
+  `ADDON_MATCH="<name>\\.node\$"` and sources back to the regex. A `REAL_ASAN` you write
+  by hand with `ADDON_MATCH=` inside it needs the same escaping (`\\.` and `\$`).
+* **When the JS layer needs the second addon** (a checksum over the frame, a hash the
+  decoder verifies), the harness needs that code too: compile its library source into
+  the harness TU the way that addon's glue does (a header-only `#define ..._PRIVATE_API` +
+  `#include`, say), or link its objects from a build of that target (`TARGET=<other>`
+  into a scratch `OUT=`, then add them to `LIB=`). Its include directory goes in
+  `EXTRA_FLAGS="-I<package dir>/<its dir>"` on `link_harness.sh` (and in `rebuild.sh`).
+  Say in the write-up whether the second addon's own code was fuzzed: through the
+  harness it is exercised only as the JS calls it.
 
 ## No `binding.gyp` at HEAD
 

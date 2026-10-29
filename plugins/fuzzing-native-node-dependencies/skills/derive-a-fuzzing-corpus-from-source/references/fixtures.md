@@ -30,6 +30,9 @@ Magnitudes are in `measured-examples.md` step 2.
   skips.
 * **A vendored library's test directory may be named `testing`**, which the `find`
   includes for that reason.
+* **None at all.** A package often vendors only a codec's sources, with no tests and no
+  test data. Then the writer-driven family is the source (`success-path.md`): drive the
+  library's own encoder across its options, then truncate and flip its output.
 
 ## Fixtures as string literals
 

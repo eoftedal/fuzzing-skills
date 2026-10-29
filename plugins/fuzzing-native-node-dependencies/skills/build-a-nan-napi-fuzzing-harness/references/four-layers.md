@@ -217,3 +217,26 @@ Read the implementation of any reset you call in a loop. Case: an image-processi
 binding's library-wide cache-drop call reads like a reset and is a *teardown* that frees its hash table
 and leaves it NULL, breaking every later operation. Faithful configuration plus
 `__AFL_LOOP(1000)` is usually the right answer.
+
+## The `err` token: when the binding collapses errors, and when it embeds a position
+
+`err=` is compared by the gate and keyed on by the corpus skill's histograms and error
+inventory, so it has to be one stable token per library error on both sides.
+
+* **A binding that maps every library error to one message** (`throw Error("failed to
+  decompress")` whatever the decoder said) makes `err` correct for the gate and blind for
+  the corpus skill: every reject has the same token. Keep `err` as the binding reports
+  it, and add the template's optional **`lib_err=`** field to the direct harness only,
+  set from the library's own error code or name (`<Lib>GetErrorCode` plus its string
+  function). It is ungated: leave it out of `FIELDS`, and the gate ignores it. Tell the
+  corpus skill to steer by it: `validate.sh FIELD=lib_err`. Adding it later is a harness
+  change (relink, both gates, the self-test again).
+* **A message that ends in a position** (`"<text> @<offset>"`, `" at byte 12"`) has no
+  `": "` for the default `errToken` to cut at, so `err` would be unique per seed. Use the
+  real template's position-suffix hook in `errToken` to strip it, and print the same
+  token from the direct harness.
+* **A library whose messages embed numbers** (a marker code, a declared size, a
+  component count in the middle of the text): replace every run of digits with `N` on
+  both sides (in the arm's `errToken` and in the harness's `set_err()`), so one library
+  error is one token whatever values the input declared.
+

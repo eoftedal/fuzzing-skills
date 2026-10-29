@@ -19,7 +19,8 @@ const require = createRequire(import.meta.url);   // ESM has no `require`
 //    build script overwrites that per variant, and agreeing with an independently
 //    installed copy (different version, different compiler) is a far stronger claim.
 //    For a binding over SYSTEM libraries, install that oracle with
-//    `npm install <pkg> --build-from-source`: the npm prebuilt bundles its own copies of
+//    `npm_config_build_from_source=true npm install <pkg>@<ver>` (npm 11 warns that the
+//    `--build-from-source` flag form is an unknown config): the npm prebuilt bundles its own copies of
 //    the libraries (other builds of its codecs) and is a different back end.
 const PKG = process.env.PKG || '/path/to/oracle/node_modules/<package>';
 
@@ -149,11 +150,22 @@ const emit = (f) => checkSwap(true) || process.stdout.write(
 // token: ERR_OUT_OF_RANGE (a Buffer above kMaxLength), ERR_MEMORY_ALLOCATION_FAILED (the
 // allocator refused a legal length -- the asan gate's max_allocation_size_mb path),
 // ERR_ASSERTION (a package-side assert).
+// MSG_STRIP: a hook for messages that carry the input somewhere other than after ": ",
+// applied to the message before the ": " cut.  A trailing position suffix
+// ("Unexpected end of stream @0", "bad header @4") makes err unique per offset: strip it
+// with / @\d+$/.  Add one regex per shape the oracle shows; the direct harness passes
+// the same stem, without the suffix, to set_err().
+const MSG_STRIP = [
+  // / @\d+$/,                 // trailing " @<position>"
+  // / at (offset|line) \d+.*$/, // " at offset 12", " at line 3, column 4"
+];
 const errToken = (e) => {
   if (typeof e?.code === 'number') return e.code;
   if (typeof e?.code === 'string' && e.code) return e.code.replace(/\s+/g, '_').slice(0, 63);
   if (typeof e?.errno === 'number') return e.errno;
-  const m = String(e?.message ?? e), i = m.indexOf(': ');
+  let m = String(e?.message ?? e);
+  for (const re of MSG_STRIP) m = m.replace(re, '');
+  const i = m.indexOf(': ');
   return (i > 0 ? m.slice(0, i) : m).replace(/\s+/g, '_').slice(0, 63);
 };
 
@@ -202,6 +214,16 @@ try {
   //   s.on('data', c => chunks.push(c)); s.on('error', e => { emit({status:1, err:errToken(e)}); process.exit(1); });
   //   s.on('end', () => { const out = Buffer.concat(chunks); emit({status:0, out_len:out.length, out_hash:fnv1a(out)}); process.exit(0); });
   //   s.end(buf); setTimeout(() => { emit({status:3, err:'timeout'}); process.exit(3); }, 10000);
+  // A SYNCHRONOUS wrapper over a stream (decode(buf) driving a Transform internally) can
+  // behave differently: an error raised from _transform throws out of the call, but one
+  // raised from _flush (a truncated final frame, a missing trailer) may be caught by the
+  // stream machinery and re-emitted on a LATER tick.  The call then RETURNS the partial
+  // output, and the error arrives afterwards as an uncaught exception that kills the
+  // process.  This file exits right after emit(), so it reports what the call returned;
+  // the direct harness must mirror whatever the oracle observably does (here: the partial
+  // output as status=0), not what the library "means".  Probe it once by hand:
+  //   node -e "const r = lib.decode(truncated); console.log('returned', r.length)"  (then: does node die?)
+  // and note the delayed crash as a finding of the package, not the harness.
   //
   // CALLBACK-DRIVEN (SAX) API: register EVERY listener the package offers, serialise
   // each event exactly as the direct harness does (event tag, length-prefixed UTF-8

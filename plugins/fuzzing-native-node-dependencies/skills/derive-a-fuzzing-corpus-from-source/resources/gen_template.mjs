@@ -9,6 +9,9 @@
 //     mapping each file to the branch, bound or hazard that motivated it;
 //   * every written integer CLAMPED to its field width, so a value derived from a
 //     deliberately extreme one cannot make the writer throw before the target sees it;
+//     a NEGATIVE value into an unsigned clamp warns once on stderr: in JavaScript
+//     `0x80000000 | len` and `x << 24` are negative int32s, and a silent clamp to 0 turns
+//     a whole family into a different value.  Write `(0x80000000 | len) >>> 0`;
 //   * the DECLARED value separated from the ACTUAL layout, so a length field can say
 //     0xFFFFFFF0 while the buffer stays small;
 //   * a default record that must parse to completion -- byte-diff it against the real
@@ -28,16 +31,23 @@ const MANIFEST = args.MANIFEST ?? (ONLY ? `${OUT}.manifest.${ONLY}.tsv` : `${OUT
 mkdirSync(OUT, { recursive: true });
 
 // ---- clamps: every value you WRITE goes through one of these -------------------
-const u8  = v => Math.max(0, Math.min(0xff,        Math.floor(Number(v) || 0)));
-const u16 = v => Math.max(0, Math.min(0xffff,      Math.floor(Number(v) || 0)));
-const u32 = v => Math.max(0, Math.min(0xffffffff,  Math.floor(Number(v) || 0)));
+const warned = new Set();
+const neg = (name, v) => {          // a sign bug, not a boundary: say so once per helper
+  if (Number(v) < 0 && !warned.has(name)) {
+    warned.add(name); console.error(`${name}: negative value clamped, use >>> 0 (got ${v})`);
+  }
+  return v;
+};
+const u8  = v => Math.max(0, Math.min(0xff,        Math.floor(Number(neg('u8', v)) || 0)));
+const u16 = v => Math.max(0, Math.min(0xffff,      Math.floor(Number(neg('u16', v)) || 0)));
+const u32 = v => Math.max(0, Math.min(0xffffffff,  Math.floor(Number(neg('u32', v)) || 0)));
 const i32 = v => Math.max(-0x80000000, Math.min(0x7fffffff, Math.floor(Number(v) || 0)));
 // 64-bit fields (content sizes, offsets) are BigInt: clamp the same way, write with
 // buf.writeBigUInt64LE(u64(v), off).  Boundaries worth a seed each: 2n**32n, 2n**53n
 // (the largest exact JS double, which the JS layer may sum sizes in), 2n**63n, 2n**64n-1n.
 const U64_MAX = (1n << 64n) - 1n;
 const u64 = v => {
-  const n = Number(v);
+  const n = Number(neg('u64', v));
   const b = typeof v === 'bigint' ? v
           : n === Infinity ? U64_MAX : BigInt(Number.isFinite(n) ? Math.floor(n) : 0);
   return b < 0n ? 0n : b > U64_MAX ? U64_MAX : b;

@@ -21,7 +21,8 @@ $RC/error_inventory.sh SRC=<vendor dir> PREFIX=<LIB> RESULTS=maps_baseline/.resu
    it together with the library's error-string source file (the AFL-instrumented objects
    do not link into a plain program; the pristine ones do), and diff its output against
    the `err` column of `.results`. It skips the filler string such functions return for
-   non-members. The mapping is exact, and on every target that had such a function (Node
+   non-members. It walks from `MIN_CODE` (default -64), because error codes are often
+   negative; set it below the enum's lowest member. The mapping is exact, and on every target that had such a function (Node
    bindings) it was the right route. An enum member the parser never sets is dead code,
    which is a finding, not a gap.
 2. **The enum, when the harness prints the numeric code.** Parse the enum from the header
@@ -54,3 +55,13 @@ The gem's Ruby wrapper (`lib/**/*.rb`) may **shadow** the library's header error
 pre-check that raises its own error before the native call. A code is then reachable only
 through an input that gets past the pre-check first (an unsized first frame). The
 per-family `err` histogram is where that shows.
+
+## When the binding collapses every error into one message
+
+Some bindings map every library error to one fixed message, so `err` is the same token
+for every reject: correct for the gate, which compares what the real stack shows, and
+useless for the histograms and the inventory. `error_inventory.sh` warns when every
+rejected input has one value. Give the direct harness an **ungated** `lib_err=` field
+holding the library's own error name or code (the gate compares only `FIELDS`, so it
+ignores the extra key), re-run `measure.sh`, then pass `FIELD=lib_err` to `validate.sh`
+and `error_inventory.sh`, and diff `errenum`'s output against the `lib_err` column.

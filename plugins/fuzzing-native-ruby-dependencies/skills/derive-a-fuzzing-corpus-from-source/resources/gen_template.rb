@@ -10,6 +10,8 @@
 #     mapping each file to the branch, bound or hazard that motivated it;
 #   * every written integer CLAMPED to its field width, so a value derived from a
 #     deliberately extreme one cannot make pack() wrap silently before the target sees it;
+#     a NEGATIVE value into an unsigned clamp warns once on stderr (a sign bug in the
+#     generator, such as a subtraction that went below zero, not a boundary you chose);
 #   * the DECLARED value separated from the ACTUAL layout, so a length field can say
 #     0xFFFFFFF0 while the buffer stays small;
 #   * a default record that must parse to completion -- byte-diff it against the real
@@ -41,16 +43,24 @@ def clamp(v, lo, hi)
   n = f.floor
   n < lo ? lo : (n > hi ? hi : n)
 end
-def u8(v);  clamp(v, 0, 0xff);                     end
-def u16(v); clamp(v, 0, 0xffff);                   end
-def u32(v); clamp(v, 0, 0xffffffff);               end
+WARNED = {}
+def neg(name, v)            # say so once per helper: a clamp to 0 hides a sign bug
+  if (v.is_a?(Numeric) ? v : (Float(v) rescue 0)).negative? && !WARNED[name]
+    WARNED[name] = true
+    warn "#{name}: negative value clamped (got #{v}); mask it to the field width if you meant the bits"
+  end
+  v
+end
+def u8(v);  clamp(neg('u8', v), 0, 0xff);           end
+def u16(v); clamp(neg('u16', v), 0, 0xffff);        end
+def u32(v); clamp(neg('u32', v), 0, 0xffffffff);    end
 def i32(v); clamp(v, -0x80000000, 0x7fffffff);     end
 # 64-bit fields (content sizes, offsets): Ruby Integers are arbitrary precision, so the
 # clamp is the same; write with [u64(v)].pack('Q<').  Boundaries worth a seed each:
 # 2**32, 2**53 (the largest exact Float, which a Ruby wrapper may sum sizes in), 2**63,
 # 2**64-1.
 U64_MAX = (1 << 64) - 1
-def u64(v); clamp(v, 0, U64_MAX); end
+def u64(v); clamp(neg('u64', v), 0, U64_MAX); end
 # Check every size field's ENCODING against the real writer before deriving from it:
 # one frame format stores (size - 256) under one flag value; one compressed container stores
 # (n + 1) * 4 in a header length byte.  A wrong encoding rule kills a whole family while every seed "runs".

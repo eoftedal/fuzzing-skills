@@ -26,6 +26,11 @@ records, per instrumented object, the constant operand of each comparison: integ
 compares against an immediate (magic numbers, field values, `case` labels) and
 `memcmp`/`strcmp`/`strncmp`/`strcasecmp` calls with a literal argument. The result,
 deduplicated, is `out/<variant>/dict.afl`, and the build summary prints its entry count.
+The plain and asan files differ by a few entries (on one target two constants were in
+the plain file only), so `dict.sh` merges every `out/*/dict.afl` by default and prints
+which it took; `FROM=` names others, `FROM=none` none. Without the merge `$W/dict.afl`
+would hold only your tokens, and since the campaign prefers it to the build file, the
+build constants would silently drop out of every campaign.
 An entry count near zero for a parser that obviously checks magic bytes means the
 library was not compiled by those scripts (a 3b archive without the export, harness
 skill `references/build-traps.md`).
@@ -47,9 +52,30 @@ It does not see:
 * **Values the code computes before comparing** (a hash of a name, a checksum).
   A token for the name still helps when the hash is over the token.
 
-Those are what `TOKENS=` and `TOKENS_FILE=` are for. A token holding a space goes in
-`TOKENS_FILE=`, one per line. Check the written `dict.afl` for any non-printing
-separator: it must appear as its `\xNN` escape.
+Those are what `TOKENS=` and `TOKENS_FILE=` are for. `TOKENS` is split on whitespace
+and taken **literally**: `\x04` there is the four characters backslash, x, 0, 4, and
+`dict.sh` prints a NOTE when it sees one. A binary token, or one holding a space, goes
+in `TOKENS_FILE=`, one entry per line, in AFL syntax (`magic="\x04\x22M\x18"` or
+`"\x00"`) or raw with `\xNN` escapes; `#` lines are comments. Check the written
+`dict.afl` for any non-printing separator: it must appear as its `\xNN` escape.
+
+**Tokens are input bytes.** The harness reads its mode from the environment, so a mode
+name is never in the input and is no token; the build dictionary holds the harness's own
+`getenv`/`strcmp` constants (`default` and the `MODES` values), and `dict.sh` drops
+those (it names them in a NOTE; `DROP="a b"` adds words, `DROP=none` keeps everything).
+An option value counts only when the input carries it (a framed option string).
+
+**`SRC=` also harvests named hex constants** that no compare spells out: C `#define X
+0x...`, JS `exports.X = 0x...` and `const|let|var X = 0x...`, Ruby `X = 0x...`. A
+JavaScript layer that checks `magic === lib.MAGIC` compares against a name, so the
+literal regex sees nothing there. Each constant of two bytes or more is written in
+little- and big-endian order as separate entries, at most `NAMED_MAX=64`; the count line
+says how many were seen and kept.
+
+**A bit-packed format gains little.** Where fields are a few bits wide and not
+byte-aligned (an entropy-coded stream, a header assembled from bit fields), a byte token
+lines up with a field only by chance; a handful of header bytes is enough, and the
+corpus does the rest.
 
 ## A worked example: a converter selected by name
 
@@ -63,11 +89,13 @@ over the table.
 ```sh
 cd $W && . ./fuzz.env
 grep -ohE '"[A-Z0-9_-]{3,24}"' <lib>/src/<name-table>.c | tr -d '"' | sort -u > names.txt
-printf '%s\n' '\x00' stream default >> names.txt
+echo '"\x00"' >> names.txt          # the separator, in AFL syntax
 $RC/dict.sh OUT=./dict.afl TOKENS_FILE=names.txt SRC="lib/*.js"
 ```
 
-The result holds, beside the build-time constants:
+It prints the build files it merged (`out/asan/dict.afl out/plain/dict.afl`), a NOTE
+dropping `"stream"` (a `MODES` value the harness compares) and a count per source. The
+result holds, beside the build-time constants:
 
 ```
 "\x00"
@@ -77,7 +105,6 @@ The result holds, beside the build-time constants:
 "ISO-8859-1"
 "SHIFT_JIS"
 "EUC-JP"
-"stream"
 ```
 
 Now a mutant that replaces `UTF-8` with `EUC-JP` reaches a different converter in one
@@ -90,5 +117,6 @@ option, a stylesheet's property names, or a query language's keywords and operat
 
 `campaign.sh` passes `-x $W/dict.afl` when it exists, else the variant's
 `out/<variant>/dict.afl`; `DICT=none` turns it off, and the manifest's `dict` column
-records which one ran, because a finding that needed a token reproduces through its
-saved input but is found again only with the same dictionary.
+records which one ran (a path relative to the workspace: `dict.afl` is `$W/dict.afl`),
+because a finding that needed a token reproduces through its saved input but is found
+again only with the same dictionary.

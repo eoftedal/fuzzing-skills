@@ -148,6 +148,10 @@ know how big an effect to expect. `EVIDENCE.md` maps each target to its totals.
   `SUMMARY:` line, and the pass recorded nothing and said nothing; at 90 seconds the same
   pass found 32 ASAN-only crashers. Hence the 30-second default and the `WARN` line for a
   run that exits 86 or on a signal with no `SUMMARY:`.
+* **The crasher pass uses the campaign's and the gate's `ASAN_OPTIONS`.** Without the
+  allocation ceiling a seed that merely *declares* a huge size aborts with
+  allocation-size-too-big and is filed as a crasher it is not. It runs in the default
+  mode only, in parallel: a crash only in another mode is that mode's campaign's to find.
 * **`AFL_IGNORE_SEED_PROBLEMS=1`, not `AFL_SKIP_CRASHES=1`.** The latter covers crashing
   seeds only and says nothing of hanging ones.
 * **A nondeterministic seed can be a crasher.** `nondet.sh` once moved 20 seeds to

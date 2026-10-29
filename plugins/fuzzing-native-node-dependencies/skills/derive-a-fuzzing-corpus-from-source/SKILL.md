@@ -115,11 +115,9 @@ for a in out/plain/lib/*.a; do [ -f "$a" ] && echo "$(basename $a) sancov=$(nm $
 # only if the harness links a shared library: nm -D on each ldd ./out/plain/harness-fork entry
 ```
 
-Every archive non-zero (or no archives) is the good case. Spend the family budget where
-the instrumentation is: when every decoder is in a system `.so` with `sancov=0` (or the
-harness links no instrumented archive of it), write for the **in-tree parsers** (`references/measured-examples.md`
-step 1); a family, or step 8's writer seeds, for an uninstrumented decoder adds nothing
-you can measure.
+Every archive non-zero (or none) is the good case. When every decoder is in a system
+`.so` with `sancov=0`, write for the **in-tree parsers** (`references/measured-examples.md`
+step 1): a family, or writer seeds, for an uninstrumented decoder measures as nothing.
 
 Many seeds sharing one map die early if all *fail*, and run uninstrumented code if all
 *succeed*: check the exit codes before concluding either.
@@ -149,13 +147,11 @@ Cheapest coverage available, in this order. Measure each as an A-side (step 7), 
    ```sh
    cd $W && . ./fuzz.env; P=<package dir>
    $RC/extract_literals.py OUT=./corpus-fixtures STARTS='<' SRC=$P/<lib>/tests/*.c
-   $RC/extract_literals.py OUT=./corpus-fixtures RE='^(\x89PNG|GIF8)' SRC=$P/test/*.js
-   $RC/extract_literals.py OUT=./corpus-fixtures DECODE=hex SRC=$P/tests/*.ts
-   $RC/extract_literals.py OUT=./corpus-fixtures ALL=1 SRC=$P/tests/*.c   # no signature byte
    ```
-   `JSREGEX=1` for JS regex literals; wrap
-   each literal into a **structured** input convention before measuring; `data:` URIs
-   are not reachable this way. Options and cases: `references/fixtures.md`.
+   `RE=`, `DECODE=hex`, `ALL=1`, `JSREGEX=1`, and wrapping each literal into a
+   **structured** input convention: `references/fixtures.md`. **No tests or test data in
+   the tarball** (common for a vendored codec): the writer-driven family (item 4, step 8)
+   is the source.
 4. **The library's own writer.** Where the dependency can write the format (step 8), its
    default output is a sample corpus you generated yourself.
 
@@ -184,6 +180,9 @@ Three routes to the list, best first (`references/error-inventory.md` has each):
 * a numeric code from the harness: parse the enum from the header;
 * only otherwise grep literals, and the composer when messages are built at runtime
   (`HASHCMD=` only when the harness hashes exactly the literal).
+
+**One `err` for every reject** (the binding collapses the library's errors): use the
+direct harness's ungated `lib_err=` field, `FIELD=lib_err` in both scripts.
 
 Classify what remains (input-reachable: write the seed; the other classes, and a JS
 wrapper shadowing a library error, are in `references/error-inventory.md`).
@@ -266,7 +265,9 @@ If nothing has to be derived, do not build a generator.
 
 **If you write a generator**, start from `gen_template.mjs` (it already names files
 `<family>-<nnn>-<name>` for `validate.sh PREFIX=`, writes the manifest outside the corpus,
-clamps writes to field width, and separates declared value from layout). Add:
+clamps writes to field width, and separates declared value from layout). A clamp that
+warns `u32: negative value clamped` is a sign bug (`0x80000000 | len` is negative in
+JS; write `>>> 0`). Add:
 
 * **Defaults that parse to completion, proved by byte-diffing against the real writer
   before any family exists**: a differing required field is the bug, an optional one is
@@ -316,7 +317,7 @@ checks, in increasing value:
 3. **The target's own error code, per seed.** The same early error on every seed means
    you never got past field one. This is the one that finds the bug. With only an error
    class, or a message embedding a position, `err` is the message up to the position
-   marker (`references/error-inventory.md`).
+   marker; one `err` for every reject: `FIELD=lib_err` (`references/error-inventory.md`).
 
 After `sweep.sh` the results are per mode: `maps_<base>_default/.results`, and one per
 setting beside it (`references/modes.md`).
@@ -349,7 +350,8 @@ $RC/compare.sh A=maps_baseline B=maps_derived
 
 **Union, then keep it lean.** No sourcing strategy dominates; ship the union as
 `corpus-final/`. Minimise each borrowed or swept set against what you have, assemble,
-apply the seed policy, measure:
+apply the seed policy, measure. Save the block as a script in `$W` and run that
+(pasted into `docker exec bash -lc '...'` it needs re-quoting):
 
 ```sh
 cd $W && . ./fuzz.env; H=./out/plain/harness-fork
@@ -366,25 +368,10 @@ for f in corpus/* corpus-derived/* corpus-extra/*; do
   cp "$f" "corpus-final/$n"
 done
 $RC/measure.sh BASE=final HARNESS=$H CORPUS=./corpus-final
-# seed policy: hangs and plain crashes (rc >= 128) leave corpus-final/.
-# rebuild this pass's rows only: smoke-* rows are smoke.sh's finds, not re-derivable here
-grep '^smoke-' crashers.summary.tsv > .tmp 2>/dev/null; mv .tmp crashers.summary.tsv
-awk -F'\t' '$1=="hang"{print $3}' maps_final/.results | while read -r n; do mv "corpus-final/$n" hangs/; done
-awk -F'\t' '$1~/^[0-9]+$/ && $1>=128 {print $1"\t"$3}' maps_final/.results | while IFS=$'\t' read -r rc n; do
-  mv "corpus-final/$n" crashers/ && printf '%s\tplain rc=%s\n' "$n" "$rc" >> crashers.summary.tsv; done
-# ASAN-only crashers stay, and are copied out with their summary line.  Same ASAN_OPTIONS as
-# the campaign and the gate: without the allocation ceiling a seed that merely DECLARES a huge
-# size aborts with allocation-size-too-big and is filed as a crasher it is not.
-# Default mode only, in parallel: a crash only in another mode is that mode's campaign's to find.
-# 30 s, not 5: under load ASAN symbolization outlasts 5 s, the report loses its SUMMARY: line,
-# and the pass would record nothing; the WARN names every such seed.
-export ASAN_OPTIONS="detect_leaks=0:exitcode=86:allocator_may_return_null=1:max_allocation_size_mb=$ALLOC_CAP_MB"
-find corpus-final -maxdepth 1 -type f -print0 | xargs -0 -P 8 -I{} bash -c '
-  o=$(timeout -k1 "$2" ./out/asan/harness-fork "$1" 2>&1 >/dev/null); rc=$?
-  s=$(printf "%s\n" "$o" | grep -m1 "^SUMMARY:")
-  if [ -n "$s" ]; then cp "$1" crashers/ && printf "%s\t%s\n" "$(basename "$1")" "$s"
-  elif [ $rc = 86 ] || [ $rc -gt 128 ] || printf "%s" "$o" | grep -q "ERROR: AddressSanitizer"; then
-    echo "WARN: $(basename "$1") rc=$rc but no SUMMARY: line: raise TIMEOUT" >&2; fi' _ {} "${TIMEOUT:-30}" >> crashers.summary.tsv
+# seed policy: hangs and plain crashes (rc >= 128) leave corpus-final/; ASAN-only crashers
+# are copied to crashers/. Keeps every crashers.summary.tsv row whose file still exists
+# (any name), drops the rest, adds this pass's rows (resources/union_crashers.sh header).
+$RC/union_crashers.sh
 $RC/measure.sh BASE=final HARNESS=$H CORPUS=./corpus-final     # maps_final/ after the moves
 # no modes: sweep.sh refuses an empty SWEEP and writes no union, so cover the one map set
 if [ -n "$MODES" ]; then
@@ -394,6 +381,10 @@ else
   $RC/cover.sh MAPS="maps_final" KEEP=./corpus-min CORPUS=./corpus-final
 fi
 ```
+
+**A hang or real-stack-only crash known from reading or the gate** (`gate-real-*`,
+`hangs/smoke-*`) that no seed here produced: file the input by hand in `hangs/` or
+`crashers/` under any name, with a `crashers.summary.tsv` row, so triage screens it.
 
 The greedy cover in `corpus-min/` is a stop signal, not a reason to ship only the cover
 (a fuzzer mutates what you give it, and duplicates cost little); criteria in the last section.
@@ -405,11 +396,10 @@ cd $W && . ./fuzz.env
 $RC/nondet.sh HARNESS=./out/plain/harness-fork CORPUS=./corpus-final MOVE=./corpus-nondet MODES="$MODES"
 ```
 
-A seed that does not agree with itself cannot pass the gate reliably, and its mutants
-drag the campaign's stability down: quarantine it, or canonicalise the order on both
-sides of the gate; never loosen `FIELDS`. A seed also in `crashers/` is not quarantined:
-its varying result is the bug (an over-read returning garbage), not noise. When it moves
-anything, re-run the last `measure.sh` and the cover so `maps_final/` and `corpus-min/` drop those seeds too.
+A seed that disagrees with itself fails the gate at random and drags stability down:
+quarantine it, or canonicalise the order on both sides; never loosen `FIELDS`. One also
+in `crashers/` stays (its varying result is the bug). When it moves anything, re-run the
+last `measure.sh` and the cover.
 
 **Re-run the harness skill's gate** (`$R/gate.sh`): the **plain** variant in the default
 mode only (`MODES=""`) over the whole corpus, then the asan variant in every mode over
@@ -439,20 +429,21 @@ a few hundred keepers for a few hundred edges is plenty.
 ## Step 7b — Write the dictionary
 
 afl-fuzz splices dictionary tokens in whole; mutation alone almost never assembles a
-multi-byte keyword. The harness builds wrote `out/<variant>/dict.afl` (the constants
-instrumented code compares against); add what that pass cannot see:
+multi-byte keyword. The campaign passes `$W/dict.afl` *instead of* the build's
+`out/<variant>/dict.afl`, so `dict.sh` merges every `out/*/dict.afl` by default (both
+variants, printed; `FROM=none` opts out) and adds what that pass cannot see:
 
 ```sh
 cd $W && . ./fuzz.env
-$RC/dict.sh OUT=./dict.afl TOKENS="<separator> <mode> <option> ..." [SRC="<uncompiled sources>"]
+$RC/dict.sh OUT=./dict.afl [TOKENS="<sep> <option>"] [TOKENS_FILE=tok.txt] [SRC="<uncompiled sources>"]
 ```
 
-`TOKENS` (or `TOKENS_FILE=`): the framing separators documented at the top of
-`harness.cc`, every `MODE` and option value, the names in a lookup table that selects
-code (encoding or format names), a grammar's keywords and operators. `SRC=` harvests
-literals from sources afl-clang-fast never compiled (a system library, JavaScript that
-selects native paths). The campaign picks `$W/dict.afl` by itself. Syntax and a worked
-example: `references/dictionary.md`.
+Tokens are **input bytes** (framing separators, option values the input carries,
+table names that select code, keywords), never mode names: `dict.sh` drops `MODES`
+values and `default`. `TOKENS` is literal text (`\x04` stays four characters): binary
+tokens go in `TOKENS_FILE`, one AFL entry per line. `SRC=` harvests literals and named
+hex constants from code afl-clang-fast never compiled. Details, the manifest's `dict`
+column, bit-packed formats: `references/dictionary.md`.
 
 ---
 

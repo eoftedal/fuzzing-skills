@@ -22,6 +22,12 @@
 //             Never a hash of a message that embeds the input: that makes err unique
 //             per seed and useless for the corpus skill's histograms.
 //   lossy     always 0 on this side; the real stack sets 1 when it cannot report faithfully
+//   lib_err   OPTIONAL and UNGATED, this side only: for a binding that collapses every library
+//             error into ONE message (err is then the same token for every rejected seed,
+//             and the corpus skill's histograms and error inventory learn nothing from it).
+//             Print the library's own error code or name here as well; FIELDS stays as it
+//             is (the real side cannot see it, so it is never compared), and the corpus
+//             skill keys on it with `validate.sh FIELD=lib_err`.  See Result and main().
 
 // --- 1. the library's own headers, and the addon header holding your boundary ---
 // #include <library.h>
@@ -37,7 +43,9 @@
 
 // --- 2. anything the real stack reaches only through the binding must be
 //        unreachable here, and must say so loudly rather than returning ---
-static void binding_path_reached(const char* what) {
+// unused when nothing in sections 4-7 can reach the runtime: the attribute keeps
+// -Wunused-function quiet on every compile without deleting the trap
+__attribute__((unused)) static void binding_path_reached(const char* what) {
   (void)!write(2, "AFL-HARNESS-V8PATH: ", 20);
   (void)!write(2, what, strlen(what));
   (void)!write(2, "\n", 1);
@@ -70,13 +78,13 @@ static int    g_mode = 0;          /* e.g. buffer vs file entry point */
 // above it AT THE ATTACKER-DECLARED SITE ONLY (call over_ceiling() where you mirror
 // that allocation, and report err=alloc-ceiling).  Never on malloc in general.
 static size_t g_alloc_ceil = 0;    /* 0 = off */
-static inline bool over_ceiling(size_t declared) { return g_alloc_ceil && declared > g_alloc_ceil; }
+__attribute__((unused)) static inline bool over_ceiling(size_t declared) { return g_alloc_ceil && declared > g_alloc_ceil; }
 // Attacker-chosen WORK (a cost/rounds exponent, an iteration count in the input) is the
 // same thing in time: mirror the package's own bound if it has one, else an OPT-IN
 // WORK_CEIL=<units> applied at that field on both arms (err=work-ceiling), never a silent
 // clamp.  An unbounded one is a finding for triage (input-controlled work factor).
 static unsigned long g_work_ceil = 0;  /* 0 = off; e.g. the maximum cost exponent to run */
-static inline bool over_work(unsigned long units) { return g_work_ceil && units > g_work_ceil; }
+__attribute__((unused)) static inline bool over_work(unsigned long units) { return g_work_ceil && units > g_work_ceil; }
 
 struct Result {
   int      status;           // 0 ok, 1 rejected, ... ; your own small enum
@@ -84,6 +92,9 @@ struct Result {
   size_t   out_len;
   uint64_t out_hash;
   long     invariant;        // e.g. the addon's node/alloc counter delta; want 0
+  // OPTIONAL, ungated (see lib_err in the header): the library's own error code, set on
+  // the error path beside err, when the binding reports every error with one message.
+  //   char lib_err[48];       // "0" on success; e.g. snprintf(r->lib_err, sizeof r->lib_err, "%d", code)
 };
 
 static uint64_t fnv1a(const unsigned char* p, size_t n) {
@@ -133,6 +144,7 @@ static void harness_fini(void) {
 static void run_one(const unsigned char* data, size_t len, Result* r) {
   memset(r, 0, sizeof *r);
   r->err[0] = '0';
+  // r->lib_err[0] = '0';     // with the optional lib_err field
 
   // Reset only what is safe to reset.  READ the implementation of any "reset"
   // you call in a loop: an image library's cache-drop call reads like a reset and is
@@ -221,6 +233,10 @@ int main(int argc, char** argv) {
 
     printf("in_len=%zu status=%d err=%s out_len=%zu out_hash=%016llx lossy=0 invariant=%ld\n",
            len, r.status, r.err, r.out_len, (unsigned long long)r.out_hash, r.invariant);
+    // With the optional lib_err field, print it on the SAME line (the gate reads one line):
+    //   printf("in_len=%zu status=%d err=%s out_len=%zu out_hash=%016llx lossy=0 invariant=%ld lib_err=%s\n",
+    //          len, r.status, r.err, r.out_len, (unsigned long long)r.out_hash, r.invariant, r.lib_err);
+    // (initialised to "0" at the top of run_one, like err).
     harness_fini();
 
     // Assert ONLY genuinely impossible states here, and only ones you have checked

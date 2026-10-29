@@ -13,9 +13,12 @@
 #   corpus-final/ else corpus/ else corpus-min/      derive-a-fuzzing-corpus-from-source
 #   dict.afl, else out/<variant>/dict.afl           dict.sh / the harness build (afl-fuzz -x)
 # Writes:
-#   campaigns/<variant>[@<mode>][.fork]/   one afl-fuzz -o per campaign, never shared
+#   campaigns/<variant>[@<mode>][.fork]/   one afl-fuzz -o per campaign, never shared with
+#                                          another campaign.  Inside: default/ (one instance),
+#                                          or main/ + s1/ .. s<n>/ with SECONDARIES=<n>
 #   campaigns/manifest.tsv                 one row per campaign (re-running replaces its row)
-#   campaigns/<name>.log                   afl-fuzz output
+#   campaigns/<name>.log                   afl-fuzz output (the main instance's)
+#   campaigns/<name>.s<i>.log              a secondary instance's output (SECONDARIES=<n>)
 #   campaigns/<name>.dropped               `<seed>\t<reason>` per seed afl-fuzz did not fuzz:
 #                                          zero-length or README.txt (skipped silently, found
 #                                          by diffing the corpus against the queue's orig:
@@ -65,14 +68,30 @@
 #   SELFTEST   the self-test output (default: selftest*.txt); SELFTEST=skip records that the
 #              run cannot tell "found nothing" from "detects nothing"
 #   POLL       seconds between status lines (default 15)
-#   JOBS       campaigns at once (default: cores-1)
+#   JOBS       campaigns at once (default: (cores-1) / instances per campaign, at least 1).
+#              Each campaign runs 1 + SECONDARIES afl-fuzz instances, one core each, so the
+#              default counts INSTANCES against cores-1.  When the plan leaves more than half
+#              the cores idle (few variant x mode campaigns), the run prints
+#              `SECONDARIES=<k> would use them`.
+#   SECONDARIES  extra afl-fuzz instances per campaign (default 0).  0: one instance, output
+#              in <out>/default/, exactly as before.  n > 0: `-M main` plus n `-S s<i>`
+#              sharing the campaign's -o (AFL++ parallel mode: they sync queues).  For variety
+#              (AFL++ docs, "fuzzing in depth", multi-core): s<i> alternates `-p explore` (odd i)
+#              and `-p fast` (even i); with n >= 3 the last one runs MOpt (`-L 0`) instead.
+#              Every instance gets the same -x, -m, -t, -V and environment.  No -d/-D: 4.33c
+#              ignores both (deterministic stages are off by default).  Every instance is a
+#              direct child: the stability fallback, WALL, the end of the main instance and
+#              `kill -TERM` stop them all.  fuzzer_stats in the manifest (execs, stability,
+#              saved_*, exec_timeout) are the MAIN instance's; crash_files/hang_files count
+#              every instance's crashes/ and hangs/ (triage reads them all and dedups by content).
 #   DICT       afl-fuzz -x: a dictionary file or a directory of them, relative to the
 #              workspace.  Default: $WORKSPACE/dict.afl (dict.sh's merge) when it exists,
 #              else the campaign variant's out/<v>/dict.afl (the build's compare constants)
 #              when it exists, else none.  DICT=none disables.
 #              smoke.sh drives this script, so a smoke run picks the same default: intended,
 #              the smoke run then also proves afl-fuzz accepts the dictionary.
-#   SCREEN=1   run each afl-fuzz inside a detached GNU screen session named afl-<campaign>,
+#   SCREEN=1   run each afl-fuzz inside a detached GNU screen session named afl-<campaign>
+#              (afl-<campaign>-main / afl-<campaign>-s<i> with SECONDARIES),
 #              with its UI on, so you can watch it live: `screen -ls`, `screen -r afl-<name>`
 #              (detach again with C-a d; never C-c, that kills the campaign).  Everything
 #              else is unchanged: this script still owns the pid, the stop/relaunch logic
@@ -87,9 +106,14 @@
 # Manifest columns (triage reads the first 11 by position, the rest by name):
 #   name variant driver harness mode_env entry out_dir mem_limit exec_timeout_ms map_size
 #   alloc_cap_mb start stop stop_reason execs stability saved_crashes saved_hangs crash_files
-#   hang_files selftest status asan_options seeds_total seeds_loaded dict
-# `dict` is the -x path relative to the workspace, or `-` for none (empty on rows written
-# before the column existed).
+#   hang_files selftest status asan_options seeds_total seeds_loaded dict instances
+# `dict` is the -x path RELATIVE TO THE WORKSPACE (`dict.afl` is $WORKSPACE/dict.afl,
+# `out/asan/dict.afl` the build's), or `-` for none (empty on rows written before the column
+# existed).  When $WORKSPACE/dict.afl is chosen while out/<variant>/dict.afl also exists, the
+# launch line says so with both entry counts: dict.sh run without FROM= writes a workspace
+# file that lacks the build's compare constants, and this default would then drop them.
+# `instances` is how many afl-fuzz ran in the campaign (1 + SECONDARIES; empty on rows written
+# before the column existed, which ran one).
 # `status` is what ACTUALLY happened: completed | switched | interrupted | walled | aborted | failed |
 # early.  Only `completed` ran its full duration; a campaign that did not is never a result.
 set -uo pipefail
@@ -102,7 +126,10 @@ CAMP=${CAMPAIGNS:-$WS/campaigns}
 DURATION=${DURATION:-600}
 STAB_CHECK=${STAB_CHECK:-60}; MIN_STABILITY=${MIN_STABILITY:-90}
 ALLOC_CAP_MB=${ALLOC_CAP_MB:-1024}; POLL=${POLL:-15}
-JOBS=${JOBS:-$(( $(nproc) - 1 ))}; [ "$JOBS" -ge 1 ] || JOBS=1
+SECONDARIES=${SECONDARIES:-0}
+case $SECONDARIES in ''|*[!0-9]*) echo "FAIL: SECONDARIES=$SECONDARIES is not a number" >&2; exit 1;; esac
+INST=$(( SECONDARIES + 1 )); NCORES=$(nproc)
+JOBS=${JOBS:-$(( (NCORES - 1) / INST ))}; [ "$JOBS" -ge 1 ] || JOBS=1
 DEFAULT_ENTRY=${DEFAULT_ENTRY:-default}; WALL=${WALL:-0}
 SCREEN=${SCREEN:-0}
 if [ "$SCREEN" = 1 ]; then
@@ -173,7 +200,7 @@ fi
 
 mkdir -p "$CAMP"
 MAN="$CAMP/manifest.tsv"
-COLS="name variant driver harness mode_env entry out_dir mem_limit exec_timeout_ms map_size alloc_cap_mb start stop stop_reason execs stability saved_crashes saved_hangs crash_files hang_files selftest status asan_options seeds_total seeds_loaded dict"
+COLS="name variant driver harness mode_env entry out_dir mem_limit exec_timeout_ms map_size alloc_cap_mb start stop stop_reason execs stability saved_crashes saved_hangs crash_files hang_files selftest status asan_options seeds_total seeds_loaded dict instances"
 [ -f "$MAN" ] || printf '%s\n' "$COLS" | tr ' ' '\t' > "$MAN"
 # A manifest from before a trailing column was added: extend its header and pad its rows
 # (empty = not recorded), or new rows would sit under the wrong names.  Any other mismatch
@@ -191,7 +218,7 @@ fi
 
 ts "workspace $WS"
 ts "corpus $CORPUS ($(ls "$CORPUS" | wc -l) seeds); variants: $VARIANTS; self-test: $SELFTEST_STATE"
-ts "modes besides default: ${MODES:-none}; ${DURATION}s each, up to $JOBS at once, ceiling ${ALLOC_CAP_MB} MB"
+ts "modes besides default: ${MODES:-none}; ${DURATION}s each, up to $JOBS at once, $INST afl-fuzz instance(s) each, ceiling ${ALLOC_CAP_MB} MB"
 ts "dictionary: ${DICT:-default (dict.afl, else out/<variant>/dict.afl)}"
 # A piped core_pattern (a crash-report helper): afl-fuzz refuses to start without this.
 if [ -z "${AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES:-}" ] && [ "$(head -c1 /proc/sys/kernel/core_pattern 2>/dev/null)" = '|' ]; then
@@ -219,15 +246,29 @@ for v in $VARIANTS; do
   done
 done
 
+# Cores: every instance takes one.  Too many is slower than enough (they compete); too few
+# leaves cores idle that SECONDARIES would use (measured: 2 campaigns on 14 cores, 12 idle).
+NRUN=$(( ${#PLAN[@]} < JOBS ? ${#PLAN[@]} : JOBS )); USED=$(( NRUN * INST ))
+ts "plan: ${#PLAN[@]} campaign(s), $NRUN at once x $INST instance(s) = $USED of $NCORES cores"
+[ "$USED" -ge "$NCORES" ] && ts "  WARN: $USED afl-fuzz instances on $NCORES cores: they compete for CPU; lower JOBS or SECONDARIES"
+if [ $(( USED * 2 )) -lt "$NCORES" ] && [ "$NRUN" -ge 1 ]; then
+  k=$(( (NCORES - 1) / NRUN - 1 ))
+  [ "$k" -gt "$SECONDARIES" ] && ts "  NOTE: the plan uses $USED of $NCORES cores; SECONDARIES=$k would use them ($NRUN campaign(s) x $((k + 1)) instances)"
+fi
+
 # ---- campaign state, in the main shell: afl-fuzz is a DIRECT child, so its pid is real ---
 # (An earlier version ran it inside `( ... ) &` and kept the subshell's pid: `kill` then hit
 # the wrapper and left afl-fuzz running -- the stability fallback never stopped the unstable
 # campaign, and an interrupted run orphaned every afl-fuzz.)
-declare -A PID VAR DRV ME EN BIN OUTD MEM MS START ASANO TLOG DICTP
+declare -A PID SPIDS IDIR VAR DRV ME EN BIN OUTD MEM MS START ASANO TLOG DICTP
 LIVE=()
 tag_of() { local t=$1; [ -n "$2" ] && t="$1@$(tr -c 'A-Za-z0-9=' _ <<<"$2" | sed 's/_*$//')"; [ "$3" = fork ] && t="$t.fork"; echo "$t"; }
-stat_of() { sed -n "s/^$2 *: *//p" "$1/default/fuzzer_stats" 2>/dev/null | head -1 | tr -d ' %'; }
+# <out dir> <key>: from the MAIN instance's fuzzer_stats (default/ alone, main/ with secondaries)
+stat_of() { local d; for d in default main; do [ -f "$1/$d/fuzzer_stats" ] && break; done
+            sed -n "s/^$2 *: *//p" "$1/$d/fuzzer_stats" 2>/dev/null | head -1 | tr -d ' %'; }
 nfiles() { local n; n=$(ls "$1" 2>/dev/null | grep -c '^id:'); echo "${n:-0}"; }
+# <out dir> <crashes|hangs>: id:* files over EVERY instance (default/, main/, s<i>/)
+nall() { local d t=0; for d in "$1"/*/"$2"; do [ -d "$d" ] && t=$(( t + $(nfiles "$d") )); done; echo "$t"; }
 
 launch() {  # <variant> <mode_env> <entry> <persistent|fork>
   local v=$1 me=$2 en=$3 driver=$4 bin tag o log ms asan="" mem=$ALLOC_CAP_MB
@@ -254,6 +295,9 @@ launch() {  # <variant> <mode_env> <entry> <persistent|fork>
   local args=(-i "$CORPUS" -o "$o" -m "$mem" -V "$DURATION")
   [ -n "${TIMEOUT_MS:-}" ] && args+=(-t "$TIMEOUT_MS")
   local dict; dict=$(dict_of "$v"); [ -n "$dict" ] && args+=(-x "$dict")
+  if [ -z "$DICT" ] && [ "$dict" = "$WS/dict.afl" ] && [ -s "$WS/out/$v/dict.afl" ]; then
+    ts "  $tag: dictionary dict.afl ($(grep -c '^[^#]' "$WS/dict.afl") entries) chosen over out/$v/dict.afl ($(grep -c '^[^#]' "$WS/out/$v/dict.afl") entries); DICT=out/$v/dict.afl to use the build's"
+  fi
   local tgt=("$bin"); [ "$driver" = fork ] && tgt=("$bin" @@)   # the fork binary reads argv[1]
   # AFL_IGNORE_SEED_PROBLEMS skips seeds that crash or HANG in the dry run (the corpus skill
   # leaves ASAN-only crashers in on purpose; this also catches a hanging or plain-crashing
@@ -265,48 +309,74 @@ launch() {  # <variant> <mode_env> <entry> <persistent|fork>
   [ -n "$asan" ] && cmd+=(ASAN_OPTIONS="$asan")
   cmd+=(AFL_MAP_SIZE="$ms" AFL_IGNORE_SEED_PROBLEMS=1 AFL_SKIP_CPUFREQ=1)
   [ "$SCREEN" = 1 ] || cmd+=(AFL_NO_UI=1)         # the UI is the point of SCREEN=1
-  cmd+=(afl-fuzz "${args[@]}" -- "${tgt[@]}")
-  local pid
-  if [ "$SCREEN" = 1 ]; then
-    # Inside a detached screen (a pty, so afl-fuzz shows its UI).  The window runs a tiny
-    # wrapper that starts afl-fuzz in the background, writes ITS pid (env exec()s afl-fuzz,
-    # so $! is afl-fuzz) and, when it exits, its exit status -- this script cannot `wait` on
-    # a process that is not its child, so .pid and .rc replace $! and wait.  screen -L logs
-    # the terminal to the campaign log; the UI's escape codes are in there, the startup
-    # messages finish() greps for too.
-    local q sess; q=$(printf '%q ' "${cmd[@]}"); sess="afl-$tag"
-    rm -f "$o/.pid" "$o/.rc"; : > "$log"
-    screen -dmS "$sess" -L -Logfile "$log" bash -c \
-      "$q & echo \$! > $(printf %q "$o/.pid"); wait \$!; echo \$? > $(printf %q "$o/.rc")"
-    local i; for i in $(seq 50); do [ -s "$o/.pid" ] && break; sleep 0.1; done
-    pid=$(cat "$o/.pid" 2>/dev/null)
-    [ -n "$pid" ] || { ts "  FAIL $tag: screen session $sess did not start afl-fuzz (is screen working? try: screen -ls)"; return 1; }
-  else
-    "${cmd[@]}" >"$log" 2>&1 &                    # env exec()s afl-fuzz: $! IS afl-fuzz
-    pid=$!
-  fi
-  PID[$tag]=$pid VAR[$tag]=$v DRV[$tag]=$driver ME[$tag]=$me EN[$tag]=$en BIN[$tag]=$bin
+  # The instances: `default` alone (no -M/-S, output in <o>/default/), or main + s1..sN.
+  local insts=(default) i; [ "$SECONDARIES" -gt 0 ] && { insts=(main); for i in $(seq "$SECONDARIES"); do insts+=("s$i"); done; }
+  local pid="" spids="" in ilog ia
+  for in in "${insts[@]}"; do
+    ia=()
+    case $in in
+      default) ;;
+      main) ia=(-M main) ;;
+      *) i=${in#s}; ia=(-S "$in")
+         if [ "$SECONDARIES" -ge 3 ] && [ "$i" = "$SECONDARIES" ]; then ia+=(-L 0)
+         elif [ $(( i % 2 )) = 1 ]; then ia+=(-p explore); else ia+=(-p fast); fi ;;
+    esac
+    ilog=$log; [ "$in" = default ] || [ "$in" = main ] || ilog="$CAMP/$tag.$in.log"
+    local full=("${cmd[@]}" afl-fuzz "${ia[@]}" "${args[@]}" -- "${tgt[@]}") ipid
+    if [ "$SCREEN" = 1 ]; then
+      # Inside a detached screen (a pty, so afl-fuzz shows its UI).  The window runs a tiny
+      # wrapper that starts afl-fuzz in the background, writes ITS pid (env exec()s afl-fuzz,
+      # so $! is afl-fuzz) and, when it exits, its exit status -- this script cannot `wait` on
+      # a process that is not its child, so .pid and .rc replace $! and wait.  screen -L logs
+      # the terminal to the campaign log; the UI's escape codes are in there, the startup
+      # messages finish() greps for too.
+      local q sess sfx=""; q=$(printf '%q ' "${full[@]}"); [ "$in" = default ] || sfx="-$in"; sess="afl-$tag$sfx"
+      rm -f "$o/.pid$sfx" "$o/.rc$sfx"; : > "$ilog"
+      screen -dmS "$sess" -L -Logfile "$ilog" bash -c \
+        "$q & echo \$! > $(printf %q "$o/.pid$sfx"); wait \$!; echo \$? > $(printf %q "$o/.rc$sfx")"
+      local k; for k in $(seq 50); do [ -s "$o/.pid$sfx" ] && break; sleep 0.1; done
+      ipid=$(cat "$o/.pid$sfx" 2>/dev/null)
+      [ -n "$ipid" ] || { ts "  FAIL $tag: screen session $sess did not start afl-fuzz (is screen working? try: screen -ls)"
+                          [ -n "$pid" ] && stop_pids $pid $spids; return 1; }
+    else
+      "${full[@]}" >"$ilog" 2>&1 &                 # env exec()s afl-fuzz: $! IS afl-fuzz
+      ipid=$!
+    fi
+    if [ -z "$pid" ]; then pid=$ipid; else spids="$spids $ipid"; fi
+    # the main instance first: secondaries that start before main exists sync nothing yet
+    [ "$in" = main ] && sleep 1
+  done
+  PID[$tag]=$pid SPIDS[$tag]=${spids# } IDIR[$tag]=${insts[0]} VAR[$tag]=$v DRV[$tag]=$driver ME[$tag]=$me EN[$tag]=$en BIN[$tag]=$bin
   OUTD[$tag]=$o MEM[$tag]=$mem MS[$tag]=$ms START[$tag]=$(date +%s) ASANO[$tag]=$asan TLOG[$tag]=$log DICTP[$tag]=${dict:+${dict#$WS/}}
   LIVE+=("$tag")
-  ts "  launched $tag ($driver, pid ${PID[$tag]}, -m $mem${asan:+, asan ceiling ${ALLOC_CAP_MB} MB}, dict ${DICTP[$tag]:-none})"
-  [ "$SCREEN" = 1 ] && ts "    watch it: screen -r afl-$tag   (detach with C-a d, not C-c)"
+  ts "  launched $tag ($driver, pid ${PID[$tag]}${SPIDS[$tag]:+, secondaries ${SPIDS[$tag]}}, -m $mem${asan:+, asan ceiling ${ALLOC_CAP_MB} MB}, dict ${DICTP[$tag]:-none})"
+  [ "$SCREEN" = 1 ] && ts "    watch it: screen -r afl-$tag$([ "$SECONDARIES" -gt 0 ] && echo '-main')   (detach with C-a d, not C-c)"
 }
 # Exit status of a finished campaign: `wait` for our own child, the wrapper's .rc under SCREEN=1
 # (give the wrapper a moment to write it after afl-fuzz is gone).
 rc_of() {  # <tag> <pid>
   if [ "$SCREEN" = 1 ]; then
-    local i; for i in $(seq 30); do [ -s "${OUTD[$1]}/.rc" ] && break; sleep 0.1; done
-    cat "${OUTD[$1]}/.rc" 2>/dev/null || echo 1
+    local f="${OUTD[$1]}/.rc"; [ "${IDIR[$1]}" = main ] && f="$f-main"
+    local i; for i in $(seq 30); do [ -s "$f" ] && break; sleep 0.1; done
+    cat "$f" 2>/dev/null || echo 1
   else wait "$2" 2>/dev/null; echo $?; fi
 }
 
-# Stop one campaign for real: TERM so afl-fuzz writes its final stats, KILL if it ignores us.
-stop_one() {  # <pid>
-  local pid=$1 i
-  kill -TERM "$pid" 2>/dev/null
-  for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
-  kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
-  wait "$pid" 2>/dev/null
+# Stop afl-fuzz instances for real: TERM all at once so each writes its final stats, then
+# KILL whichever ignores us.  (Not one after the other: ten seconds each would add up.)
+stop_pids() {  # <pid>...
+  local p i alive
+  for p in "$@"; do kill -TERM "$p" 2>/dev/null; done
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    alive=0; for p in "$@"; do kill -0 "$p" 2>/dev/null && alive=1; done
+    [ "$alive" = 1 ] || break; sleep 1
+  done
+  for p in "$@"; do kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null; done
+  for p in "$@"; do wait "$p" 2>/dev/null; done
+}
+# Stop one campaign: its main (or only) instance and every secondary.
+stop_one() {  # <tag>
+  stop_pids "${PID[$1]}" ${SPIDS[$1]:-}
 }
 
 # Write one manifest row, replacing any earlier row of the same name (re-running a campaign
@@ -318,7 +388,10 @@ stop_one() {  # <pid>
 finish() {  # <tag> <natural|switched|interrupted> <afl exit status>
   local tag=$1 kind=$2 rc=$3 o=${OUTD[$1]} log=${TLOG[$1]}
   local elapsed=$(( $(date +%s) - START[$tag] )) status reason cf hf sc sh stab
-  cf=$(nfiles "$o/default/crashes"); hf=$(nfiles "$o/default/hangs")
+  local idir=${IDIR[$tag]:-default} ins cfm
+  # files on disk over EVERY instance; the stats mismatch check below uses the main one's own
+  cf=$(nall "$o" crashes); hf=$(nall "$o" hangs); cfm=$(nfiles "$o/$idir/crashes")
+  ins=$(( 1 + $(wc -w <<<"${SPIDS[$tag]:-}") ))
   sc=$(stat_of "$o" saved_crashes); sh=$(stat_of "$o" saved_hangs); stab=$(stat_of "$o" stability)
   case $kind in
     switched)    status=switched;    reason="stability-${stab:-?}%-below-${MIN_STABILITY}%-relaunched-on-fork";;
@@ -328,25 +401,25 @@ finish() {  # <tag> <natural|switched|interrupted> <afl exit status>
          status=aborted
          reason="afl-fuzz-aborted: $(sed 's/\x1b\[[0-9;]*m//g' "$log" | sed -n 's/.*PROGRAM ABORT *: *//p' | head -1 | cut -c1-110)"
        elif [ "$rc" -ne 0 ]; then status=failed; reason="afl-fuzz-exit-$rc"
-       elif [ ! -f "$o/default/fuzzer_stats" ]; then status=failed; reason="no-fuzzer_stats"
+       elif [ ! -f "$o/$idir/fuzzer_stats" ]; then status=failed; reason="no-fuzzer_stats"
        elif [ $(( elapsed + 5 )) -lt "$DURATION" ]; then status=early; reason="exited-after-${elapsed}s-of-${DURATION}s"
        else status=completed; reason="completed-${DURATION}s"; fi;;
   esac
   # The files on disk are the truth; fuzzer_stats is only a diagnostic (it is written
   # periodically, so it lags a campaign that was stopped).  A mismatch after a NORMAL finish
   # means two fuzzers shared this -o.
-  [ "$status" = completed ] && [ -n "$sc" ] && [ "$sc" != "$cf" ] \
-    && ts "  WARN $tag: fuzzer_stats saved_crashes=$sc but $cf id:* files on disk (two fuzzers sharing one -o?)"
+  [ "$status" = completed ] && [ -n "$sc" ] && [ "$sc" != "$cfm" ] \
+    && ts "  WARN $tag: $idir/fuzzer_stats saved_crashes=$sc but $cfm id:* files in $idir/crashes (two fuzzers sharing one -o?)"
   [ "$status" != completed ] && [ "$status" != switched ] && ts "  $tag: $status -- $reason"
   local seeds_total seeds_loaded
   seeds_total=$(ls "$CORPUS" | wc -l)
   seeds_loaded=$(sed 's/\x1b\[[0-9;]*m//g' "$log" 2>/dev/null | sed -n 's/.*Loaded a total of \([0-9]*\) seeds.*/\1/p' | head -1)
-  dropped_seeds "$tag" "$log" "$o"
+  dropped_seeds "$tag" "$log" "$o/$idir"
   local row tmp; tmp=$(mktemp)
   row=$(printf '%s\t' "$tag" "${VAR[$tag]}" "${DRV[$tag]}" "${BIN[$tag]}" "${ME[$tag]:-default}" "${EN[$tag]}" \
         "${o#$WS/}" "${MEM[$tag]}" "$(stat_of "$o" exec_timeout)" "${MS[$tag]}" "$ALLOC_CAP_MB" "${START[$tag]}" \
         "$(date +%s)" "$reason" "$(stat_of "$o" execs_done)" "${stab:-}" "${sc:-0}" "${sh:-0}" "$cf" "$hf" \
-        "$SELFTEST_STATE" "$status" "${ASANO[$tag]}" "$seeds_total" "${seeds_loaded:-}" "${DICTP[$tag]:--}")
+        "$SELFTEST_STATE" "$status" "${ASANO[$tag]}" "$seeds_total" "${seeds_loaded:-}" "${DICTP[$tag]:--}" "$ins")
   awk -F'\t' -v n="$tag" 'NR==1||$1!=n' "$MAN" > "$tmp"; printf '%s\n' "${row%$'\t'}" >> "$tmp"; mv "$tmp" "$MAN"
   local i; for i in "${!LIVE[@]}"; do [ "${LIVE[$i]}" = "$tag" ] && unset 'LIVE[i]'; done; LIVE=("${LIVE[@]}")
 }
@@ -355,8 +428,8 @@ finish() {  # <tag> <natural|switched|interrupted> <afl exit status>
 # README.txt without a word (they are missing from the queue), and under
 # AFL_IGNORE_SEED_PROBLEMS loads a crashing or hanging seed but ignores it, printing
 # "WARNING: Test case '<queue name>' results in a crash, skipping" (or "a timeout").
-dropped_seeds() {  # <tag> <log> <out dir> -> writes $CAMP/<tag>.dropped
-  local df="$CAMP/$1.dropped" q="$3/default/queue"
+dropped_seeds() {  # <tag> <log> <the main instance's dir> -> writes $CAMP/<tag>.dropped
+  local df="$CAMP/$1.dropped" q="$3/queue"
   : > "$df"
   [ -d "$q" ] || return 0
   { ls "$q"; echo /; find "$CORPUS" -type f -printf '%f\t%s\n'; } 2>/dev/null | awk -F'\t' '
@@ -376,7 +449,7 @@ dropped_seeds() {  # <tag> <log> <out dir> -> writes $CAMP/<tag>.dropped
 # ---- summary and hand-off ----------------------------------------------------------------
 summarize() {
   ts "== $(($(grep -c . "$MAN") - 1)) campaign row(s) in $MAN =="
-  awk -F'\t' 'NR>1{printf "  %-26s %-10s %-11s stab %-6s crashes %-4s hangs %-4s seeds %s/%s\n",$1,$3,$22,$16,$19,$20,$25,$24}' "$MAN"
+  awk -F'\t' 'NR>1{printf "  %-26s %-10s %-11s stab %-6s crashes %-4s hangs %-4s seeds %s/%s x%s\n",$1,$3,$22,$16,$19,$20,$25,$24,($27==""?1:$27)}' "$MAN"
   # the seeds each campaign did not fuzz, from campaigns/<name>.dropped
   local nm tot ld df
   while IFS=$'\t' read -r nm tot ld; do
@@ -388,7 +461,11 @@ summarize() {
       echo "  $nm: $((tot - ld)) seed(s) dropped, afl-fuzz did not name them"
     fi
   done < <(awk -F'\t' 'NR>1{print $1 "\t" $24 "\t" $25}' "$MAN")
-  local fc fh bad
+  local fc fh bad nseed
+  # Seeds waiting in crashers/ and hangs/ (the gate's and smoke run's real-stack crashers, the
+  # corpus skill's set-asides, hand-filed ones): triage screens them even when no campaign
+  # saved anything, so "found nothing" would be false while they wait.
+  nseed=$(find "$WS/crashers" "$WS/hangs" -maxdepth 1 -type f ! -name 'README*' 2>/dev/null | wc -l)
   fc=$(awk -F'\t' 'NR>1{c+=$19} END{print c+0}' "$MAN"); fh=$(awk -F'\t' 'NR>1{h+=$20} END{print h+0}' "$MAN")
   bad=$(awk -F'\t' 'NR>1 && $22!="completed" && $22!="switched"{n++} END{print n+0}' "$MAN")
   echo
@@ -397,6 +474,10 @@ summarize() {
       ts "no crashes or hangs, BUT $bad campaign(s) did not run to completion: this is NOT a result."
       echo "  Read the status column; an aborted or failed campaign finds nothing for a reason that has"
       echo "  nothing to do with the target."
+    elif [ "$nseed" -gt 0 ]; then
+      ts "no crashes or hangs in the campaigns; $nseed seed(s) in crashers/ and hangs/ await triage."
+      echo "  Run the triage skill from $WS: it screens crashers/ and hangs/ on every build and"
+      echo "  confirms on the real stack what no build reproduces. Nothing is a result before that."
     elif [ "$SELFTEST_STATE" = passed ]; then
       ts "no crashes or hangs."
       echo "  The detection self-test passed and every campaign ran its full ${DURATION}s, so this is a"
@@ -409,6 +490,7 @@ summarize() {
     echo "  triage_all.sh reads $MAN for the variant, harness, mode->entry map, ceiling and"
     echo "  status of each campaign, so pass nothing it can read there."
     [ "$bad" != 0 ] && echo "  NOTE: $bad campaign(s) did not run to completion; their crashes are real, the absence of more is not."
+    [ "$nseed" -gt 0 ] && echo "  Also $nseed seed(s) in crashers/ and hangs/ await triage (it screens them too)."
   fi
 }
 
@@ -429,11 +511,15 @@ done_line() {
 on_interrupt() {
   trap '' INT TERM
   ts "interrupted: stopping ${#LIVE[@]} campaign(s) and recording them"
-  local t; for t in "${LIVE[@]:-}"; do [ -n "$t" ] || continue; stop_one "${PID[$t]}"; finish "$t" interrupted 143; done
+  # every campaign's instances at once, then one row each (sequentially, ten seconds of
+  # grace per campaign would add up)
+  local t all=""; for t in "${LIVE[@]:-}"; do [ -n "$t" ] && all="$all ${PID[$t]} ${SPIDS[$t]:-}"; done
+  [ -n "${all// /}" ] && stop_pids $all
+  for t in "${LIVE[@]:-}"; do [ -n "$t" ] || continue; finish "$t" interrupted 143; done
   summarize; done_line; exit 130
 }
 trap on_interrupt INT TERM
-trap 'for t in "${LIVE[@]:-}"; do [ -n "$t" ] && kill -KILL "${PID[$t]}" 2>/dev/null; done' EXIT
+trap 'for t in "${LIVE[@]:-}"; do [ -n "$t" ] && kill -KILL "${PID[$t]}" ${SPIDS[$t]:-} 2>/dev/null; done' EXIT
 
 # ---- run the plan, JOBS at a time, persistent-first with a stability fallback ------------
 ts "== running ${#PLAN[@]} campaign(s) =="
@@ -454,20 +540,22 @@ while [ "$ri" -lt "${#PLAN[@]}" ] || [ "${#LIVE[@]}" -gt 0 ]; do
     if kill -0 "$pid" 2>/dev/null; then
       if [ "$WALL" -gt 0 ] && [ $(( $(date +%s) - START[$t] )) -ge "$WALL" ]; then
         ts "  $t: ${WALL}s wall-clock ceiling reached (stability ${stab:-?}%, $(stat_of "$o" execs_done) execs): stopping it"
-        stop_one "$pid"; finish "$t" walled 0; continue
+        stop_one "$t"; finish "$t" walled 0; continue
       fi
-      ts "  $t: $(stat_of "$o" execs_done) execs, stability ${stab:-?}%, crashes $(nfiles "$o/default/crashes"), hangs $(nfiles "$o/default/hangs")"
+      ts "  $t: $(stat_of "$o" execs_done) execs${SPIDS[$t]:+ (main)}, stability ${stab:-?}%, crashes $(nall "$o" crashes), hangs $(nall "$o" hangs)"
       [ "$HB_NOTE" = 1 ] || { HB_NOTE=1; echo "    (execs and stability come from fuzzer_stats, which afl-fuzz rewrites about every 60 s: repeated numbers are not a stall; crashes/hangs are counted on disk)"; }
       if [ "${DRV[$t]}" = persistent ] && [ -n "$stab" ] \
          && [ $(( $(date +%s) - START[$t] )) -ge "$STAB_CHECK" ] \
          && awk -v s="${stab%%.*}" -v m="$MIN_STABILITY" 'BEGIN{exit !(s+0 < m)}'; then
         ts "  $t: stability ${stab}% < ${MIN_STABILITY}%: stopping it and relaunching on the fork driver"
-        stop_one "$pid"; v=${VAR[$t]}; me=${ME[$t]}; en=${EN[$t]}
+        stop_one "$t"; v=${VAR[$t]}; me=${ME[$t]}; en=${EN[$t]}
         finish "$t" switched 0
         launch "$v" "$me" "$en" fork
       fi
     else
+      # the main instance ended (its -V, or an abort): the secondaries end with it
       rc=$(rc_of "$t" "$pid")
+      [ -n "${SPIDS[$t]:-}" ] && stop_pids ${SPIDS[$t]}
       finish "$t" natural "$rc"
     fi
   done

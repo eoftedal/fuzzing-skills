@@ -67,6 +67,7 @@ One manifest row per campaign, with the columns triage was reconstructing by han
 | `status` | whether the campaign ran its full duration | a campaign that aborted at startup was recorded as `completed` and read as "found nothing" |
 | `seeds_loaded` / `seeds_total` | how much of the corpus actually ran | `AFL_IGNORE_SEED_PROBLEMS` silently dropped seeds |
 | `dict` | which dictionary afl-fuzz had; a token-driven finding is reproducible only with it | |
+| `instances` | how many afl-fuzz ran in the campaign (1 + `SECONDARIES`); its execs and stability are `main`'s alone | |
 
 The `entry` field names the `confirm.mjs` ENTRIES arm that reaches the same code through the
 npm API. By the chain's convention it is the **mode's value**: the harness skill's
@@ -78,8 +79,20 @@ once, here, instead of triage rediscovering it.
 
 ## How it steers afl-fuzz
 
-* **One output directory per (variant × mode).** Never shared — the `saved_crashes`/files
-  mismatch that corrupts a count comes from two fuzzers in one `-o`.
+* **One output directory per (variant × mode).** Never shared between campaigns — the
+  `saved_crashes`/files mismatch that corrupts a count comes from two fuzzers in one `-o`.
+  A campaign's own instances share it by design (AFL++ parallel mode: `default/` alone, or
+  `main/` and `s1/`..`s<n>/`).
+* **Cores: secondary instances.** `JOBS` counts campaigns; each runs `1 + SECONDARIES`
+  afl-fuzz instances, one core each, so the default `JOBS` is
+  `(cores − 1) / (1 + SECONDARIES)`. A plan with few (variant × mode) campaigns leaves
+  cores idle (two campaigns on 14 cores left 12 idle for a whole run); the `plan:` line
+  counts the cores used and, below half, prints `SECONDARIES=<k> would use them`. With
+  `SECONDARIES=n` a campaign runs `-M main` plus `-S s1`..`s<n>`, which sync queues;
+  secondaries alternate `-p explore`/`-p fast`, and with n ≥ 3 the last runs MOpt (`-L 0`);
+  all get the same `-x`, ceiling and `-V`. The stability fallback, `WALL`, the end of
+  `main` and `kill -TERM` stop every instance. `crash_files`/`hang_files` count every
+  instance; triage reads them all and dedups by content.
 * **Persistent first, fork on low stability.** It starts the persistent binary, reads
   `stability` from `fuzzer_stats` after `STAB_CHECK` seconds, and if it is below
   `MIN_STABILITY` (90%) **stops it for real** and relaunches on `harness-fork`. Both
@@ -97,7 +110,8 @@ once, here, instead of triage rediscovering it.
   leaves trimming and calibration out of `-V`), so a campaign that has saved a hang can run
   several times its `DURATION`. `WALL=<seconds>` stops a campaign at a wall-clock ceiling and records
   it `walled`; its crashes are real, but it is never a "found nothing" result. The end-of-run summary says "found nothing" only if the
-  self-test passed AND every campaign `completed`; otherwise it says the result is not one.
+  self-test passed AND every campaign `completed` AND `crashers/` and `hangs/` are empty;
+  otherwise it says the result is not one, or that N seeds there await triage.
 * **Seeds in, seeds run.** The corpus defaults to `corpus-final` (the union), not
   `corpus-min`: the corpus skill calls the greedy cover "a stop signal, not a reason to ship
   only the cover". `seeds_loaded` vs `seeds_total` records what `AFL_IGNORE_SEED_PROBLEMS`
@@ -144,11 +158,15 @@ confirm step, as the triage skill already requires.
 ## Knobs
 
 `WORKSPACE CAMPAIGNS CORPUS VARIANTS MODES DEFAULT_ENTRY DURATION WALL STAB_CHECK
-MIN_STABILITY ALLOC_CAP_MB TIMEOUT_MS SELFTEST POLL JOBS SCREEN DETACH DICT` — each documented in `resources/campaign.sh`'s
-header. `DURATION` is fuzz-time per campaign; `JOBS` (default cores−1) is how many run at
-once. `DICT=` is passed as `afl-fuzz -x`: by default `$W/dict.afl` (the corpus skill's
+MIN_STABILITY ALLOC_CAP_MB TIMEOUT_MS SELFTEST POLL JOBS SECONDARIES SCREEN DETACH DICT` — each documented in `resources/campaign.sh`'s
+header. `DURATION` is fuzz-time per campaign; `JOBS` (default (cores−1) / (1 + `SECONDARIES`))
+is how many campaigns run at once. `DICT=` is passed as `afl-fuzz -x`: by default `$W/dict.afl` (the corpus skill's
 merged dictionary), else the variant's `out/<variant>/dict.afl` from its build; `DICT=none`
-runs without one. The harness skill's smoke runs pick the same default. `SCREEN=1` runs each afl-fuzz inside a detached GNU `screen` session (`afl-<campaign>`)
+runs without one. The manifest's `dict` column is that path relative to the workspace
+(`dict.afl` = `$W/dict.afl`). When `$W/dict.afl` is chosen while `out/<variant>/dict.afl`
+also exists, the launch line names both with their entry counts: a `dict.sh` run without
+`FROM=` drops the build's compare constants, and a smaller count is the sign. The harness skill's smoke runs pick the same default. `SCREEN=1` runs each afl-fuzz inside a detached GNU `screen` session (`afl-<campaign>`,
+or `afl-<campaign>-main`/`-s<i>` with secondaries)
 with its UI on, so a person can watch it live with `screen -r afl-<name>` (detach with
 `C-a d`; `C-c` would kill the campaign) while the script keeps owning the pid, the
 stability fallback and the manifest. The evidence behind the choices is in `EVIDENCE.md`.

@@ -130,7 +130,9 @@ plugin's `EVIDENCE.md` maps each target to its totals.
   jitters a few edges on every run; that is the floor, not a bug in your corpus.
 * **The final re-gate finds fidelity gaps the gate corpus was too small to reach.** On one
   target, re-gating `corpus-final/` was what exposed a library accepting inputs the real
-  stack rejects.
+  stack rejects. A lossy test on the final string alone misses a U+FFFD inside an event's name: test
+  every string the API returns. `AFL_SKIP_CRASHES=1` covers crashing seeds only, so the
+  campaign relies on `AFL_IGNORE_SEED_PROBLEMS=1`, which also skips hanging ones.
 * **Sweep and minimise.** One sweep of 258 single-byte-flip candidates yielded **10
   keepers for +20 edges**.
 * **The ASAN crasher pass needs a long timeout** (carried from Node evaluation runs). At

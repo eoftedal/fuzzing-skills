@@ -27,8 +27,15 @@
 # Verdicts per cell, most severe first:
 #   NATIVE-CRASH(...)  node died on a signal or printed a sanitizer report: NO JavaScript
 #                      handler can catch this (the user's whole point).
+#   RUNTIME-ABORT(sigN)  node died on a signal with a runtime invariant message (`Check
+#                      failed:`, `Fatal error`) and no sanitizer report: the binding broke
+#                      the runtime's bookkeeping (external-memory accounting, a handle scope)
+#                      and the runtime aborted on purpose.  Uncatchable, so a denial of
+#                      service, but not a memory-safety finding.
 #   UNCAUGHT           a JS error escaped the call's own handling (emitter 'error', async
-#                      throw): an ordinary try/catch does NOT stop it, a global handler does.
+#                      throw, or a throw on a later tick after the call returned:
+#                      `after=return`): an ordinary try/catch does NOT stop it, a global
+#                      handler does.
 #   HANG               no answer within TIMEOUT_MS: an algorithmic DoS, not a clean run.
 #   CAUGHT             threw or rejected: a try/catch or .catch at the call site stops it.
 #   CLEAN              no error at all, with `evidence=` of what the call produced.
@@ -43,15 +50,16 @@
 #                      arm is mis-wired; not CLEAN.
 #
 # Configure with KEY=VALUE arguments, then $WORKSPACE/fuzz.env (WORKSPACE default .), then
-# environment.  From fuzz.env: PKG, PKG_VERSION, ALLOC_CAP_MB, ADDON (from ADDON_ASAN), and
-# ASAN_RT (from $R/find_asan_rt.sh) when ADDON is set.
+# environment.  From fuzz.env: PKG, PKG_VERSION, ALLOC_CAP_MB, ADDON (from ADDON_ASAN),
+# ADDON_MATCH, and ASAN_RT (from $R/find_asan_rt.sh) when ADDON is set.
 #   PKG       REQUIRED.  node_modules/<pkg> of a FRESH `npm install <pkg>@<version>`, pinned
 #             to the version you harnessed -- a newer npm release may have fixed the bug,
 #             which is itself a result worth reporting.  Not your build tree, not the oracle.
 #   ADDON     the ASAN addon for the second column; omit to skip it (hard crashes still show
 #             in column 1).  The path is whatever your build produced -- Release/<name>.node
 #             for node-gyp, often flat out/asan/<name>.node, out/asan/lib/ for a zig build.
-#   ADDON_MATCH  regex limiting which loaded addon ADDON replaces.
+#   ADDON_MATCH  regex limiting which loaded addon ADDON replaces (fuzz.env carries it for a
+#             package that loads several addons; an explicit argument wins).
 #   ADDON_MAP    `regex=path;regex=path` when the package loads SEVERAL addons (a runtime
 #             plus a grammar).  Without it, one ADDON is swapped in for all of them and the
 #             cell reads ADDON-AMBIGUOUS rather than a verdict.  Applies to the ASAN column
@@ -81,7 +89,13 @@
 #   CELL_TIMEOUT  seconds per cell (default 30).  A native infinite loop would otherwise
 #             wedge the whole table.
 #   OUT       triage work dir (default ./triage); BUCKETS defaults to OUT/buckets.
-#   VERDICTS  machine-readable output (default OUT/verdicts.tsv): name, entry, 3 columns.
+#   VERDICTS  machine-readable output (default OUT/verdicts.tsv): name, entry, 3 columns,
+#             and the install cell's wall-clock seconds (triage_all.sh tells a slow input from
+#             a hang with it: a hang bucket the install answers in 0.3 s is slow, not a hang).
+#   LIVENESS_ONLY=1  run only the GOOD= liveness check of every ENTRIES arm, no table (what
+#             triage_all.sh runs when there is nothing to confirm, so a no-findings run still
+#             shows the pasted arms work).
+#   SETTLE_MS passed to confirm.mjs: how long a CLEAN waits for a late throw (default 50).
 set -uo pipefail
 for kv in "$@"; do case $kv in WORKSPACE=*) export "$kv";; esac; done   # find fuzz.env first
 WS=${WORKSPACE:-.}; [ -f "$WS/fuzz.env" ] && { set -a; . "$WS/fuzz.env"; set +a; }
@@ -165,6 +179,11 @@ run() {  # <crash file> <env assignments...>  -> prints one cell, sets LAST_OUT
   rc=$?
   LAST_OUT=$out
   if   grep -q 'Sanitizer:' <<<"$out"; then echo "NATIVE-CRASH($(sed -n 's/.*Sanitizer: \([a-z-]*\( of memory\)\{0,1\}\).*/\1/p' <<<"$out" | head -1 | tr ' ' '-'))"
+  # A runtime's own invariant abort (V8's `Check failed:` / `# Fatal error`, SIGTRAP or
+  # SIGABRT) with no sanitizer report: the binding misused the runtime's bookkeeping.  A
+  # denial of service, not a memory-safety bug; measured on a compression binding whose
+  # external-memory accounting went negative, which read NATIVE-CRASH(sig5) as if critical.
+  elif [ "$rc" -ge 128 ] && [ "$rc" != 137 ] && grep -qE 'Check failed:|Fatal error' <<<"$out"; then echo "RUNTIME-ABORT(sig$((rc-128)))"
   elif [ "$rc" = 124 ];          then echo "HANG(cell-timeout)"
   elif [ "$rc" -ge 128 ];        then echo "NATIVE-CRASH(sig$((rc-128)))"
   elif [ "$rc" = 86 ];           then echo "NATIVE-CRASH(asan)"
@@ -195,13 +214,14 @@ cell() {  # <minimized file> <original file> <env...>
     local vo; vo=$(run "$orig" "$@")
     # SKIPPED and ERROR are reported too: "the minimized input is clean and the original
     # proved nothing" is not the same claim as a plain CLEAN.
-    case "$vo" in NATIVE-CRASH*|UNCAUGHT|HANG*|CAUGHT|SKIPPED|ERROR*) echo "CLEAN->${vo}(orig)";;
+    case "$vo" in NATIVE-CRASH*|RUNTIME-ABORT*|UNCAUGHT|HANG*|CAUGHT|SKIPPED|ERROR*) echo "CLEAN->${vo}(orig)";;
                   *) echo "$v";; esac
   else echo "$v"; fi
 }
 
-[ -n "$(ls "$BUCKETS" 2>/dev/null)" ] || { echo "no representatives in $BUCKETS; run bucket.sh first" >&2; exit 1; }
-# Machine-readable verdicts, one line per bucket x entry: name, entry, install, asan, pristine.
+[ -n "$(ls "$BUCKETS" 2>/dev/null)" ] || [ "${LIVENESS_ONLY:-0}" = 1 ] || { echo "no representatives in $BUCKETS; run bucket.sh first" >&2; exit 1; }
+# Machine-readable verdicts, one line per bucket x entry: name, entry, install, asan, pristine,
+# install seconds.
 # The driver reads this to decide which representatives are worth minimizing.
 VERDICTS=${VERDICTS:-$OUT/verdicts.tsv}; : > "$VERDICTS"
 
@@ -227,6 +247,7 @@ for E in $ENTRIES; do
   else
     echo "# no GOOD= (or GOOD_${E//[^A-Za-z0-9_]/_}=) given: the CLEAN cells below are unverified. Pass a corpus seed."
   fi
+  [ "${LIVENESS_ONLY:-0}" = 1 ] && continue
   cells=0
   printf '%-34s %-24s %-24s %-24s\n' CRASH 'npm-install(plain)' 'npm-js+asan-addon' 'npm-js+pristine-addon'
   for c in "$BUCKETS"/*; do
@@ -236,7 +257,8 @@ for E in $ENTRIES; do
     orig="$OUT/pool/$pname"                                  # pre-tmin bytes (see screen.sh)
     cap=$(capof "$pname"); export ASAN_OPTIONS="$ASAN_BASE:allocator_may_return_null=1:max_allocation_size_mb=${cap:-$ALLOC_CAP_MB}"
     export ALLOC_CEIL=$(( ${cap:-$ALLOC_CAP_MB} * 1048576 ))
-    a=$(cell "$c" "$orig" ENTRY="$E" PKG="$PKG")
+    t0=$(date +%s%N); a=$(cell "$c" "$orig" ENTRY="$E" PKG="$PKG")
+    as=$(LC_ALL=C awk -v d="$(( $(date +%s%N) - t0 ))" 'BEGIN { printf "%.2f", d / 1e9 }')
     if [ -n "${ADDON:-}" ]; then
       b=$(cell "$c" "$orig" ENTRY="$E" PKG="$PKG" ADDON="$ADDON" \
                ${ADDON_MATCH:+ADDON_MATCH="$ADDON_MATCH"} ${ADDON_MAP:+ADDON_MAP="$ADDON_MAP"} \
@@ -248,14 +270,17 @@ for E in $ENTRIES; do
                ${ASAN_RT:+LD_PRELOAD="$ASAN_RT"})
     else p="(no PRISTINE)"; fi
     printf '%-34s %-24s %-24s %-24s\n' "$(basename "$c" | cut -c1-34)" "$a" "$b" "$p"
-    printf '%s\t%s\t%s\t%s\t%s\n' "$(basename "$c")" "$E" "$a" "$b" "$p" >> "$VERDICTS"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(basename "$c")" "$E" "$a" "$b" "$p" "$as" >> "$VERDICTS"
     cells=$((cells+1)); ts "# cell $cells/$nb done ($E)" >&2
   done
 done
+[ "${LIVENESS_ONLY:-0}" = 1 ] && exit 0
 echo
 echo "severity: install NATIVE-CRASH = critical (any consumer, uncatchable);"
 echo "          asan-only NATIVE-CRASH = real memory bug, release build hides the symptom;"
 echo "          reproduces on PRISTINE too = not an artifact of the coverage instrumentation;"
+echo "          RUNTIME-ABORT = the runtime aborted on the binding's broken bookkeeping:"
+echo "                          a DoS (uncatchable), not a memory-safety bug;"
 echo "          HANG = algorithmic DoS, uncatchable by try/catch;"
 echo "          UNCAUGHT = DoS unless the consumer installs a global handler;"
 echo "          CAUGHT = defensible (a try/catch is enough);"

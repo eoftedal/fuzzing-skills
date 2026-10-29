@@ -86,3 +86,15 @@ grouping and `DRIFT`).
 | change | tag | evidence |
 |---|---|---|
 | `DICT=` passes `afl-fuzz -x`; default `$W/dict.afl`, else the variant's `out/<variant>/dict.afl`, `DICT=none` disables; new last manifest column `dict`, with an older manifest upgraded in place; smoke runs pick the same default | **[measured]** on a fabricated extension in the `sectainer-ruby` container, not on a published gem | a 5 s run picked `$W/dict.afl`, the log shows the dictionary loaded, the manifest row carries it on completed and interrupted paths; `triage_all.sh` and `smoke.sh` read the 26-column manifest unchanged |
+
+## Mirrored from the Node plugin's round 3 fixes (2026-10-09)
+
+| change | tag | evidence |
+|---|---|---|
+| the summary says `N seed(s) in crashers/ and hangs/ await triage` instead of "found nothing" when those directories hold seeds; the launch line names `dict.afl` over `out/<variant>/dict.afl` with entry counts; the header says `dict` is workspace-relative | **[carried]** | measured on a Node workspace (the Node EVIDENCE.md, same heading); identical code here (`check_shared.sh`: 0 drift), not yet run on a gem |
+
+## Mirrored from the Node plugin's round 4 fixes (2026-10-09)
+
+| change | tag | evidence |
+|---|---|---|
+| `SECONDARIES=<n>`: `-M main` + `-S s<i>` per campaign (explore/fast alternation, `-L 0` on the last when n ≥ 3); default `JOBS` counts instances against cores−1, with a `SECONDARIES=<k> would use them` hint below half the cores; stats from `main`, crash/hang files summed over every instance; new last manifest column `instances` with the in-place header upgrade; the stability fallback, `WALL`, the end of `main`, `kill -TERM` and `SCREEN=1` (`afl-<campaign>-main`/`-s<i>`) cover every instance | **[carried]** | measured on a Node workspace (the Node EVIDENCE.md, same heading): a 60 s run with 2 secondaries, a killed 300 s run with 6 instances (0 left, rows `interrupted`), a forced stability switch with 3 secondaries. Identical code here (`check_shared.sh`: 0 drift), not yet run on a gem |

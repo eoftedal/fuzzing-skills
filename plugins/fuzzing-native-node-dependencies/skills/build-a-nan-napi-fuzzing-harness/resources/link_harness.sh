@@ -6,7 +6,7 @@
 #       SRCDIR=<package dir> [LIB="<objects or archives the boundary needs>"] \
 #       [ADDON_OBJS="<addon objects you link, if any>"] [HARNESS=harness.cc] [OUT=out] \
 #       [HARNESS_CXX=g++] [STUB_SYMBOL=napi_throw] [EXTRA_LIBS="-lz -pthread"] \
-#       [LIBS_FROM_MK=1] [EXTRA_FLAGS="-I..."]
+#       [LIBS_FROM_MK=1] [EXTRA_FLAGS="-I..."] [ARCHIVE_LIBS="foo"] [ARCHIVE_INC=<dir>]
 #
 #   LIB         the library's objects ("$(find out/<v>/Release/obj.target/<dep> -name '*.o')") or
 #               its archive (out/<v>/lib/lib<dep>.a) -- what the boundary function's
@@ -15,6 +15,18 @@
 #               is required.
 #   LIBS_FROM_MK=1  append the target's own `LIBS :=` block from MK (the system
 #               libraries the addon links: -lfoo -lbar ...) to EXTRA_LIBS.
+#   ARCHIVE_LIBS  libraries a static archive provides INSTEAD of the system shared object
+#               (route 3b, build_lib.sh): `-l<x>` for each is dropped from EXTRA_LIBS and the
+#               lifted LIBS (it would pull the distro's lib<x>.so in beside the archive), and
+#               the archive is linked even when LIB does not name it.  Default: every
+#               lib<x>.a in OUT/<variant>/lib/ and in LIB.  ARCHIVE_LIBS= (empty) disables.
+#               After the link: FAIL when the harness still NEEDs lib<x>.so, or when a
+#               function of the archive the linked objects call is not defined in it.
+#               -L directories that do not exist (hard-coded in a binding.gyp for another
+#               platform) are dropped too.
+#   ARCHIVE_INC the archive's headers, put FIRST on the include path; OUT/<variant>/lib/include
+#               (build_lib.sh writes it) is used when present, so the harness compiles
+#               against the archive's config headers, not the distro's.
 #   EXTRA_FLAGS extra compile flags for the harness TU.  lift_flags.sh already adds
 #               -I for the package root, src/ and lib/ (gyp compiles with includes
 #               relative to the source file, so the lifted -I list lacks them).
@@ -65,7 +77,36 @@ if [ "${LIBS_FROM_MK:-0}" = 1 ]; then
   EXTRA_LIBS="$EXTRA_LIBS $(sed -n '/^LIBS :=/,/^$/p' "$MK" | tr -d '\\' | tr '\n' ' ' | sed 's/^LIBS := //; s/-l[A-Za-z0-9_.+-]*afl-compiler-rt[^ ]*//; s#[^ ]*afl-compiler-rt\.o##')"
 fi
 
-# The harness TU's compare constants join the build's dict.afl (build script: dict2file.raw).
+# Route 3b: a static archive replaces a system library.  Its -l<x> must go (the distro's
+# lib<x>.so would otherwise be linked beside it), and its headers come first.
+if [ -z "${ARCHIVE_LIBS+x}" ]; then
+  ARCHIVE_LIBS=$(for a in "$D"/lib/lib*.a $LIB; do case $a in (*/lib*.a|lib*.a) [ -f "$a" ] && basename "$a" .a | sed 's/^lib//';; esac; done | sort -u | paste -sd' ' -)
+fi
+ARCH_FILES=""
+for x in $ARCHIVE_LIBS; do
+  af=""
+  for a in $LIB; do [ "$(basename "$a")" = "lib$x.a" ] && af=$a; done
+  if [ -z "$af" ] && [ -f "$D/lib/lib$x.a" ]; then
+    af=$D/lib/lib$x.a; LIB="$LIB $af"; echo "  archive: $af added to LIB (it provides -l$x)"
+  fi
+  [ -n "$af" ] && ARCH_FILES="$ARCH_FILES $x=$af"
+  dropped=""; kept=""
+  for t in $EXTRA_LIBS; do
+    case $t in "-l$x"|"-l:lib$x.so"*) dropped="$dropped $t" ;; *) kept="$kept $t" ;; esac
+  done
+  EXTRA_LIBS=$kept
+  [ -n "$dropped" ] && echo "  dropped$dropped from the libraries: lib$x.a provides it"
+done
+kept=""; for t in $EXTRA_LIBS; do
+  case $t in -L*) [ -d "${t#-L}" ] || { echo "  dropped $t: no such directory here"; continue; } ;; esac
+  kept="$kept $t"; done; EXTRA_LIBS=$kept
+AINC=""
+[ -d "$D/lib/include" ] && AINC="-I$(cd "$D/lib/include" && pwd)"
+[ -n "${ARCHIVE_INC:-}" ] && AINC="-I$ARCHIVE_INC $AINC"
+[ -n "$AINC" ] && { FLAGS="$AINC $FLAGS"; echo "  include first: $AINC (the archive's headers, not the distro's)"; }
+
+# The harness TU's compare constants join the build's dict.afl (build_addon.sh: dict2file.raw;
+# build_lib.sh: dict2file-lib.raw).
 # Its own raw file, so a relink neither wipes the library's entries nor accumulates; stubs
 # and shims are not recorded.  An absolute path, or afl-cc aborts.  No _NO_MAIN here: at -O2
 # the harness's static helpers are inlined into main and their constants would be lost.
@@ -122,6 +163,32 @@ for drv in harness harness-fork; do
     exit 1
   fi
 done
+# Route 3b: the archive, not the distro's shared object, must serve the harness.
+for xa in $ARCH_FILES; do
+  x=${xa%%=*}; af=${xa#*=}
+  if readelf -d "$D/harness" 2>/dev/null | grep -E '\(NEEDED\)' | grep -qE "\[lib$x\.so"; then
+    echo "FAIL: $D/harness NEEDs lib$x.so although lib$x.a provides it: a -l$x is still on the link line" >&2
+    echo "      (EXTRA_LIBS, or an -l spelled another way); remove it" >&2; exit 1
+  fi
+  if ldd "$D/harness" 2>/dev/null | grep -qE "^[[:space:]]*lib$x\.so"; then
+    echo "  WARN: lib$x.so is loaded indirectly (another system library NEEDs it; ldd): the harness's own calls bind"
+    echo "        to the archive (checked below), that library's calls to the shared copy"
+  fi
+  # the archive's functions the linked objects call must be defined in the binary
+  calls=$(nm -u "$D/harness.o" $ADDON_OBJS $(for o in $LIB; do case $o in (*.a) ;; (*) echo "$o";; esac; done) 2>/dev/null \
+          | awk '{print $NF}' | LC_ALL=C sort -u)
+  defs=$(nm --defined-only -g "$af" 2>/dev/null | awk '$2 ~ /^[TW]$/ {print $3}' | LC_ALL=C sort -u)
+  used=$(LC_ALL=C comm -12 <(echo "$calls") <(echo "$defs") | grep .)
+  if [ -z "$used" ]; then
+    echo "  WARN: nothing linked calls a function of $(basename "$af") directly (harness.o, ADDON_OBJS): is it the library you fuzz?"
+    continue
+  fi
+  bad=$(nm "$D/harness" 2>/dev/null | awk '$1=="U" || $2=="U" {print $NF}' | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(echo "$used") | grep .)
+  if [ -n "$bad" ]; then
+    echo "FAIL: $(wc -l <<<"$bad") function(s) of $(basename "$af") are undefined in $D/harness (resolved at run time elsewhere): $(head -3 <<<"$bad" | paste -sd' ' -)" >&2; exit 1
+  fi
+  echo "  ok: lib$x from $(basename "$af"): $(wc -l <<<"$used") function(s) the harness calls are defined in the binary (e.g. $(head -2 <<<"$used" | paste -sd' ' -)); no lib$x.so NEEDED"
+done
 # afl-fuzz picks the driver from the persistent-mode magic string in the binary.  A shim
 # lacking the testcase macros once turned the persistent binary into a usage-printing fork
 # binary without any error, and a sentence in SKILL.md was the only guard: check it here.
@@ -141,13 +208,13 @@ if [ "$VARIANT" != pristine ]; then
   echo "$ms" > "$D/map_size"
 fi
 if [ -n "$HDICT" ]; then   # same filter as the build script: dedup, drop empty or >128-byte tokens
-  ndict=$(cat "$D/dict2file.raw" "$HDICT" 2>/dev/null | LC_ALL=C sort -u | awk -v out="$D/dict.afl.tmp" '
+  ndict=$(cat "$D/dict2file.raw" "$D/dict2file-lib.raw" "$HDICT" 2>/dev/null | LC_ALL=C sort -u | awk -v out="$D/dict.afl.tmp" '
     !/^".*"$/ { next }
     { d = substr($0, 2, length($0) - 2); gsub(/\\x[0-9A-Fa-f][0-9A-Fa-f]|\\./, "x", d)
       if (d == "" || length(d) > 128) next
       print > out; n++ }
     END { print n + 0 }')
-  if [ "$ndict" -gt 0 ]; then mv "$D/dict.afl.tmp" "$D/dict.afl"; echo "  dict: $ndict entries in $D/dict.afl (library + harness compare constants)"
+  if [ "$ndict" -gt 0 ]; then mv "$D/dict.afl.tmp" "$D/dict.afl"; echo "  dict: $ndict entries in $D/dict.afl (addon build + separate library build + harness compare constants)"
   else rm -f "$D/dict.afl.tmp"; fi
 fi
 echo "built $D/harness and $D/harness-fork"

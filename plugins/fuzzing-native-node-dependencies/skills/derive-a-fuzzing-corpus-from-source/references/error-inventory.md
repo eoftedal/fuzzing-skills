@@ -13,7 +13,9 @@ step 2.
    it together with the library's error-string source file (the AFL-instrumented objects
    do not link into a plain program; the pristine ones do), and diff its output against
    the `err` column of `.results`. It skips the filler string such functions return for
-   non-members. The mapping is exact, and on every target that had such a function it
+   non-members. It walks from `MIN_CODE` (default -64), because error codes are often
+   negative; set it below the enum's lowest member.
+   The mapping is exact, and on every target that had such a function it
    was the right route. An enum member the parser never sets is dead code, which is a
    finding, not a gap.
 2. **The enum, when the harness prints the numeric code.** Parse the enum from the header
@@ -58,3 +60,14 @@ line 3, column 17`), the whole message is unique per seed. Use the message **up 
 position marker**, spaces replaced by `_`, on both sides of the gate: it names the check
 that failed and nothing about where. Change it in the harness and the real-side template
 together, then re-gate when `FIELDS` compares `err`.
+
+## When the binding collapses every error into one message
+
+Some bindings map every library error to one fixed message (one "operation failed"), so
+`err` is the same token for every reject: correct for the gate, which compares what the
+real stack shows, and useless for the histograms and the inventory. `error_inventory.sh`
+warns when every rejected input has one value. Give the direct harness an **ungated**
+`lib_err=` field holding the library's own error name or code (the harness skill
+describes it; the gate compares only `FIELDS`, so it ignores the extra key), re-run
+`measure.sh`, then pass `FIELD=lib_err` to `validate.sh` and `error_inventory.sh`, and
+diff `errenum`'s output against the `lib_err` column instead of `err`.

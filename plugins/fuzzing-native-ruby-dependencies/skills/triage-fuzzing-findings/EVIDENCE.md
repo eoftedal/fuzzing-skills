@@ -98,3 +98,26 @@ On this plugin they are **[carried]** except where the Ruby-side templates and t
 adjusted to match (the empty-output hash rule, the framing-not-a-mode rule, `mkgate.sh`,
 `CRASHES-BOTH` and `known-crasher`, the `DONE:` marker, pristine before triage, the caller
 grouping and `DRIFT`).
+
+## Mirrored from the Node plugin's round 3 fixes (2026-10-09)
+
+**[carried]**, not yet run on a gem; the Node rows are in the Node plugin's triage EVIDENCE.md
+under the same heading. Shared code changed identically (`bucket.sh`: the
+`hang in harness code (<frame>)` key; `triage_all.sh`: real-stack-only confirmation of
+unresolved `crashers/`, liveness of every arm on a run with no bucket, REPORT rows deduplicated
+on (minimized sha1, key) with `report_rows.tsv`, Scope pre-filled from the manifest and
+`real_harness.rb`; `confirm.sh`: `RUNTIME-ABORT(sigN)` for a signal with `Check failed:` or
+`Fatal error` and no sanitizer report, `LIVENESS_ONLY=1`, `EXT_MATCH` defaulting to
+`fuzz.env`'s `ADDON_MATCH`). `confirm.rb` does not get the Node settle wait: Ruby has no event
+loop to deliver a throw after the call returns (a gem thread that dies later ends the process
+only under `Thread.abort_on_exception`, and `exit!` skips `at_exit`). To make room, the
+minimization and pipeline-order paragraphs moved from SKILL.md to
+`references/afl-tool-reliability.md` ("In short"), and a stale sentence saying the liveness run
+does not prove the swap was replaced: `confirm.sh` already runs a liveness cell per sanitized
+column and prints its `swap=` state.
+
+## Mirrored from the Node plugin's round 4 fixes (2026-10-09)
+
+| change | tag | evidence |
+|---|---|---|
+| `triage_all.sh`/`screen.sh` read every instance's `*/crashes` and `*/hangs` (`default/`, `main/`, `s<i>/`), dedup by content across them, and keep the instance in the pool name; every REPORT cell has a value (`(not minimized...)`, `(not confirmed...)`); a hang row whose worst cell is `CAUGHT` reads `SLOW (not a hang: real stack answers in <t> s)` from the install cell's seconds (new 6th `verdicts.tsv` column, also in this plugin's `confirm.sh`); a hang representative that is `NATIVE-CRASH` on the real stack is re-keyed as a crash with `bucket.sh HANGS=0`; not-minimized rows hash their original bytes (they hashed nothing and merged) | **[carried]** | measured on a Node workspace (the Node EVIDENCE.md, same heading). Identical shared code here (`check_shared.sh`: 0 drift); the `confirm.sh` column was added by the same edit to the Ruby copy, `bash -n` only. Not yet run on a gem. SKILL.md: the bucket-section paragraph and the manifest row; to fit under 30,000 bytes, three sentences were shortened (scripts check results, smoke's crashers, the modes example's last sentence, a `TIMEOUT_MS` aside) |

@@ -8,6 +8,24 @@ around Node bindings, with AFL++ 4.33c, aarch64, container kernel 6.12, Python 3
 behaviour is AFL++'s, not the binding's, so it applies to a Ruby C extension harness
 unchanged; the per-target numbers are Node ones.
 
+## In short: how minimize.sh steers afl-tmin, and why the pipeline order
+
+Fed through `@@`, afl-tmin's temp file reached the harness empty, and it minimized every
+input to zero bytes with exit 0. `minimize.sh` passes `/dev/stdin` as the harness's file
+argument instead, lets afl-tmin minimize freely, and retries with `AFL_TMIN_EXACT=1` only if
+the sanitizer key drifted to a different bug. Drift is keyed on the first non-interceptor
+frame, so a `memcpy` interceptor is not the key; read the minimized input's key against its
+bucket's. Hangs use `afl-tmin -H` with a short `-t` (`HANG_S`, default 2 s) and a re-check
+at the full timeout. A result that does not verify is discarded and the original bytes are
+kept. There is no homemade fallback. The sections below have the evidence.
+
+Bucketing needs only a sanitizer report, so it runs on the raw crashes and does the
+collapsing; minimization then runs once per bug instead of once per crash. On the Node
+sibling (an image-decoding binding) the whole pipeline, including both confirmations, took
+61 s; the earlier "cmin, then minimize every survivor" design ran past 20 minutes.
+Confirming the original bytes before minimizing is also the safer test: that binding's GIF
+bug read CLEAN on the package install once minimized and crashed it only as the original.
+
 ## afl-tmin: feed it through `/dev/stdin`
 
 Symptom: afl-tmin's dry run reports `Program terminates normally` for an input that

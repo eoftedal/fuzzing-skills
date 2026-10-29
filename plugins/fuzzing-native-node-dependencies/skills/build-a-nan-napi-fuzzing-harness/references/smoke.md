@@ -46,6 +46,21 @@ representative per site copied into the workspace's `crashers/` as
 `crashers.summary.tsv`, the directory the corpus skill's seed policy fills. Triage screens `crashers/` (it skips `smoke/` itself), so nothing is
 copied by hand.
 
+## Hangs
+
+A hang does not fail the smoke, but it is not silent either: the summary line reports
+`hangs=N` per variant and mode, and one hang per (variant, mode) is filed into the
+workspace's `hangs/` as `smoke-<variant>[@<mode>]-<name>`, which triage screens against
+every variant. Only a hang that still runs on replay is filed: `smoke.sh` replays the
+smallest of each group for `HANG_S` seconds (default 5), and one that finishes sooner
+was only slow under AFL's millisecond timeout (often an ASAN build of a decoder's
+inner loop). It is listed in the summary (`only slow on replay`, `not handed on`), not
+filed, so `hangs=3` with nothing new in `hangs/` is expected, not a lost hang; the
+campaign's own hangs reach triage anyway. A hang that sits in mirrored dispatch on purpose (a JS state machine
+with an unhandled state, `boundary-shapes.md`) is a finding of the package's JavaScript
+layer; one in your own harness code (a reset that never terminates) is a harness bug to
+fix before the self-test.
+
 ## Exit codes and warnings
 
 Exit 1 on `HARNESS-FRAME` or `DIRECT-ONLY`. Exit 2 when the smoke test itself did not

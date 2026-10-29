@@ -29,11 +29,11 @@ build-a-nan-napi-fuzzing-harness/resources/preflight.sh build-a-ruby-c-extension
 build-a-nan-napi-fuzzing-harness/resources/init_workspace.sh build-a-ruby-c-extension-fuzzing-harness/resources/init_workspace.sh
 build-a-nan-napi-fuzzing-harness/resources/mkgate.sh build-a-ruby-c-extension-fuzzing-harness/resources/mkgate.sh
 "
-for f in compare.sh cost.sh cover.sh dict.sh enumerate_constants.sh errenum_template.c error_inventory.sh measure.sh minimise.sh nondet.sh sweep.sh validate.sh; do
+for f in compare.sh cost.sh cover.sh dict.sh enumerate_constants.sh errenum_template.c error_inventory.sh measure.sh minimise.sh nondet.sh sweep.sh validate.sh union_crashers.sh; do
   PAIRS="$PAIRS
 derive-a-fuzzing-corpus-from-source/resources/$f derive-a-fuzzing-corpus-from-source/resources/$f"
 done
-for f in screen.sh bucket.sh minimize.sh; do
+for f in screen.sh bucket.sh minimize.sh triage_all.sh; do
   PAIRS="$PAIRS
 triage-fuzzing-findings/resources/$f triage-fuzzing-findings/resources/$f"
 done

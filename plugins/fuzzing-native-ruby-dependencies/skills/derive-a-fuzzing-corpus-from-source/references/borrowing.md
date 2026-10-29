@@ -16,6 +16,9 @@ The binding may ship none while the vendored dependency ships many.
   (the loop skips signatures and checksums).
 * **A vendored library's test directory may be named `testing`.** The `find` already
   includes it.
+* **None at all.** A gem often vendors only a codec's sources, with no tests and no test
+  data. Then the writer-driven family is the source (SKILL.md step 8): drive the library's
+  own encoder across its options, then truncate and flip its output.
 
 ## The fixtures may not be files
 

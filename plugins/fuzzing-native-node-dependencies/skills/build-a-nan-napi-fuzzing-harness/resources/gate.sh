@@ -49,13 +49,29 @@
 #             MODES="MODE=file"
 #
 # Seeds the gate sets aside (reported, never a FAIL):
-#   known-crasher  a seed whose basename is also in $WORKSPACE/crashers/ (an ASAN-only
-#                  crasher the corpus skill kept in corpus-final, a smoke finding): skipped
-#                  unjudged, so a re-gate over corpus-min needs no hand-filtered copy
+#   known-crasher  a seed whose basename is also in $WORKSPACE/crashers/, as is or as
+#                  gate-real-<name> / gate-both-<name> (an ASAN-only crasher the corpus skill
+#                  kept in corpus-final, a smoke finding, a seed an earlier gate filed):
+#                  skipped unjudged, so a re-gate over corpus-min needs no hand-filtered copy
 #   CRASHES-BOTH   the direct side exited 86 or on a signal AND so did the real side (or its
 #                  stderr holds "Sanitizer:"): a finding met during the gate, not a fidelity
-#                  failure.  Printed prominently; move it to crashers/ (with a row in
-#                  crashers.summary.tsv) and out of the gate corpus
+#                  failure.  The gate files it itself, as for CRASHES-REAL-ONLY below:
+#                  crashers/gate-both-<name> with a row
+#                  "<name>\tgate CRASHES-BOTH <mode> direct rc=<rc>, real rc=<rc>: <sanitizer line>"
+#                  in crashers.summary.tsv (skipped when the same bytes are already there).
+#                  Counted on the verdict line; it does not fail the gate, and a re-run skips
+#                  it as known-crasher.  Leaving it in the gate corpus is harmless
+#   CRASHES-REAL-ONLY  the direct side answered (a result line, no crash) and the real side
+#                  died: a signal (rc>128 but not the timeout's 137), the sanitizer's 86, or
+#                  "Sanitizer:" / "Fatal error" / "Check failed" (V8) / "[BUG]" (Ruby) on its stderr.  The runtime or
+#                  the package's own code above the boundary aborted on an input the library
+#                  handled: a finding the direct harness cannot see (it does not run that
+#                  code), not a fidelity failure.  The gate files it itself: the seed is copied
+#                  to $WORKSPACE/crashers/gate-real-<name> with a row
+#                  "<name>\tgate CRASHES-REAL-ONLY <mode> rc=<rc>: <first error line>" in
+#                  crashers.summary.tsv (smoke.sh's layout; skipped when the same bytes are
+#                  already there), so a re-gate skips it as known-crasher and triage screens it.
+#                  Counted on the verdict line; it does not fail the gate.
 #
 # Exit status is 0 only when every check passes in every mode, so it can gate a build script.
 set -uo pipefail
@@ -80,7 +96,8 @@ MODES=${MODES:-}
 JOBS=${JOBS:-8}
 ALLOC_CAP_MB=${ALLOC_CAP_MB:-1024}
 export AFL_MAP_SIZE=${MAP_SIZE:-131072}
-KNOWN=""; [ -d "$WS/crashers" ] && KNOWN=$(cd "$WS/crashers" && pwd)
+WSABS=$(cd "$WS" && pwd)
+KNOWN=""; [ -d "$WSABS/crashers" ] && KNOWN=$WSABS/crashers
 # A harness that keeps one-time state (a shared context created in init) trips
 # LeakSanitizer at exit and prints nothing; the leak is not what the gate tests.  The
 # allocation ceiling matches the campaign's, so declared-size seeds fail identically on both
@@ -91,7 +108,8 @@ export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0:exitcode=86:a
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 export DIRECT REAL FIELDS ARM_FIELD SOFT_FIELD SOFT_DROP TMP KNOWN
 
-first_err() { grep -m1 -E 'ERROR:|Error|error|Cannot|SUMMARY' "$1" | cut -c1-110; }
+# "failed to allocate": ASAN's allocator refusing a request over ALLOC_CAP_MB (a WARNING, no ERROR)
+first_err() { grep -m1 -E 'ERROR:|Error|error|Cannot|SUMMARY|failed to allocate' "$1" | cut -c1-110; }
 # keys come from the result line only, so stray stdout logging cannot supply one
 get() { grep -m1 -E '(^| )status=' <<<"$1" | sed -n "s/.*\b$2=\([^ ]*\).*/\1/p" | head -1; }
 key() { local line=$1 drop=${2:-} out=""; for f in $FIELDS; do
@@ -112,12 +130,24 @@ judge() {
   if { [ "$drc" = 86 ] || { [ "$drc" -gt 128 ] && [ "$drc" != 137 ]; }; } \
      && { [ "$nrc" = 86 ] || { [ "$nrc" -gt 128 ] && [ "$nrc" != 137 ]; } || grep -q 'Sanitizer:' "$rerr"; }; then
     printf 'CRASHES-BOTH\t%s\t\tdirect rc=%s, real rc=%s: %s\n' "$n" "$drc" "$nrc" "$(grep -h -m1 -oE 'Sanitizer: [^ ]+' "$err" "$rerr" | head -1)"; return; fi
+  # The real side died while the direct side answered: the code above the boundary (the
+  # runtime, the package's own native or script layer) aborted on an input the library
+  # handled.  A finding of its own, filed by the caller (see the header), not a mismatch.
+  if grep -qE '(^| )status=' <<<"$d" && ! { [ "$drc" = 86 ] || { [ "$drc" -gt 128 ] && [ "$drc" != 137 ]; }; } \
+     && { [ "$nrc" = 86 ] || { [ "$nrc" -gt 128 ] && [ "$nrc" != 137 ]; } || grep -qE 'Sanitizer:|Fatal error|Check failed|\[BUG\]' "$rerr"; }; then
+    printf 'CRASHES-REAL-ONLY\t%s\t\tdirect rc=%s answered, real rc=%s: %s\n' "$n" "$drc" "$nrc" \
+      "$(for p in 'Sanitizer: [^ ]+' 'Check failed.*' 'Fatal error.*' '\[BUG\].*'; do grep -m1 -oE "$p" "$rerr" && break; done | cut -c1-110)"; return; fi
   # (rc=124 means the 30 s timeout fired: a hang, named like any other no-output seed.)
   # A seed with no output is the interesting case: a sanitizer abort on one side (a real
   # finding) or a broken real-side command (a wrong ADDON= path).  Say which.
   # Stdout without a status= line counts as none: judged on keys it would read as a
   # MISMATCH with every key empty.
-  if ! grep -qE '(^| )status=' <<<"$d"; then printf 'NO-OUTPUT\t%s\t\tdirect printed no result line (status=...), rc=%s: %s\n' "$n" "$drc" "$(first_err "$err")"; return; fi
+  # Blame the side that printed nothing; when neither did, say so with both exit codes.
+  if ! grep -qE '(^| )status=' <<<"$d"; then
+    if ! grep -qE '(^| )status=' <<<"$r"; then
+      printf 'NO-OUTPUT\t%s\t\tNEITHER side printed a result line: direct rc=%s: %s | real rc=%s: %s\n' "$n" "$drc" "$(first_err "$err")" "$nrc" "$(first_err "$rerr")"
+    else printf 'NO-OUTPUT\t%s\t\tdirect printed no result line (status=...), rc=%s: %s (real answered)\n' "$n" "$drc" "$(first_err "$err")"; fi
+    return; fi
   if ! grep -qE '(^| )status=' <<<"$r"; then printf 'NO-OUTPUT\t%s\t\treal printed no result line (status=...), rc=%s: %s\n' "$n" "$nrc" "$(first_err "$rerr")"; return; fi
   local arm; arm=$(get "$d" "$ARM_FIELD")
   # AGREED carries its out_hash in the detail column: one hash for every seed is a vacuous gate
@@ -133,27 +163,60 @@ export -f first_err get key judge
 
 # a seed whose name is in crashers/ is a known crasher: listed, never judged or mapped
 allseeds() { find "$CORPUS" -maxdepth 1 -type f -print0 | sort -z; }
-isknown() { [ -n "$KNOWN" ] && [ -e "$KNOWN/$(basename "$1")" ]; }
+isknown() { [ -n "$KNOWN" ] && { [ -e "$KNOWN/$(basename "$1")" ] || [ -e "$KNOWN/gate-real-$(basename "$1")" ] \
+                                  || [ -e "$KNOWN/gate-both-$(basename "$1")" ]; }; }
 seeds() { allseeds | while IFS= read -r -d '' f; do isknown "$f" || printf '%s\0' "$f"; done; }
-NSEEDS=$(seeds | tr -cd '\0' | wc -c)
-NKNOWN=$(allseeds | while IFS= read -r -d '' f; do isknown "$f" && echo; done | wc -l)
+count_seeds() {   # per mode: a seed filed by an earlier mode is known from then on
+  KNOWN=""; [ -d "$WSABS/crashers" ] && KNOWN=$WSABS/crashers
+  NSEEDS=$(seeds | tr -cd '\0' | wc -c)
+  NKNOWN=$(allseeds | while IFS= read -r -d '' f; do isknown "$f" && echo; done | wc -l)
+}
+count_seeds
+# CRASHES-REAL-ONLY -> crashers/gate-real-<name>, CRASHES-BOTH -> crashers/gate-both-<name>,
+# each with a crashers.summary.tsv row (smoke.sh's layout: name TAB "<who> <class> <detail>");
+# the same bytes already there are not copied twice
+file_crasher() {  # <prefix> <class> <seed path> <detail>
+  local d="$WSABS/crashers" x n=$1$(basename "$3") m=${GATE_MODE:-default}
+  mkdir -p "$d"
+  for x in "$d"/*; do [ -f "$x" ] && cmp -s "$3" "$x" && { echo "     (already in crashers/ as $(basename "$x"))"; return; }; done
+  cp "$3" "$d/$n" && printf '%s\tgate %s %s %s\n' "$n" "$2" "$m" "$4" >> "$WSABS/crashers.summary.tsv" \
+    && echo "     -> crashers/$n (row in crashers.summary.tsv)"
+  KNOWN=$d
+}
 
 one_mode() {   # runs the whole gate in the current environment; prints and returns its status
+  count_seeds
   echo "== 1+2. every seed reaches the library, and agrees with the real stack =="
   seeds | xargs -0 -P "$JOBS" -I{} bash -c 'judge "$1"' _ {} | sort -t$'\t' -k2 > "$TMP/judged"
   awk -F'\t' '$1=="BINDING"  {printf "  BINDING     %-34s %s\n", $2, $4}
               $1=="NO-OUTPUT"{printf "  NO-OUTPUT   %-34s %s\n", $2, $4}
               $1=="MISMATCH" {split($4, kv, " real="); printf "  MISMATCH    %-34s\n     direct=%s\n     real  =%s\n", $2, substr(kv[1], 8), kv[2]}' "$TMP/judged"
-  local ok mism limited empty stub both
+  local ok mism limited empty stub both ronly
   ok=$(grep -c '^AGREED' "$TMP/judged"); limited=$(grep -c '^LIMITED' "$TMP/judged")
   mism=$(grep -c '^MISMATCH' "$TMP/judged"); empty=$(grep -c '^NO-OUTPUT' "$TMP/judged")
   stub=$(grep -c '^BINDING' "$TMP/judged"); both=$(grep -c '^CRASHES-BOTH' "$TMP/judged")
-  echo "  agreed=$ok  oracle-limited=$limited  mismatched=$mism  no-output=$empty  entered-binding=$stub  crashes-both=$both  known-crasher=$NKNOWN"
-  [ "$NKNOWN" -gt 0 ] && echo "  ($NKNOWN seed(s) skipped as known-crasher: the same name is in $KNOWN/)"
+  ronly=$(grep -c '^CRASHES-REAL-ONLY' "$TMP/judged")
+  echo "  agreed=$ok  oracle-limited=$limited  mismatched=$mism  no-output=$empty  entered-binding=$stub  crashes-both=$both  crashes-real-only=$ronly  known-crasher=$NKNOWN"
+  [ "$NKNOWN" -gt 0 ] && echo "  ($NKNOWN seed(s) skipped as known-crasher: the same name, or gate-real-/gate-both-<name>, is in $KNOWN/)"
   if [ "$both" -gt 0 ]; then
-    echo "  !!!!!!!! $both seed(s) CRASH BOTH SIDES: a finding, not a fidelity failure: move it to crashers/ and out of the gate corpus"
-    awk -F'\t' '$1=="CRASHES-BOTH"{printf "  !! CRASHES-BOTH %-31s %s\n", $2, $4}' "$TMP/judged"
-    echo "  !! (cp <seed> crashers/ with a row in crashers.summary.tsv; a re-run then skips it as known-crasher)"
+    echo "  !!!!!!!! $both seed(s) CRASH BOTH SIDES: a finding, not a fidelity failure; filed to crashers/ for"
+    echo "  !! triage, and skipped as known-crasher from now on:"
+    while IFS=$'\037' read -r sn det; do
+      printf '  !! CRASHES-BOTH %-31s %s\n' "$sn" "$det"
+      file_crasher gate-both- CRASHES-BOTH "$CORPUS/$sn" "$det"
+    done < <(awk -F'\t' '$1=="CRASHES-BOTH"{print $2 "\037" $4}' "$TMP/judged")
+    echo "$both" >> "$TMP/both.total"
+  fi
+  if [ "$ronly" -gt 0 ]; then
+    echo "  !!!!!!!! $ronly seed(s) CRASH THE REAL STACK ONLY: the direct harness answered, the real side died above the"
+    echo "  !! boundary (the runtime or the package's own layer).  A finding the direct harness cannot reach, not a"
+    echo "  !! fidelity failure; filed to crashers/ for triage, and skipped as known-crasher from now on:"
+    # fields 2 and 4 by awk: `read` with IFS=tab collapses the empty arm column and shifts them
+    while IFS=$'\037' read -r sn det; do
+      printf '  !! CRASHES-REAL-ONLY %-26s %s\n' "$sn" "$det"
+      file_crasher gate-real- CRASHES-REAL-ONLY "$CORPUS/$sn" "$(sed 's/^direct rc=[0-9]* answered, //' <<<"$det")"
+    done < <(awk -F'\t' '$1=="CRASHES-REAL-ONLY"{print $2 "\037" $4}' "$TMP/judged")
+    echo "$ronly" >> "$TMP/ronly.total"   # for the verdict line (a non-default mode runs in a subshell)
   fi
   # a harness that hashes a constant (or nothing) agrees with any real side
   local hashes; hashes=$(awk -F'\t' '$1=="AGREED"{print $4}' "$TMP/judged" | sort -u | wc -l)
@@ -161,7 +224,7 @@ one_mode() {   # runs the whole gate in the current environment; prints and retu
     echo "  WARN: all $ok agreed seeds share ONE out_hash ($(awk -F'\t' '$1=="AGREED"{print $4; exit}' "$TMP/judged")): the harness"
     echo "        hashes a constant, or nothing, so agreement on it proves nothing about the artifact"
   fi
-  if [ "$empty" = $((NSEEDS - both)) ] && [ "$empty" -gt 0 ]; then
+  if [ "$empty" = $((NSEEDS - both - ronly)) ] && [ "$empty" -gt 0 ]; then
     echo "  (EVERY seed had no output on one side: the command is broken, not the seeds -- read the message above."
     if grep -qF 'direct printed no result line (status=...), rc=86' "$TMP/judged"; then
       echo "   The DIRECT side died with the sanitizer exit code and no report: is a sanitizer runtime"
@@ -171,7 +234,7 @@ one_mode() {   # runs the whole gate in the current environment; prints and retu
   # A lone timeout-shaped NO-OUTPUT on a busy host is usually contention, not the seed
   # (measured: one asan gate run reported no-output=1 while other campaigns shared the
   # host; two re-runs were clean).  Say so before anyone debugs it.
-  if [ "$empty" -gt 0 ] && [ "$empty" -lt 3 ] && [ "$empty" -lt $((NSEEDS - both)) ] && grep -q '^NO-OUTPUT.*rc=124' "$TMP/judged"; then
+  if [ "$empty" -gt 0 ] && [ "$empty" -lt 3 ] && [ "$empty" -lt $((NSEEDS - both - ronly)) ] && grep -q '^NO-OUTPUT.*rc=124' "$TMP/judged"; then
     echo "  (rc=124 is the 30 s timeout: on a loaded host re-run the gate before debugging; a NO-OUTPUT that repeats is real.)"
   fi
 
@@ -229,11 +292,16 @@ for setting in $MODES; do s=${setting%%:*}; for kv in ${s//,/ }; do v=${kv%%=*}
   if [ -n "${!v+x}" ]; then echo "WARN: $v=${!v} is set in the environment: unset for the default mode, which otherwise runs under it"; unset "$v"; fi
 done; done
 status=0
+ronly_note() { local n b; n=$(awk '{s += $1} END {print s + 0}' "$TMP/ronly.total" 2>/dev/null)
+  b=$(awk '{s += $1} END {print s + 0}' "$TMP/both.total" 2>/dev/null)
+  [ "${b:-0}" -gt 0 ] && echo -n " ($b CRASHES-BOTH seed(s), in crashers/: findings for triage, not gate failures)"
+  [ "${n:-0}" -gt 0 ] && echo -n " ($n CRASHES-REAL-ONLY seed(s) filed to crashers/: findings for triage, not gate failures)"
+  return 0; }
 if [ -z "$MODES" ]; then
   one_mode || status=1
   # Always end with a verdict line: piped through `| tee` (as the docs do) the exit code
   # is lost, and the per-check lines alone do not say whether the gate passed.
-  [ "$status" = 0 ] && echo "PASS: the gate passed (default mode only)" || echo "FAIL: the gate failed (see the checks above)"
+  [ "$status" = 0 ] && echo "PASS: the gate passed (default mode only)$(ronly_note)" || echo "FAIL: the gate failed (see the checks above)$(ronly_note)"
 else
   for setting in default $MODES; do
     echo "######## mode: $setting"
@@ -241,10 +309,10 @@ else
     else
       s=${setting%%:*}; extras=${setting#"$s"}; ma=$MIN_ARMS
       for x in ${extras//:/ }; do case $x in min_arms=*) ma=${x#min_arms=};; esac; done
-      ( export ${s//,/ }; MIN_ARMS=$ma one_mode ) || status=1
+      ( export ${s//,/ }; GATE_MODE=$s MIN_ARMS=$ma one_mode ) || status=1
     fi
     echo
   done
-  [ "$status" = 0 ] && echo "ALL MODES PASS: default $MODES" || echo "FAIL: at least one mode above failed"
+  [ "$status" = 0 ] && echo "ALL MODES PASS: default $MODES$(ronly_note)" || echo "FAIL: at least one mode above failed$(ronly_note)"
 fi
 exit $status

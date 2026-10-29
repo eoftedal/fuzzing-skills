@@ -51,6 +51,32 @@ ordinary defensive code is safe.
 The distinction is real and worth getting right: it is the difference between "wrap it in
 try/catch" advice that works and advice that does not.
 
+**A call can return and then throw.** A synchronous call that drives a stream internally
+(a decode or decompress built on a Transform) can hand back partial output, and the stream's
+`'error'` then fires on a later tick: re-emitted from its flush, or thrown from a handler the
+package attached (`stream.on('error', e => { throw e })`). Nothing is on the call stack any
+more, so no call-site `try/catch` sees it, and the uncaught exception kills the process. That
+is UNCAUGHT, printed with `after=return`. So `confirm.mjs` does not finish a CLEAN at once: it
+waits two `setImmediate` turns plus `SETTLE_MS` (default 50, from the environment) and only
+then prints CLEAN; a throw in that window becomes UNCAUGHT with its error token. Every other
+verdict is immediate. Measured on two compression bindings: before the wait, truncated or
+corrupt frames read `CLEAN evidence=bytes=0` through a synchronous entry point, and in fact
+returned an empty buffer and then killed the process. A late throw slower than `SETTLE_MS`
+(a timer the package sets) still reads CLEAN; raise `SETTLE_MS` when the package defers work.
+
+## RUNTIME-ABORT: the runtime's own invariant check, not a memory bug
+
+Node can abort on purpose: V8 prints `# Fatal error` and `Check failed: <condition>` and
+raises SIGTRAP (or SIGABRT) when a binding breaks the runtime's bookkeeping, for example
+external-memory accounting that goes negative, or a handle used outside its scope. No
+sanitizer report, no JS handler runs. `confirm.sh` labels such a cell `RUNTIME-ABORT(sigN)`
+rather than NATIVE-CRASH: it is uncatchable, so it is a **denial of service** through the
+public API, but it is not evidence of an out-of-bounds access, and the critical severity a
+native crash on the install earns does not apply. Quote the runtime's message. These inputs
+usually crash only the real stack (the direct harness does not model the runtime's
+accounting), so they arrive through `crashers/` and the report's "Real-stack-only" section,
+not through a bucket.
+
 ## HANG: a timeout is not a clean run
 
 The call neither returned nor errored within `TIMEOUT_MS`. That is an algorithmic denial of

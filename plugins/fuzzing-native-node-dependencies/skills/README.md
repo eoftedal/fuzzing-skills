@@ -14,13 +14,14 @@ What the skills hand each other, so the names stay the same end to end:
 
 | artifact | written by | read by |
 |---|---|---|
-| `fuzz.env` (`SKILLS R RC W PKG_NAME PKG PKG_VERSION ADDON_ASAN MODES FIELDS SOFT_FIELD SOFT_DROP ALLOC_CAP_MB REAL REAL_ASAN`) | harness (`init_workspace.sh`, re-run as keys become known) | every skill's scripts, as defaults; an explicit argument wins |
+| `fuzz.env` (`SKILLS R RC W PKG_NAME PKG PKG_VERSION ADDON_ASAN ADDON_MATCH MODES FIELDS SOFT_FIELD SOFT_DROP ALLOC_CAP_MB REAL REAL_ASAN`; `ADDON_MATCH` only for a package with several addons) | harness (`init_workspace.sh`, re-run as keys become known) | every skill's scripts, as defaults; an explicit argument wins |
 | `out/<variant>/{harness,harness-fork,map_size}` | harness | corpus, campaign, triage |
+| `out/<variant>/lib/` (vendored archives; a step-3b instrumented archive with its headers in `lib/include/`), `out/<variant>/dict2file-lib.raw` | harness (`build_addon.sh` snapshots vendored archives and keeps the directory across re-runs; `build_lib.sh` builds the 3b archive and writes the library's compared constants) | harness (`link_harness.sh` links the archive, merges the raw file into `dict.afl`; `rebuild_asan.sh` redoes the asan archive), corpus (instrumentation check), triage (the pristine archive, `build_lib.sh VARIANT=pristine`) |
 | `out/<variant>/dict.afl`, `dict.afl` | harness builds, per variant (the constants the instrumented code compares against); corpus (`dict.sh` merges it with the author's tokens into `$W/dict.afl`) | campaign (`campaign.sh DICT=`, and `smoke.sh` through it: `$W/dict.afl`, else the variant's) |
-| `corpus/` (the gate corpus), `real_harness.mjs`, `oracle/` | harness (`mkgate.sh` writes the gate corpus's truncations and flips) | corpus (re-gate), triage (`PKG=oracle/node_modules/<pkg>`, `GOOD=` a gate seed) |
+| `corpus/` (the gate corpus), `real_harness.mjs`, `oracle/` (and `oracle-sym/` when `check_symbols.sh` reports interposition) | harness (`mkgate.sh` writes the gate corpus's truncations and flips) | corpus (re-gate), triage (`PKG` from `fuzz.env`; `oracle/` stays the as-installed package; `GOOD=` a gate seed) |
 | `selftest.txt` with its `PASS:` line | harness | campaign (refuses without it; flags it stale if a harness is newer) |
-| `corpus-final/`, `hangs/` | corpus | campaign (`corpus-final/` is the default seed set), triage (`hangs/` is screened against every variant) |
-| `crashers/` with `crashers.summary.tsv` | corpus (seed policy), harness (`smoke.sh`: one per `REAL` or `PERSISTENT-ONLY` site; the gate's `CRASHES-BOTH` seeds, moved by hand) | triage (screened against every variant, even when no campaign saved a crash) |
+| `corpus-final/`, `hangs/` | corpus; harness (`smoke.sh` files one hang per variant and mode as `hangs/smoke-*`; a hang known from reading the source, by hand) | campaign (`corpus-final/` is the default seed set), triage (`hangs/` is screened against every variant) |
+| `crashers/` with `crashers.summary.tsv` | corpus (seed policy), harness (`smoke.sh`: one per `REAL` or `PERSISTENT-ONLY` site; `gate.sh`: `CRASHES-REAL-ONLY` seeds as `crashers/gate-real-*`, `CRASHES-BOTH` seeds as `crashers/gate-both-*`, each with its summary row) | triage (screened against every variant, even when no campaign saved a crash) |
 | `confirm.mjs` | you, in the workspace, from the triage skill's template (`ENTRIES` pasted from `real_harness.mjs`) | triage (`triage_all.sh` / `confirm.sh` by default; `CONFIRM=` points elsewhere) |
 | `campaigns/manifest.tsv` | campaign | triage (variant, harness, mode, entry, ceiling, status per campaign) |
 | `triage/REPORT.md` | triage | you |

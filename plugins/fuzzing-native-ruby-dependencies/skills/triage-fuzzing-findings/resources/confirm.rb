@@ -210,6 +210,9 @@ def as_file(b, ext = "")
   p
 end
 
+# No wait before CLEAN, unlike the Node sibling (which holds a CLEAN for a late throw from a
+# stream 'error' on a later tick): Ruby has no event loop to deliver one; a gem thread that dies
+# later kills the process only under Thread.abort_on_exception, and exit! skips at_exit hooks.
 $done = false
 def finish(v, code, extra = "")
   return if $done
