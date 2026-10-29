@@ -1,8 +1,8 @@
 # Fuzzing skills for native Node and Ruby dependencies
 
-Claude Code skills for finding memory-safety bugs in the native code behind Node.js and Ruby
-packages with AFL++. The skills stop at a classified, minimized reproducer you can send to the
-maintainer. They do not develop exploits.
+Agent skills for Claude Code, Codex and OpenCode that find memory-safety bugs in the native code
+behind Node.js and Ruby packages with AFL++. The skills stop at a classified, minimized
+reproducer you can send to the maintainer. They do not develop exploits.
 
 The repo is a Claude Code plugin marketplace with two plugins:
 
@@ -34,7 +34,7 @@ The skills drive the tools; they do not install them. Run them on Linux with:
 
 A Docker container with these installed is the easiest setup; fuzzing on macOS is not supported.
 
-## Install as a marketplace
+## Install in Claude Code as a marketplace
 
 In Claude Code, add the marketplace and install the plugin(s) you need:
 
@@ -56,32 +56,47 @@ same-named corpus, campaign and triage skills do not clash. Update later with
 
 ## Install by copying into a skills folder
 
-Copy one plugin's skill directories into a Claude Code skills folder: `~/.claude/skills/` for
-all your projects, or `.claude/skills/` inside a project for that project only.
+This works for Claude Code, Codex and OpenCode. Each skill is a directory with a `SKILL.md`, so
+installing one means copying the directory into a folder the agent scans:
+
+| agent | all projects | one project (in the repo) |
+|---|---|---|
+| Claude Code | `~/.claude/skills/` | `.claude/skills/` |
+| Codex | `~/.agents/skills/` | `.agents/skills/` |
+| OpenCode | `~/.config/opencode/skills/` | `.opencode/skills/` |
+
+OpenCode also reads the Claude Code and Codex folders (`~/.claude/skills/`, `~/.agents/skills/`
+and their project versions), so a copy made for either of those also works in OpenCode.
+
+Clone the repo and copy one plugin's four skill directories into the folder, here the Node
+plugin into Codex's user folder:
 
 ```sh
 git clone https://github.com/eoftedal/fuzzing-skills.git
-mkdir -p ~/.claude/skills
+DEST=~/.agents/skills        # or ~/.claude/skills, ~/.config/opencode/skills, ...
+mkdir -p "$DEST"
 for d in fuzzing-skills/plugins/fuzzing-native-node-dependencies/skills/*/; do
-  cp -R "${d%/}" ~/.claude/skills/
+  cp -R "${d%/}" "$DEST/"
 done
 ```
 
-For Ruby, copy from `plugins/fuzzing-native-ruby-dependencies/skills/` instead.
+For Ruby, copy from `plugins/fuzzing-native-ruby-dependencies/skills/` instead. Start a new
+session afterwards so the agent picks up the skills.
 
 Two things to keep in mind:
 
 - **Copy all four skills of a plugin into the same folder.** The scripts find each other through
   the sibling skill directories (the harness skill's `init_workspace.sh` writes their paths to
   the workspace's `fuzz.env`), so the four must stay side by side.
-- **Copy only one plugin into a given skills folder.** The corpus, campaign and triage skills
-  have the same names in both plugins, so the second copy would overwrite the first. To use
-  both, install them as plugins, or put one in `~/.claude/skills/` and the other in a
-  project's `.claude/skills/`.
+- **Install only one of the two plugins by copying.** The corpus, campaign and triage skills
+  have the same names in both plugins. In one folder, the second copy overwrites the first.
+  OpenCode requires skill names to be unique across all the folders it reads, and Codex lists
+  same-named skills from different folders side by side without telling them apart. To use
+  both plugins, install them as Claude Code plugins, which namespaces the skills.
 
 ## Usage
 
-Ask Claude to fuzz a package, for example "fuzz the native addon of the npm package `<name>`"
+Ask the agent to fuzz a package, for example "fuzz the native addon of the npm package `<name>`"
 or "fuzz the C extension of the gem `<name>`". The harness skill triggers first, creates the fuzz
 workspace and its `fuzz.env`, and each skill names the next one when it is done.
 
